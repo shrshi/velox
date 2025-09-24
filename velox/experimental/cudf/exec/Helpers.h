@@ -62,5 +62,6 @@ rmm::device_uvector<cudf::size_type> filter_left_joined_cols(
     rmm::cuda_stream_view stream);
 
 void printTable(cudf::table_view const& t, rmm::cuda_stream_view stream);
+void printColumn(cudf::column_view const& col, rmm::cuda_stream_view stream);
 
 } // namespace facebook::velox::cudf_velox

@@ -1958,7 +1958,6 @@ TEST_P(MultiThreadedHashJoinTest, leftJoinWithFilter) {
   }
 }
 
-#if 0
 void printRowVectors(const std::vector<RowVectorPtr>& vectors, const std::string& label) {
   std::cout << "=== " << label << " ===" << std::endl;
   for (size_t i = 0; i < vectors.size(); ++i) {
@@ -2075,35 +2074,6 @@ TEST_P(MultiThreadedHashJoinTest, InnerJoinWithFilterDebug) {
   // Left side keys are [0, 1, 2,..10].
   // Use 3-rd column as row number to allow for asserting the order of
   // results.
-  std::vector<RowVectorPtr> probeVectors = mergeBatches(
-      makeBatches(
-          1,
-          [&](int32_t /*unused*/) {
-            return makeRowVector(
-                {"c0", "c1", "row_number"},
-                {
-                    makeFlatVector<int32_t>(
-                        5, [](auto row) { return row % 5; }),
-                    makeFlatVector<int32_t>(5, [](auto row) { return row; }),
-                    makeFlatVector<int32_t>(5, [](auto row) { return row; }),
-                });
-          }),
-      makeBatches(
-          1,
-          [&](int32_t /*unused*/) {
-            return makeRowVector(
-                {"c0", "c1", "row_number"},
-                {
-                    makeFlatVector<int32_t>(
-                        5,
-                        [](auto row) { return (row + 3) % 5; }
-                        ),
-                    makeFlatVector<int32_t>(5, [](auto row) { return row; }),
-                    makeFlatVector<int32_t>(
-                        5, [](auto row) { return 5 + row; }),
-                });
-          }),
-      true);
   std::vector<RowVectorPtr> probeVectors = makeBatches(
           1,
           [&](int32_t /*unused*/) {
@@ -2171,7 +2141,6 @@ TEST_P(MultiThreadedHashJoinTest, InnerJoinWithFilterDebug) {
         .run();
   }
 }
-#endif
 
 /// Tests left join with a filter that may evaluate to true, false or null.
 /// Makes sure that null filter results are handled correctly, e.g. as if the

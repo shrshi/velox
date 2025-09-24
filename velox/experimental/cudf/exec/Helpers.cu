@@ -158,4 +158,18 @@ void printTable(cudf::table_view const& t, rmm::cuda_stream_view stream) {
   }
 }
 
+void printColumn(cudf::column_view const& col, rmm::cuda_stream_view stream) {
+  std::vector<cudf::size_type> h_col(col.size(), -1);
+  cudaMemcpyAsync(
+      h_col.data(),
+      col.data<cudf::size_type>(),
+      col.size() * sizeof(cudf::size_type),
+      cudaMemcpyDefault,
+      stream);
+  stream.synchronize();
+  for (auto e : h_col)
+    std::cout << e << " ";
+  std::cout << std::endl;
+}
+
 } // namespace facebook::velox::cudf_velox

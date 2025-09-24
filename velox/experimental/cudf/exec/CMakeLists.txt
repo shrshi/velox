@@ -19,7 +19,6 @@ add_library(
   CudfFilterProject.cpp
   CudfHashAggregation.cpp
   CudfHashJoin.cpp
-  Helpers.cu
   CudfLimit.cpp
   CudfLocalPartition.cpp
   CudfOrderBy.cpp
@@ -29,6 +28,7 @@ add_library(
   ToCudf.cpp
   Utilities.cpp
   VeloxCudfInterop.cpp
+  Helpers.cu
 )
 
 target_link_libraries(
@@ -46,7 +46,8 @@ target_link_libraries(
 
 target_compile_options(
   velox_cudf_exec
-  PRIVATE -Wno-missing-field-initializers $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>
+  PRIVATE -Wno-missing-field-initializers 
+  $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>
 )
 
 set_target_properties(
