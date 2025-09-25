@@ -724,9 +724,9 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
       std::vector<cudf::groupby::aggregation_request> requests;
       requests.emplace_back(cudf::groupby::aggregation_request{});
       requests[0].aggregations.push_back(cudf::make_sum_aggregation<cudf::groupby_aggregation>());
-      requests[0].values = intFilterColumn->view();
+      //requests[0].values = intFilterColumn->view();
+      requests[0].values = filterColumn;
       auto result = keysleftIndicesColGrouper.aggregate(requests, stream);
-      stream.synchronize();
       auto uniqueIntFilter = std::move(result.second[0].results[0]);
       // print column
       printColumn(uniqueIntFilter->view(), stream);
