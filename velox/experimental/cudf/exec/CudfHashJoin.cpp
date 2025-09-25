@@ -16,7 +16,6 @@
 
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/ExpressionEvaluator.h"
-#include "velox/experimental/cudf/exec/Helpers.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -658,23 +657,21 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
 
   if (joinNode_->filter() &&
       (joinNode_->isLeftJoin() || joinNode_->isInnerJoin())) {
-    if(joinNode_->isLeftJoin()) {
-      std::vector<std::unique_ptr<cudf::column>> indicesColumns;
-      indicesColumns.push_back(std::make_unique<cudf::column>(
-          std::move(*leftJoinIndices),
-          rmm::device_buffer{},
-          0
-      ));
-      indicesColumns.push_back(std::make_unique<cudf::column>(
-          std::move(*rightJoinIndices),
-          rmm::device_buffer{},
-          0
-      ));
-      auto indicesTable = std::make_unique<cudf::table>(std::move(indicesColumns));
-      indicesTable = cudf::sort(indicesTable->view(), {}, {}, stream);
-      leftIndicesCol = indicesTable->get_column(0).view();
-      rightIndicesCol = indicesTable->get_column(1).view();
-    }
+    std::vector<std::unique_ptr<cudf::column>> indicesColumns;
+    indicesColumns.push_back(std::make_unique<cudf::column>(
+        std::move(*leftJoinIndices),
+        rmm::device_buffer{},
+        0
+    ));
+    indicesColumns.push_back(std::make_unique<cudf::column>(
+        std::move(*rightJoinIndices),
+        rmm::device_buffer{},
+        0
+    ));
+    auto indicesTable = std::make_unique<cudf::table>(std::move(indicesColumns));
+    indicesTable = cudf::sort(indicesTable->view(), {}, {}, stream);
+    leftIndicesCol = indicesTable->get_column(0).view();
+    rightIndicesCol = indicesTable->get_column(1).view();
 
     auto leftResult =
         cudf::gather(leftTableView, leftIndicesCol, oobPolicy, stream);
@@ -711,41 +708,6 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
       joinedCols = filteredTable->release();
     } else if (joinNode_->isLeftJoin()) {
 
-      {
-      std::cout << "filterColumn.data_type = " << static_cast<std::underlying_type<cudf::type_id>::type>(filterColumn.type().id()) << std::endl;
-      std::cout << "filterColumn.has_nulls() = " << filterColumn.has_nulls() << std::endl;
-      std::cout << "leftIndicesCol.has_nulls() = " << leftIndicesCol.has_nulls() << std::endl;
-      //auto intFilterColumn = cudf::cast(filterColumn, cudf::data_type{cudf::type_id::INT32}, stream);
-      auto intFilterColumn = std::make_unique<cudf::column>(filterColumn, stream);
-      std::cout << "intFilterColumn->data_type = " << static_cast<std::underlying_type<cudf::type_id>::type>(intFilterColumn->type().id()) << std::endl;
-      std::cout << "intFilterColumn->has_nulls() = " << intFilterColumn->has_nulls() << std::endl;
-      auto zero_scalar = cudf::numeric_scalar<cudf::size_type>(0, true, stream);
-      //intFilterColumn = cudf::replace_nulls(intFilterColumn->view(), zero_scalar, stream);
-      std::cout << "intFilterColumn->has_nulls() = " << intFilterColumn->has_nulls() << std::endl;
-      // print column
-      //printColumnBool(intFilterColumn->view(), stream);
-      //printColumn(leftIndicesCol, stream);
-      cudf::table_view keysLeftIndicesCol({leftIndicesCol});
-      cudf::groupby::groupby keysleftIndicesColGrouper(keysLeftIndicesCol, cudf::null_policy::INCLUDE, cudf::sorted::YES);
-      std::vector<cudf::groupby::aggregation_request> requests;
-      requests.emplace_back(cudf::groupby::aggregation_request{});
-      requests[0].aggregations.push_back(cudf::make_sum_aggregation<cudf::groupby_aggregation>());
-      requests[0].values = intFilterColumn->view();
-      //requests[0].values = filterColumn;
-      auto result = keysleftIndicesColGrouper.aggregate(requests, stream);
-      auto uniqueIntFilter = std::move(result.second[0].results[0]);
-      // print column
-      //printColumn64(uniqueIntFilter->view(), stream);
-      //printColumn(result.first->get_column(0).view(), stream);
-      auto zero_scalar64 = cudf::numeric_scalar<std::int64_t>(0, true, stream);
-      uniqueIntFilter = cudf::binary_operation(uniqueIntFilter->view(), zero_scalar, cudf::binary_operator::EQUAL, cudf::data_type{cudf::type_id::BOOL8}, stream);
-      auto sum_agg = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
-      auto true_count_scalar = cudf::reduce(uniqueIntFilter->view(), *sum_agg, cudf::data_type{cudf::type_id::INT64}, stream);  
-      auto false_count = uniqueIntFilter->size() - static_cast<cudf::numeric_scalar<int64_t>*>(true_count_scalar.get())->value(stream);
-      std::cout << "uniqueIntFilter: false count = " << false_count << std::endl;
-      std::cout << "uniqueIntFilter: true count = " << static_cast<cudf::numeric_scalar<int64_t>*>(true_count_scalar.get())->value() << std::endl;
-      }
-
       cudf::table_view keysLeftIndicesCol({leftIndicesCol});
       cudf::groupby::groupby keysleftIndicesColGrouper(keysLeftIndicesCol, cudf::null_policy::EXCLUDE, cudf::sorted::YES);
       std::vector<cudf::groupby::aggregation_request> requests;
@@ -756,15 +718,8 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
 
       auto uniqueFilter = std::move(result.second[0].results[0]);
       auto zero_scalar_64 = cudf::numeric_scalar<std::int64_t>(0, true, stream);
-      
-      std::cout << "uniqueFilter = ";
-      //printColumn64(uniqueFilter->view(), stream);
-
       uniqueFilter = cudf::replace_nulls(uniqueFilter->view(), zero_scalar_64, stream);
       uniqueFilter = cudf::binary_operation(uniqueFilter->view(), zero_scalar_64, cudf::binary_operator::EQUAL, cudf::data_type{cudf::type_id::BOOL8}, stream);
-
-      std::cout << "uniqueFilter = ";
-      //printColumnBool(uniqueFilter->view(), stream);
 
       auto zero_scalar = cudf::numeric_scalar<cudf::size_type>(0, true, stream);
       std::vector<std::unique_ptr<cudf::column>> leftTableViewRowIndicesColumn;
@@ -772,11 +727,7 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
       auto leftTableViewRowIndicesTable = std::make_unique<cudf::table>(std::move(leftTableViewRowIndicesColumn));
       leftTableViewRowIndicesTable = cudf::apply_boolean_mask(leftTableViewRowIndicesTable->view(), uniqueFilter->view(), stream);
 
-      std::cout << "leftTableViewRowIndicesTable->num_rows() = " << leftTableViewRowIndicesTable->num_rows() << std::endl;
-
       auto extra_rows = leftTableViewRowIndicesTable->get_column(0).view();
-      //printColumn(extra_rows, stream);
-
       auto num_extra_rows = leftTableViewRowIndicesTable->num_rows();
       cudf::device_span<cudf::size_type const> extra_rows_span = extra_rows;
       auto left_extra_result = cudf::gather(

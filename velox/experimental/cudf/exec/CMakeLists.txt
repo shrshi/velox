@@ -28,7 +28,6 @@ add_library(
   ToCudf.cpp
   Utilities.cpp
   VeloxCudfInterop.cpp
-  Helpers.cu
 )
 
 target_link_libraries(
@@ -47,14 +46,4 @@ target_link_libraries(
 target_compile_options(
   velox_cudf_exec
   PRIVATE -Wno-missing-field-initializers 
-  $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>
-)
-
-set_target_properties(
-  velox_cudf_exec
-  PROPERTIES
-    CUDA_STANDARD 20
-    POSITION_INDEPENDENT_CODE ON
-    CUDA_SEPARABLE_COMPILATION ON
-    CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
