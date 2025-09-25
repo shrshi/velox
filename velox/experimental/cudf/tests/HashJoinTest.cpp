@@ -1943,7 +1943,7 @@ TEST_P(MultiThreadedHashJoinTest, leftJoinWithFilter) {
     auto testBuildVectors = buildVectors;
     HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
         .injectSpill(false)
-        .numDrivers(numDrivers_, false, false)
+        .numDrivers(numDrivers_)
         .probeKeys({"c0"})
         .probeVectors(std::move(testProbeVectors))
         .buildKeys({"u_c0"})
@@ -1958,6 +1958,7 @@ TEST_P(MultiThreadedHashJoinTest, leftJoinWithFilter) {
   }
 }
 
+#if 0
 void printRowVectors(const std::vector<RowVectorPtr>& vectors, const std::string& label) {
   std::cout << "=== " << label << " ===" << std::endl;
   for (size_t i = 0; i < vectors.size(); ++i) {
@@ -1970,7 +1971,6 @@ TEST_P(MultiThreadedHashJoinTest, leftJoinWithFilterDebug) {
   // Left side keys are [0, 1, 2,..10].
   // Use 3-rd column as row number to allow for asserting the order of
   // results.
-#if 0
   std::vector<RowVectorPtr> probeVectors = mergeBatches(
       makeBatches(
           1,
@@ -2000,7 +2000,6 @@ TEST_P(MultiThreadedHashJoinTest, leftJoinWithFilterDebug) {
                 });
           }),
       true);
-#endif
   std::vector<RowVectorPtr> probeVectors = makeBatches(
           1,
           [&](int32_t /*unused*/) {
@@ -2141,6 +2140,7 @@ TEST_P(MultiThreadedHashJoinTest, InnerJoinWithFilterDebug) {
         .run();
   }
 }
+#endif
 
 /// Tests left join with a filter that may evaluate to true, false or null.
 /// Makes sure that null filter results are handled correctly, e.g. as if the
