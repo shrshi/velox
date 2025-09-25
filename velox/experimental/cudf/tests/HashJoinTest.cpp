@@ -1923,7 +1923,7 @@ TEST_P(MultiThreadedHashJoinTest, leftJoinWithFilter) {
     auto testBuildVectors = buildVectors;
     HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
         .injectSpill(false)
-        .numDrivers(numDrivers_, false, false)
+        .numDrivers(numDrivers_)
         .probeKeys({"c0"})
         .probeVectors(std::move(testProbeVectors))
         .buildKeys({"u_c0"})
