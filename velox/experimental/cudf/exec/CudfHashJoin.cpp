@@ -760,7 +760,7 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
           extra_columns.push_back(cudf::make_column_from_scalar(
               *null_scalar,
               num_extra_rows,
-              stream);
+              stream));
         }
         auto extra_table =
             std::make_unique<cudf::table>(std::move(extra_columns));
