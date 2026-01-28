@@ -233,24 +233,41 @@ void CudfHashJoinBuild::noMoreInput() {
   bool buildHashJoin =
       (joinNode_->isInnerJoin() || joinNode_->isLeftJoin() ||
        joinNode_->isRightJoin());
+  bool buildFilteredJoin = (joinNode_->isLeftSemiFilterJoin());
 
-  std::vector<std::shared_ptr<cudf::hash_join>> hashObjects;
-  for (auto i = 0; i < tbls.size(); i++) {
-    hashObjects.push_back(
-        (buildHashJoin) ? std::make_shared<cudf::hash_join>(
-                              tbls[i]->view().select(buildKeyIndices),
-                              cudf::null_equality::UNEQUAL,
-                              stream)
-                        : nullptr);
-    if (buildHashJoin) {
-      VELOX_CHECK_NOT_NULL(hashObjects.back());
+  std::vector<std::shared_ptr<cudf::hash_join>> hashObjects(nullptr, tbls.size());
+  if (buildHashJoin) {
+    for (auto i = 0; i < tbls.size(); i++) {
+      hashObjects[i] = std::make_shared<cudf::hash_join>(
+                                tbls[i]->view().select(buildKeyIndices),
+                                cudf::null_equality::UNEQUAL,
+                                stream);
+      VELOX_CHECK_NOT_NULL(hashObjects[i]);
+      if (CudfConfig::getInstance().debugEnabled) {
+        if (hashObjects[i] != nullptr) {
+          LOG(INFO) << "hashObject " << i << " is not nullptr "
+                    << hashObjects[i].get() << "\n";
+        } else {
+          LOG(INFO) << "hashObject " << i << " is *** nullptr\n";
+        }
+      }
     }
-    if (CudfConfig::getInstance().debugEnabled) {
-      if (hashObjects.back() != nullptr) {
-        LOG(INFO) << "hashObject " << i << " is not nullptr "
-                  << hashObjects.back().get() << "\n";
-      } else {
-        LOG(INFO) << "hashObject " << i << " is *** nullptr\n";
+  }
+  else if (buildFilteredJoin) {
+    for (auto i = 0; i < tbls.size(); i++) {
+      hashObjects[i] = std::make_shared<cudf::filtered_join>(
+                                tbls[i]->view().select(buildKeyIndices),
+                                cudf::null_equality::UNEQUAL,
+                                cudf::set_as_build_table::RIGHT,
+                                stream);
+      VELOX_CHECK_NOT_NULL(hashObjects[i]);
+      if (CudfConfig::getInstance().debugEnabled) {
+        if (hashObjects[i] != nullptr) {
+          LOG(INFO) << "hashObject " << i << " is not nullptr "
+                    << hashObjects[i].get() << "\n";
+        } else {
+          LOG(INFO) << "hashObject " << i << " is *** nullptr\n";
+        }
       }
     }
   }
@@ -911,10 +928,16 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftSemiFilterJoin(
   std::vector<std::unique_ptr<cudf::table>> cudfOutputs;
 
   auto& rightTables = hashObject_.value().first;
-
+  auto& hbs = hashObject_.value().second;
   for (auto i = 0; i < rightTables.size(); i++) {
     auto rightTableView = rightTables[i]->view();
+    auto& hb = hbs[i];
     std::unique_ptr<rmm::device_uvector<cudf::size_type>> leftJoinIndices;
+
+    VELOX_CHECK_NOT_NULL(hb);
+    if (buildStream_.has_value()) {
+      cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
+    }
 
     if (joinNode_->filter()) {
       leftJoinIndices = cudf::mixed_left_semi_join(
@@ -927,12 +950,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftSemiFilterJoin(
           stream,
           cudf::get_current_device_resource_ref());
     } else {
-      cudf::filtered_join filter_join(
-          rightTableView.select(rightKeyIndices_),
-          cudf::null_equality::UNEQUAL,
-          cudf::set_as_build_table::RIGHT,
-          stream);
-      leftJoinIndices = filter_join.semi_join(
+      leftJoinIndices = hb->semi_join(
           leftTableView.select(leftKeyIndices_),
           stream,
           cudf::get_current_device_resource_ref());
