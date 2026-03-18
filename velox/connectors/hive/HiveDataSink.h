@@ -232,6 +232,9 @@ class HiveInsertFileNameGenerator : public FileNameGenerator {
       void* context);
 
   std::string toString() const override;
+
+  /// Replaces potentially unsafe characters in a file name with underscores
+  static void sanitizeFileName(std::string& name);
 };
 
 /// Represents a request for Hive write.
@@ -426,6 +429,8 @@ struct HiveFileInfo {
   std::string targetFileName;
   /// Size of the file in bytes.
   uint64_t fileSize{0};
+  /// Number of rows in the file.
+  uint64_t numRows{0};
 };
 
 struct HiveWriterInfo {
@@ -449,8 +454,11 @@ struct HiveWriterInfo {
   const std::shared_ptr<memory::MemoryPool> writerPool;
   const std::shared_ptr<memory::MemoryPool> sinkPool;
   const std::shared_ptr<memory::MemoryPool> sortPool;
-  int64_t numWrittenRows = 0;
-  int64_t inputSizeInBytes = 0;
+  /// Total rows written by this writer across all files.
+  uint64_t numWrittenRows = 0;
+  /// Rows written to the current file; reset to 0 when the file is finalized.
+  uint64_t currentFileWrittenRows{0};
+  uint64_t inputSizeInBytes = 0;
   /// File sequence number for tracking multiple files written due to size-based
   /// splitting. Incremented each time the writer rotates to a new file.
   /// Used to generate sequenced file names (e.g., file_1.orc, file_2.orc).
@@ -701,17 +709,20 @@ class HiveDataSink : public DataSink {
   // the newly created writer in 'writers_'.
   uint32_t appendWriter(const HiveWriterId& id);
 
+  // Creates a writer for the given index using the current file sequence.
+  std::unique_ptr<facebook::velox::dwio::common::Writer> createWriterForIndex(
+      size_t writerIndex);
+
   // Creates and configures WriterOptions based on file format.
   // Sets up compression, schema, and other writer configuration based on the
   // insert table handle and connector settings.
   // The no-argument overload uses the last writer's info (for appendWriter).
-  virtual std::shared_ptr<dwio::common::WriterOptions> createWriterOptions()
-      const;
+  std::shared_ptr<dwio::common::WriterOptions> createWriterOptions() const;
 
   // Creates WriterOptions for a specific writer index. Use this overload
   // during writer rotation to ensure the correct writer's memory pool and
   // nonReclaimableSection are used.
-  std::shared_ptr<dwio::common::WriterOptions> createWriterOptions(
+  virtual std::shared_ptr<dwio::common::WriterOptions> createWriterOptions(
       size_t writerIndex) const;
 
   // Returns the Hive partition directory name for the given partition ID.
@@ -722,6 +733,7 @@ class HiveDataSink : public DataSink {
 
   std::unique_ptr<facebook::velox::dwio::common::Writer>
   maybeCreateBucketSortWriter(
+      size_t writerIndex,
       std::unique_ptr<facebook::velox::dwio::common::Writer> writer);
 
   // Records a row index for a specific partition. This method maintains the
@@ -758,14 +770,14 @@ class HiveDataSink : public DataSink {
   /// Rotates the writer at the given index to a new file. This is called when
   /// the current file exceeds maxTargetFileBytes_. The old writer is closed
   /// and a new writer is created for the same partition/bucket.
-  void rotateWriter(size_t index);
+  virtual void rotateWriter(size_t index);
 
   /// Finalizes the current file for the writer at the given index.
   /// Captures file stats and adds the file info to writtenFiles.
   /// Called by rotateWriter() and closeInternal().
   void finalizeWriterFile(size_t index);
 
-  void closeInternal();
+  virtual void closeInternal();
 
   // IMPORTANT NOTE: these are passed to writers as raw pointers. HiveDataSink
   // owns the lifetime of these objects, and therefore must destroy them last.
