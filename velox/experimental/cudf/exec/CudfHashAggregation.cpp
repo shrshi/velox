@@ -20,6 +20,7 @@
 #include "velox/experimental/cudf/exec/CudfHashAggregation.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
+#include "velox/experimental/cudf/exec/Validation.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
 #include "velox/exec/Aggregate.h"
@@ -1987,16 +1988,31 @@ bool canAggregationBeEvaluatedByCudf(
   auto& stepAwareRegistry = getStepAwareAggregationRegistry();
   auto funcIt = stepAwareRegistry.find(originalName);
   if (funcIt == stepAwareRegistry.end()) {
+    LOG_FALLBACK(
+        "Aggregation function not found in step-aware registry: ", originalName);
     return false;
   }
 
   auto stepIt = funcIt->second.find(companionStep);
   if (stepIt == funcIt->second.end()) {
+    LOG_FALLBACK(
+        "Aggregation step not found in registry for function: ",
+        originalName,
+        ", step: ",
+        static_cast<int>(companionStep));
     return false;
   }
 
   // Validate against step-specific signatures from registry
-  return matchTypedCallAgainstSignatures(call, stepIt->second);
+  if (!matchTypedCallAgainstSignatures(call, stepIt->second)) {
+    LOG_FALLBACK(
+        "Aggregation signature mismatch for function: ",
+        originalName,
+        ", call: ",
+        call.toString());
+    return false;
+  }
+  return true;
 }
 
 bool canBeEvaluatedByCudf(
@@ -2014,18 +2030,24 @@ bool canBeEvaluatedByCudf(
     // Use step-aware validation that handles partial/final/intermediate steps
     if (!canAggregationBeEvaluatedByCudf(
             *aggregate.call, step, aggregate.rawInputTypes, queryCtx)) {
+      // LOG_FALLBACK already called inside canAggregationBeEvaluatedByCudf
       return false;
     }
 
     // `distinct` aggregations are not supported, in testing fails with "De-dup
     // before aggregation is not yet supported"
     if (aggregate.distinct) {
+      LOG_FALLBACK(
+          "Aggregation: distinct aggregation not supported: ",
+          aggregate.call->name());
       return false;
     }
 
     // `mask` is NOT supported (in testing do not appear to be be applied and
     // return incorrect results )
     if (aggregate.mask) {
+      LOG_FALLBACK(
+          "Aggregation: mask not supported for: ", aggregate.call->name());
       return false;
     }
 
@@ -2034,6 +2056,7 @@ bool canBeEvaluatedByCudf(
       auto expandedInput = expandFieldReference(input, sourceNode);
       std::vector<core::TypedExprPtr> exprs = {expandedInput};
       if (!canBeEvaluatedByCudf(exprs, queryCtx)) {
+        // LOG_FALLBACK already called inside canBeEvaluatedByCudf
         return false;
       }
     }
@@ -2042,6 +2065,7 @@ bool canBeEvaluatedByCudf(
   // Check grouping key expressions
   if (!canGroupingKeysBeEvaluatedByCudf(
           aggregationNode.groupingKeys(), sourceNode, queryCtx)) {
+    // LOG_FALLBACK already called inside canGroupingKeysBeEvaluatedByCudf
     return false;
   }
 

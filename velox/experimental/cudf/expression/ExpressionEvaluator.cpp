@@ -1206,20 +1206,38 @@ bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
         expr->inputs().empty() ? nullptr : expr->inputs()[0]->type();
     const auto& dstType = expr->type();
     if (srcType == nullptr || dstType == nullptr) {
+      LOG_FALLBACK("Cast: null source or destination type");
       return false;
     }
     auto src = cudf::data_type(cudf_velox::veloxToCudfTypeId(srcType));
     auto dst = cudf::data_type(cudf_velox::veloxToCudfTypeId(dstType));
-    return cudf::is_supported_cast(src, dst);
+    if (!cudf::is_supported_cast(src, dst)) {
+      LOG_FALLBACK(
+          "Cast: unsupported cast from ",
+          srcType->toString(),
+          " to ",
+          dstType->toString());
+      return false;
+    }
+    return true;
   }
 
   auto& registry = getCudfFunctionRegistry();
   auto it = registry.find(expr->name());
   if (it == registry.end()) {
+    LOG_FALLBACK("Function not found in cuDF registry: ", expr->name());
     return false;
   }
   const auto& spec = it->second;
-  return matchCallAgainstSignatures(*expr, spec.signatures);
+  if (!matchCallAgainstSignatures(*expr, spec.signatures)) {
+    LOG_FALLBACK(
+        "Function signature mismatch: ",
+        expr->name(),
+        ", expression: ",
+        expr->toString());
+    return false;
+  }
+  return true;
 }
 
 bool canBeEvaluatedByCudf(std::shared_ptr<velox::exec::Expr> expr, bool deep) {
