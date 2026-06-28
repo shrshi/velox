@@ -226,7 +226,7 @@ cudf::size_type constantRowsBoundValue(const core::TypedExprPtr& value) {
   VELOX_USER_CHECK_NOT_NULL(
       constExpr, "ROWS frame offset must be a constant expression");
   VELOX_USER_CHECK(
-      constExpr->type()->isInteger(),
+      constExpr->type()->isInteger() || constExpr->type()->isBigint(),
       "ROWS frame offset must be INTEGER or BIGINT type, got {}",
       constExpr->type()->toString());
 
@@ -319,7 +319,7 @@ cudf::range_window_bounds toRangeWindowBound(
                 std::dynamic_pointer_cast<const core::ConstantTypedExpr>(
                     value)) {
           VELOX_USER_CHECK(
-              constExpr->type()->isInteger(),
+              constExpr->type()->isInteger() || constExpr->type()->isBigint(),
               "Window frame bound must be INTEGER or BIGINT type, got {}",
               constExpr->type()->toString());
           if (constExpr->hasValueVector()) {
