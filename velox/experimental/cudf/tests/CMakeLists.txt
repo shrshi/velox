@@ -182,6 +182,12 @@ velox_add_cudf_test(
 )
 
 velox_add_cudf_test(
+  NAME velox_cudf_logical_functions_test
+  SOURCES Main.cpp LogicalFunctionsTest.cpp
+  LIBS ${CUDF_TEST_DEFAULT_LIBS}
+)
+
+velox_add_cudf_test(
   NAME velox_cudf_mark_distinct_test
   SOURCES Main.cpp MarkDistinctTest.cpp
   LIBS ${CUDF_TEST_DEFAULT_LIBS}
