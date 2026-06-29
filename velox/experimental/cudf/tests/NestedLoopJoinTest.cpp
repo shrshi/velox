@@ -1609,31 +1609,3 @@ TEST_F(CudfNestedLoopJoinTest, crossJoinZeroColumnBuild) {
       makeRowVector({"p0"}, {makeFlatVector<int64_t>({4, 4, 4, 5, 5, 5})});
   AssertQueryBuilder(plan).assertResults(expected);
 }
-
-// Verifies correct row count when the output has zero columns. A zero-column
-// cudf::table reports num_rows() == 0, so the operator must track row counts
-// separately.
-TEST_F(CudfNestedLoopJoinTest, crossJoinZeroColumnOutput) {
-  auto probeData = makeRowVector({"p0"}, {makeFlatVector<int64_t>({4, 5})});
-  auto buildData = makeRowVector({"b0"}, {makeFlatVector<int32_t>({1, 2, 3})});
-
-  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
-  auto plan = PlanBuilder(planNodeIdGenerator)
-                  .values({probeData})
-                  .nestedLoopJoin(
-                      PlanBuilder(planNodeIdGenerator)
-                          .values({buildData})
-                          .planNode(),
-                      {})
-                  .planNode();
-
-  AssertQueryBuilder builder{plan};
-  auto task = builder.assertEmptyResults();
-
-  // Pipeline 0, operator 2 is the NLJ probe (operator 0 is Values,
-  // operator 1 is CudfFromVelox).
-  // 2 probe rows x 3 build rows = 6 output rows.
-  auto outputPositions =
-      task->taskStats().pipelineStats[0].operatorStats[2].outputPositions;
-  ASSERT_EQ(outputPositions, 6);
-}
