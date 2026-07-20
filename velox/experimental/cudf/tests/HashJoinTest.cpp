@@ -9105,4 +9105,77 @@ TEST_F(HashJoinTest, emptyBuildWithDebugEnabled) {
       .run();
 }
 
+// Verify that cuDF hash join works correctly with mixed grouped execution.
+// In mixed mode the build runs ungrouped while the probe runs in grouped
+// split groups.  CudfHashJoinBuild/CudfHashJoinProbe use custom join bridges
+// (getCustomJoinBridge), which requires DriverFactory::needsCustomJoinBridges()
+// to correctly include the bridge for the ungrouped factory and exclude it from
+// grouped factories.  Without this, the probe hangs waiting on an empty bridge.
+TEST_F(HashJoinTest, mixedGroupedExecution) {
+  auto vectors = makeVectors(probeType_, 4, 20);
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), vectors);
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId probeScanNodeId;
+  core::PlanNodeId buildScanNodeId;
+
+  PlanBuilder planBuilder(planNodeIdGenerator, pool_.get());
+  auto plan = planBuilder.tableScan(probeType_)
+                  .capturePlanNodeId(probeScanNodeId)
+                  .project({"t_k1 as x"})
+                  .hashJoin(
+                      {"x"},
+                      {"y"},
+                      PlanBuilder(planNodeIdGenerator, pool_.get())
+                          .tableScan(probeType_)
+                          .capturePlanNodeId(buildScanNodeId)
+                          .project({"t_k1 as y"})
+                          .planNode(),
+                      "",
+                      {"x", "y"})
+                  .planNode();
+
+  auto planFragment = core::PlanFragment{
+      plan, core::ExecutionStrategy::kGrouped, 2, {probeScanNodeId}};
+
+  std::vector<RowVectorPtr> results;
+  auto queryCtx = core::QueryCtx::create(executor_.get());
+  auto task = exec::Task::create(
+      "0",
+      std::move(planFragment),
+      0,
+      std::move(queryCtx),
+      Task::ExecutionMode::kParallel,
+      [&results](RowVectorPtr result, bool, ContinueFuture*) {
+        if (result) {
+          results.push_back(std::move(result));
+        }
+        return BlockingReason::kNotBlocked;
+      });
+
+  task->start(3, 1);
+
+  // Add ungrouped build split.
+  task->addSplit(
+      buildScanNodeId,
+      exec::Split(makeHiveConnectorSplit(filePath->getPath())));
+  // Add grouped probe splits.
+  task->addSplit(
+      probeScanNodeId,
+      exec::Split(makeHiveConnectorSplit(filePath->getPath()), 0));
+  task->addSplit(
+      probeScanNodeId,
+      exec::Split(makeHiveConnectorSplit(filePath->getPath()), 1));
+
+  task->noMoreSplits(buildScanNodeId);
+  task->noMoreSplitsForGroup(probeScanNodeId, 0);
+  task->noMoreSplitsForGroup(probeScanNodeId, 1);
+  task->noMoreSplits(probeScanNodeId);
+
+  ASSERT_TRUE(waitForTaskCompletion(task.get(), 10'000'000));
+  ASSERT_EQ(task->state(), exec::TaskState::kFinished);
+  ASSERT_FALSE(results.empty());
+}
+
 } // namespace
