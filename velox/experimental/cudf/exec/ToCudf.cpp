@@ -54,6 +54,36 @@ bool isAnyOf(const Base* p) {
   return ((dynamic_cast<const Deriveds*>(p) != nullptr) || ...);
 }
 
+/// Returns true if every leaf type in \p type can be represented in cuDF.
+bool isTypeSupportedByCudf(const TypePtr& type) {
+  switch (type->kind()) {
+    case TypeKind::BOOLEAN:
+    case TypeKind::TINYINT:
+    case TypeKind::SMALLINT:
+    case TypeKind::INTEGER:
+    case TypeKind::BIGINT:
+    case TypeKind::HUGEINT:
+    case TypeKind::REAL:
+    case TypeKind::DOUBLE:
+    case TypeKind::VARCHAR:
+    case TypeKind::VARBINARY:
+    case TypeKind::TIMESTAMP:
+      return true;
+    case TypeKind::ARRAY:
+      return isTypeSupportedByCudf(type->childAt(0));
+    case TypeKind::ROW: {
+      for (auto i = 0; i < type->size(); ++i) {
+        if (!isTypeSupportedByCudf(type->childAt(i))) {
+          return false;
+        }
+      }
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
 } // namespace
 
 core::PlanNodePtr CompileState::getPlanNode(const core::PlanNodeId& id) const {
@@ -115,6 +145,15 @@ bool CompileState::compile(bool allowCpuFallback) {
           props.acceptsGpuInput = true;
           props.producesGpuOutput = true;
         }
+        // Reject operators whose output types cannot be represented in cuDF.
+        if (isValidPlanNodeId(op->planNodeId())) {
+          auto planNode = getPlanNode(op->planNodeId());
+          if (planNode && !isTypeSupportedByCudf(planNode->outputType())) {
+            props.canRunOnGPU = false;
+            props.acceptsGpuInput = false;
+            props.producesGpuOutput = false;
+          }
+        }
         return props;
       };
 
@@ -127,6 +166,9 @@ bool CompileState::compile(bool allowCpuFallback) {
       getOperatorProperties);
 
   int32_t operatorsOffset = 0;
+  // When an operator's input types are unsupported by cuDF, all subsequent
+  // operators in the pipeline must also stay on CPU.
+  bool skipGpuReplacement = false;
   for (int32_t operatorIndex = 0; operatorIndex < operators.size();
        ++operatorIndex) {
     std::vector<std::unique_ptr<exec::Operator>> replaceOp;
@@ -153,9 +195,21 @@ bool CompileState::compile(bool allowCpuFallback) {
     }
 
     if (previousOperatorIsNotGpu and thisOpProps.acceptsGpuInput and planNode) {
-      replaceOp.push_back(
-          std::make_unique<CudfFromVelox>(
-              id, planNode->outputType(), ctx, planNode->id() + "-from-velox"));
+      // Check that the previous operator's output types can be converted to
+      // cuDF.  If not, skip both the CudfFromVelox insertion and the current
+      // operator's GPU replacement so the whole pipeline stays on CPU.
+      auto prevPlanNode =
+          getPlanNode(operators[operatorIndex - 1]->planNodeId());
+      if (prevPlanNode &&
+          isTypeSupportedByCudf(prevPlanNode->outputType())) {
+        replaceOp.push_back(std::make_unique<CudfFromVelox>(
+            id,
+            planNode->outputType(),
+            ctx,
+            planNode->id() + "-from-velox"));
+      } else {
+        skipGpuReplacement = true;
+      }
     }
     if (not replaceOp.empty()) {
       // from-velox only, because need to inserted before current operator.
@@ -178,7 +232,7 @@ bool CompileState::compile(bool allowCpuFallback) {
     if (adapter) {
       keepOperator = adapter->keepOperator();
       if (keepOperator == 0) {
-        if (planNode && thisOpProps.canRunOnGPU) {
+        if (planNode && thisOpProps.canRunOnGPU && !skipGpuReplacement) {
           auto replacements =
               adapter->createReplacements(oper, planNode, ctx, id);
           for (auto& r : replacements) {
@@ -205,7 +259,7 @@ bool CompileState::compile(bool allowCpuFallback) {
       }
     }
 
-    if (thisOpProps.producesGpuOutput and
+    if (thisOpProps.producesGpuOutput and !skipGpuReplacement and
         (nextOperatorIsNotGpu or isLastOperatorOfTask) and planNode) {
       replaceOp.push_back(
           std::make_unique<CudfToVelox>(
