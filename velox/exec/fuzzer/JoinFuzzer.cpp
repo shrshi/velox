@@ -204,29 +204,22 @@ JoinFuzzer::JoinFuzzer(
     std::unique_ptr<test::ReferenceQueryRunner> referenceQueryRunner)
     : vectorFuzzer_{getFuzzerOptions(), pool_.get()},
       referenceQueryRunner_{std::move(referenceQueryRunner)} {
-  std::cout << "DEBUG: JoinFuzzer ctor: registering local filesystem"
-            << std::endl;
   filesystems::registerLocalFileSystem();
 
   // Make sure not to run out of open file descriptors.
   std::unordered_map<std::string, std::string> hiveConfig = {
       {connector::hive::HiveConfig::kNumCacheFileHandles, "1000"}};
 
-  std::cout << "DEBUG: JoinFuzzer ctor: creating HiveConnector" << std::endl;
   connector::hive::HiveConnectorFactory factory;
   auto hiveConnector = factory.newConnector(
       test::kHiveConnectorId,
       std::make_shared<config::ConfigBase>(std::move(hiveConfig)));
-  std::cout << "DEBUG: JoinFuzzer ctor: inserting HiveConnector" << std::endl;
   connector::ConnectorRegistry::global().insert(
       hiveConnector->connectorId(), hiveConnector);
-  std::cout << "DEBUG: JoinFuzzer ctor: registering dwrf" << std::endl;
   dwrf::registerDwrfReaderFactory();
   dwrf::registerDwrfWriterFactory();
 
-  std::cout << "DEBUG: JoinFuzzer ctor: seeding" << std::endl;
   seed(initialSeed);
-  std::cout << "DEBUG: JoinFuzzer ctor: done" << std::endl;
 }
 
 template <typename T>
@@ -385,11 +378,6 @@ RowVectorPtr JoinFuzzer::execute(
             << ": " << std::endl
             << plan.plan->toString(true, true);
 
-  std::cout << "DEBUG: execute() strategy="
-            << static_cast<int>(plan.executionStrategy)
-            << " mixed=" << plan.mixedGroupedExecution
-            << " numGroups=" << plan.numGroups
-            << std::endl;
   test::AssertQueryBuilder builder(plan.plan);
   for (const auto& [planNodeId, nodeSplits] : plan.splits) {
     builder.splits(planNodeId, nodeSplits);
@@ -426,7 +414,6 @@ RowVectorPtr JoinFuzzer::execute(
 
   TestScopedSpillInjection scopedSpillInjection(spillPct);
   RowVectorPtr result;
-  std::cout << "DEBUG: execute() calling copyResults" << std::endl;
   try {
     result = builder.maxDrivers(2).copyResults(pool_.get());
   } catch (VeloxRuntimeError& e) {
@@ -440,7 +427,6 @@ RowVectorPtr JoinFuzzer::execute(
 
     throw e;
   }
-  std::cout << "DEBUG: execute() copyResults returned" << std::endl;
   LOG(INFO) << "Results: " << result->toString();
   if (VLOG_IS_ON(1)) {
     VLOG(1) << std::endl << result->toString(0, result->size());
@@ -448,11 +434,7 @@ RowVectorPtr JoinFuzzer::execute(
   // Wait for the task to be destroyed before start next query execution to
   // avoid the potential interference of the background activities across query
   // executions.
-  std::cout << "DEBUG: execute() calling waitForAllTasksToBeDeleted"
-            << std::endl;
   test::waitForAllTasksToBeDeleted();
-  std::cout << "DEBUG: execute() waitForAllTasksToBeDeleted returned"
-            << std::endl;
   return result;
 }
 
@@ -616,8 +598,6 @@ void addPlansForInputType(
 }
 
 void JoinFuzzer::verify(core::JoinType joinType) {
-  std::cout << "DEBUG: verify() entered, joinType=" << static_cast<int>(joinType)
-            << std::endl;
   const bool nullAware =
       isNullAwareSupported(joinType) && vectorFuzzer_.coinToss(0.5);
 
@@ -831,15 +811,7 @@ void JoinFuzzer::verify(core::JoinType joinType) {
     }
   }
 
-  std::cout << "DEBUG: verify() altPlans.size()=" << altPlans.size() << std::endl;
   for (auto i = 0; i < altPlans.size(); ++i) {
-    std::cout << "DEBUG: verify() testing altPlan #" << i
-              << " strategy="
-              << static_cast<int>(altPlans[i].executionStrategy)
-              << " mixed=" << altPlans[i].mixedGroupedExecution
-              << "\n"
-              << altPlans[i].plan->toString(true, true)
-              << std::endl;
     LOG(INFO) << "Testing plan #" << i;
     auto actual = execute(altPlans[i], /*injectSpill=*/false);
     if (actual != nullptr && expected != nullptr) {
@@ -882,7 +854,6 @@ void JoinFuzzer::verify(core::JoinType joinType) {
 }
 
 void JoinFuzzer::go() {
-  std::cout << "DEBUG: JoinFuzzer::go() entered" << std::endl;
   VELOX_USER_CHECK(
       FLAGS_steps > 0 || FLAGS_duration_sec > 0,
       "Either --steps or --duration_sec needs to be greater than zero.");
@@ -891,7 +862,6 @@ void JoinFuzzer::go() {
   const auto startTime = std::chrono::system_clock::now();
 
   while (!isDone(stats_.numIterations, startTime)) {
-    std::cout << "DEBUG: go() iteration " << stats_.numIterations << std::endl;
     LOG(WARNING) << "==============================> Started iteration "
                  << stats_.numIterations << " (seed: " << currentSeed_ << ")";
 
