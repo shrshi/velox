@@ -36,6 +36,7 @@
 #include "velox/experimental/cudf/exec/CudfWindow.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/exec/Validation.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
@@ -62,65 +63,6 @@
 #include "velox/exec/Window.h"
 
 namespace facebook::velox::cudf_velox {
-
-namespace {
-/// Returns true if every leaf type in \p type can be represented in cuDF.
-bool isTypeSupportedByCudf(const TypePtr& type) {
-  switch (type->kind()) {
-    case TypeKind::BOOLEAN:
-    case TypeKind::TINYINT:
-    case TypeKind::SMALLINT:
-    case TypeKind::INTEGER:
-    case TypeKind::BIGINT:
-    case TypeKind::HUGEINT:
-    case TypeKind::REAL:
-    case TypeKind::DOUBLE:
-    case TypeKind::VARCHAR:
-    case TypeKind::VARBINARY:
-    case TypeKind::TIMESTAMP:
-      return true;
-    case TypeKind::ARRAY:
-      return isTypeSupportedByCudf(type->childAt(0));
-    case TypeKind::ROW: {
-      for (auto i = 0; i < type->size(); ++i) {
-        if (!isTypeSupportedByCudf(type->childAt(i))) {
-          return false;
-        }
-      }
-      return true;
-    }
-    default:
-      return false;
-  }
-}
-
-/// Returns true if every column in \p rowType is supported by cuDF.
-bool allColumnTypesSupportedByCudf(const RowTypePtr& rowType) {
-  for (auto i = 0; i < rowType->size(); ++i) {
-    if (!isTypeSupportedByCudf(rowType->childAt(i))) {
-      return false;
-    }
-  }
-  return true;
-}
-
-/// Returns true if \p type is a complex type (ROW, ARRAY, MAP) that cannot
-/// be used with cudf::make_default_constructed_scalar for null-filling.
-bool isComplexType(const TypePtr& type) {
-  return type->kind() == TypeKind::ROW || type->kind() == TypeKind::ARRAY ||
-      type->kind() == TypeKind::MAP;
-}
-
-/// Returns true if \p rowType contains any column with a complex type.
-bool hasComplexColumn(const RowTypePtr& rowType) {
-  for (auto i = 0; i < rowType->size(); ++i) {
-    if (isComplexType(rowType->childAt(i))) {
-      return true;
-    }
-  }
-  return false;
-}
-} // namespace
 
 /// OperatorAdapterRegistry Implementation
 OperatorAdapterRegistry& OperatorAdapterRegistry::getInstance() {
@@ -433,26 +375,12 @@ class CudfHashJoinBaseAdapter : public OperatorAdapter {
 
     // Reject if any source has types that cuDF cannot represent.
     for (const auto& source : joinPlanNode->sources()) {
-      if (!allColumnTypesSupportedByCudf(source->outputType())) {
+      if (!isTypeSupportedByCudf(source->outputType())) {
         LOG_FALLBACK(
             "HashJoin source has column types unsupported by cuDF, "
             "PlanNode id: {}",
             planNode->id());
         return false;
-      }
-    }
-
-    // cudf::make_default_constructed_scalar does not support complex types
-    // (STRUCT, LIST).  Non-inner joins null-fill columns of these types.
-    if (!core::isInnerJoin(joinPlanNode->joinType())) {
-      for (const auto& source : joinPlanNode->sources()) {
-        if (hasComplexColumn(source->outputType())) {
-          LOG_FALLBACK(
-              "HashJoin source has complex-typed columns unsupported "
-              "for null-filling, PlanNode id: {}",
-              planNode->id());
-          return false;
-        }
       }
     }
 
@@ -567,26 +495,12 @@ class CudfNestedLoopJoinBaseAdapter : public OperatorAdapter {
 
     // Reject if any source has types that cuDF cannot represent.
     for (const auto& source : joinPlanNode->sources()) {
-      if (!allColumnTypesSupportedByCudf(source->outputType())) {
+      if (!isTypeSupportedByCudf(source->outputType())) {
         LOG_FALLBACK(
             "NestedLoopJoin source has column types unsupported by cuDF, "
             "PlanNode id: {}",
             planNode->id());
         return false;
-      }
-    }
-
-    // cudf::make_default_constructed_scalar does not support complex types
-    // (STRUCT, LIST).  Non-inner joins null-fill columns of these types.
-    if (!core::isInnerJoin(joinPlanNode->joinType())) {
-      for (const auto& source : joinPlanNode->sources()) {
-        if (hasComplexColumn(source->outputType())) {
-          LOG_FALLBACK(
-              "NestedLoopJoin source has complex-typed columns unsupported "
-              "for null-filling, PlanNode id: {}",
-              planNode->id());
-          return false;
-        }
       }
     }
 

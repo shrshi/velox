@@ -26,6 +26,7 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/PrestoAggregateFunctions.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/expression/AstExpression.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
@@ -52,36 +53,6 @@ namespace {
 template <class... Deriveds, class Base>
 bool isAnyOf(const Base* p) {
   return ((dynamic_cast<const Deriveds*>(p) != nullptr) || ...);
-}
-
-/// Returns true if every leaf type in \p type can be represented in cuDF.
-bool isTypeSupportedByCudf(const TypePtr& type) {
-  switch (type->kind()) {
-    case TypeKind::BOOLEAN:
-    case TypeKind::TINYINT:
-    case TypeKind::SMALLINT:
-    case TypeKind::INTEGER:
-    case TypeKind::BIGINT:
-    case TypeKind::HUGEINT:
-    case TypeKind::REAL:
-    case TypeKind::DOUBLE:
-    case TypeKind::VARCHAR:
-    case TypeKind::VARBINARY:
-    case TypeKind::TIMESTAMP:
-      return true;
-    case TypeKind::ARRAY:
-      return isTypeSupportedByCudf(type->childAt(0));
-    case TypeKind::ROW: {
-      for (auto i = 0; i < type->size(); ++i) {
-        if (!isTypeSupportedByCudf(type->childAt(i))) {
-          return false;
-        }
-      }
-      return true;
-    }
-    default:
-      return false;
-  }
 }
 
 } // namespace
