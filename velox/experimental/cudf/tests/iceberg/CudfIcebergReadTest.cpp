@@ -1349,6 +1349,11 @@ TEST_F(CudfIcebergReadTest, compactDecimalFilterWithInjectedColumn) {
             cudf_velox::connector::hive::CudfHiveConfig::
                 kUseExperimentalCudfReaderSession,
             useExperimentalReader ? "true" : "false")
+        .connectorSessionProperty(
+            kCudfIcebergConnectorId,
+            cudf_velox::connector::hive::CudfHiveConfig::
+                kPreserveCompactDecimalsSession,
+            "true")
         .splits(makeIcebergSplits(dataFile->getPath(), {}, partitionKeys))
         .assertResults({expected});
     AssertQueryBuilder(plan)
@@ -1357,6 +1362,11 @@ TEST_F(CudfIcebergReadTest, compactDecimalFilterWithInjectedColumn) {
             cudf_velox::connector::hive::CudfHiveConfig::
                 kUseExperimentalCudfReaderSession,
             useExperimentalReader ? "true" : "false")
+        .connectorSessionProperty(
+            kCudfIcebergConnectorId,
+            cudf_velox::connector::hive::CudfHiveConfig::
+                kPreserveCompactDecimalsSession,
+            "true")
         .splits(
             makeIcebergSplits(dataFile->getPath(), {deleteFile}, partitionKeys))
         .assertResults({deletedExpected});
