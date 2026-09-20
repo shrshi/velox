@@ -143,6 +143,17 @@ bool CudfHiveConfig::useExperimentalCudfReaderSession(
       config_->get<bool>(kUseExperimentalCudfReader, false));
 }
 
+bool CudfHiveConfig::preserveCompactDecimals() const {
+  return config_->get<bool>(kPreserveCompactDecimals, false);
+}
+
+bool CudfHiveConfig::preserveCompactDecimalsSession(
+    const config::ConfigBase* session) const {
+  return session->get<bool>(
+      kPreserveCompactDecimalsSession,
+      config_->get<bool>(kPreserveCompactDecimals, false));
+}
+
 bool CudfHiveConfig::immutableFiles() const {
   return config_->get<bool>(kImmutableFiles, false);
 }
