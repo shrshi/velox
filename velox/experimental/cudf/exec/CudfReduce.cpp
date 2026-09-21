@@ -401,13 +401,16 @@ std::unique_ptr<cudf::column> singleOrRawDecimalSumWithCast(
   auto const sumAgg = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
   auto const cudfOutType = cudf_velox::veloxToCudfDataType(outputType);
   std::unique_ptr<cudf::column> castedInput;
-  if (outputType->isDecimal() && inputCol.type() != cudfOutType) {
-    castedInput = cudf::cast(inputCol, cudfOutType, stream, get_temp_mr());
-    inputCol = castedInput->view();
+  if (outputType->isDecimal()) {
+    inputCol = prepareDecimalSumInput(inputCol, castedInput, stream);
   }
-  auto const resultScalar =
-      cudf::reduce(inputCol, *sumAgg, cudfOutType, stream, get_temp_mr());
-  return cudf::make_column_from_scalar(*resultScalar, 1, stream, mr);
+  auto resultScalar = cudf::reduce(
+      inputCol, *sumAgg, inputCol.type(), stream, get_temp_mr());
+  auto result = cudf::make_column_from_scalar(*resultScalar, 1, stream, mr);
+  if (result->type() != cudfOutType) {
+    result = cudf::cast(*result, cudfOutType, stream, mr);
+  }
+  return result;
 }
 
 std::unique_ptr<cudf::column> reduceIntermediateDecimalFromSerializedColumn(
