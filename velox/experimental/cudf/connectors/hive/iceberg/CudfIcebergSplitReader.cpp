@@ -674,7 +674,8 @@ void CudfIcebergSplitReader::setupDeleteFileReaders(
             ioStatistics_,
             ioStats_,
             runtimeStats,
-            icebergSplit_->connectorId));
+            icebergSplit_->connectorId,
+            preserveCompactDecimals()));
   }
 
   if (deletionVectorFile_ != nullptr) {

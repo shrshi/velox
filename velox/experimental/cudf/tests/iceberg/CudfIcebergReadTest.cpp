@@ -2817,7 +2817,7 @@ TEST_F(CudfIcebergReadTest, nonProjectedDeleteKeyColumn) {
   assertEqualResults({expected}, {result});
 }
 
-TEST_F(CudfIcebergReadTest, normalizeHiddenDecimalEqualityKey) {
+TEST_F(CudfIcebergReadTest, canonicalizeDecimalEqualityKey) {
   auto data = makeRowVector(
       {"price", "id"},
       {makeNullableFlatVector<int64_t>(
@@ -2826,9 +2826,11 @@ TEST_F(CudfIcebergReadTest, normalizeHiddenDecimalEqualityKey) {
   auto dataFile = TempFilePath::create();
   writeCompactDecimalParquet(dataFile->getPath(), data);
   auto deletePath = TempFilePath::create();
+  // Use a wider physical decimal in the delete file than in the data file.
+  // Both keys must be canonicalized to the table's logical DECIMAL(5, 2).
   auto keys = makeRowVector(
       {"price"},
-      {makeNullableFlatVector<int64_t>({-500, std::nullopt}, DECIMAL(5, 2))});
+      {makeNullableFlatVector<int64_t>({-500, std::nullopt}, DECIMAL(18, 2))});
   writeDeleteFile(DeleteFileFormat::PARQUET, deletePath->getPath(), {keys});
   IcebergDeleteFile deleteFile(
       FileContent::kEqualityDeletes,
@@ -2837,24 +2839,39 @@ TEST_F(CudfIcebergReadTest, normalizeHiddenDecimalEqualityKey) {
       2,
       getFileSize(deletePath->getPath()),
       /*equalityFieldIds=*/{1});
-  auto plan = PlanBuilder()
-                  .startTableScan()
-                  .connectorId(kCudfIcebergConnectorId)
-                  .outputType(ROW("id", BIGINT()))
-                  .dataColumns(data->rowType())
-                  .endTableScan()
-                  .planNode();
-  auto expected = makeRowVector({"id"}, {makeFlatVector<int64_t>({1, 4})});
-  for (const bool experimental : {false, true}) {
-    SCOPED_TRACE(experimental);
-    AssertQueryBuilder(plan)
-        .connectorSessionProperty(
-            kCudfIcebergConnectorId,
-            cudf_velox::connector::hive::CudfHiveConfig::
-                kUseExperimentalCudfReaderSession,
-            experimental ? "true" : "false")
-        .splits(makeIcebergSplits(dataFile->getPath(), {deleteFile}))
-        .assertResults({expected});
+  for (const bool projectKey : {false, true}) {
+    const auto outputType =
+        projectKey ? data->rowType() : ROW("id", BIGINT());
+    auto plan = PlanBuilder()
+                    .startTableScan()
+                    .connectorId(kCudfIcebergConnectorId)
+                    .outputType(outputType)
+                    .dataColumns(data->rowType())
+                    .endTableScan()
+                    .planNode();
+    auto expected = projectKey
+        ? makeRowVector(
+              {"price", "id"},
+              {makeFlatVector<int64_t>({100, -700}, DECIMAL(5, 2)),
+               makeFlatVector<int64_t>({1, 4})})
+        : makeRowVector({"id"}, {makeFlatVector<int64_t>({1, 4})});
+    for (const bool experimental : {false, true}) {
+      SCOPED_TRACE(
+          fmt::format("projectKey={}, experimental={}", projectKey, experimental));
+      AssertQueryBuilder(plan)
+          .connectorSessionProperty(
+              kCudfIcebergConnectorId,
+              cudf_velox::connector::hive::CudfHiveConfig::
+                  kUseExperimentalCudfReaderSession,
+              experimental ? "true" : "false")
+          .connectorSessionProperty(
+              kCudfIcebergConnectorId,
+              cudf_velox::connector::hive::CudfHiveConfig::
+                  kPreserveCompactDecimalsSession,
+              "true")
+          .splits(makeIcebergSplits(dataFile->getPath(), {deleteFile}))
+          .assertResults({expected});
+    }
   }
 }
 
