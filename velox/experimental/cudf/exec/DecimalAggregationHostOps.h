@@ -55,6 +55,16 @@ cudf::column_view castDecimalInputToDecimal128(
     cuda::stream_ref stream);
 
 /**
+ * Casts a decimal column to the narrowest width that safely accumulates a
+ * single cuDF column: DECIMAL32 to DECIMAL64, and DECIMAL64 to DECIMAL128.
+ * DECIMAL128 is returned unchanged. Scale is preserved.
+ */
+cudf::column_view prepareDecimalSumInput(
+    cudf::column_view inputCol,
+    std::unique_ptr<cudf::column>& holder,
+    cuda::stream_ref stream);
+
+/**
  * Ensures the partial-row count column is INT64, casting with the temporary
  * memory resource (the result is consumed internally, not part of operator
  * output) when the incoming type differs.

@@ -45,7 +45,7 @@
 namespace {
 
 using namespace facebook::velox;
-using facebook::velox::cudf_velox::castDecimalInputToDecimal128;
+using facebook::velox::cudf_velox::prepareDecimalSumInput;
 using facebook::velox::cudf_velox::CountInputKind;
 using facebook::velox::cudf_velox::finalizeDecimalAverage;
 using facebook::velox::cudf_velox::get_output_mr;
@@ -301,7 +301,7 @@ std::unique_ptr<cudf::column> partialDecimalSumCountToSerializedString(
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   std::unique_ptr<cudf::column> castedInput;
-  inputCol = castDecimalInputToDecimal128(inputCol, castedInput, stream);
+  inputCol = prepareDecimalSumInput(inputCol, castedInput, stream);
   auto const sumAgg = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
   auto sumScalar =
       cudf::reduce(inputCol, *sumAgg, inputCol.type(), stream, get_temp_mr());
@@ -373,7 +373,7 @@ std::unique_ptr<cudf::column> singleDecimalAvgFromRawColumn(
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   std::unique_ptr<cudf::column> castedInput;
-  inputCol = castDecimalInputToDecimal128(inputCol, castedInput, stream);
+  inputCol = prepareDecimalSumInput(inputCol, castedInput, stream);
   auto const sumAgg = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
   auto sumScalar =
       cudf::reduce(inputCol, *sumAgg, inputCol.type(), stream, get_temp_mr());

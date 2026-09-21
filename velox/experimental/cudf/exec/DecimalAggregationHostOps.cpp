@@ -53,6 +53,29 @@ cudf::column_view castDecimalInputToDecimal128(
   return holder->view();
 }
 
+cudf::column_view prepareDecimalSumInput(
+    cudf::column_view inputCol,
+    std::unique_ptr<cudf::column>& holder,
+    cuda::stream_ref stream) {
+  const auto inputType = inputCol.type().id();
+  if (inputType == cudf::type_id::DECIMAL128) {
+    return inputCol;
+  }
+  VELOX_CHECK(
+      inputType == cudf::type_id::DECIMAL32 ||
+          inputType == cudf::type_id::DECIMAL64,
+      "Expected decimal SUM input");
+  const auto targetType = inputType == cudf::type_id::DECIMAL32
+      ? cudf::type_id::DECIMAL64
+      : cudf::type_id::DECIMAL128;
+  holder = cudf::cast(
+      inputCol,
+      cudf::data_type{targetType, inputCol.type().scale()},
+      stream,
+      get_temp_mr());
+  return holder->view();
+}
+
 std::unique_ptr<cudf::column> castCountColumnToInt64(
     std::unique_ptr<cudf::column> count,
     cuda::stream_ref stream) {

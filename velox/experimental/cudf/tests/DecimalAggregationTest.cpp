@@ -556,24 +556,24 @@ TEST_F(CudfDecimalTest, compactDecimalGreatestLeast) {
   }
 }
 
-TEST_F(CudfDecimalTest, compactDecimalInputWidenedBeforeSum) {
+TEST_F(CudfDecimalTest, compactDecimalInputPreparedForSum) {
   auto stream = cudf::get_default_stream();
   auto mr = cudf::get_current_device_resource_ref();
   const std::vector<bool> valid{true, true, true, false};
   auto input = makeDecimalColumn<int32_t>(
       {900'000'000, 900'000'000, 900'000'000, 0}, 2, &valid, stream);
   std::unique_ptr<cudf::column> owner;
-  auto widened = castDecimalInputToDecimal128(input->view(), owner, stream);
-  ASSERT_EQ(widened.type().id(), cudf::type_id::DECIMAL128);
-  EXPECT_EQ(widened.type().scale(), input->type().scale());
-  EXPECT_EQ(widened.null_count(), 1);
+  auto prepared = prepareDecimalSumInput(input->view(), owner, stream);
+  ASSERT_EQ(prepared.type().id(), cudf::type_id::DECIMAL64);
+  EXPECT_EQ(prepared.type().scale(), input->type().scale());
+  EXPECT_EQ(prepared.null_count(), 1);
 
   auto aggregation = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
-  auto sum = cudf::reduce(widened, *aggregation, widened.type(), stream, mr);
+  auto sum = cudf::reduce(prepared, *aggregation, prepared.type(), stream, mr);
   auto result = cudf::make_column_from_scalar(*sum, 1, stream, mr);
   EXPECT_EQ(
-      copyColumnData<int128_t>(result->view(), stream),
-      (std::vector<int128_t>{2'700'000'000}));
+      copyColumnData<int64_t>(result->view(), stream),
+      (std::vector<int64_t>{2'700'000'000}));
 }
 
 TEST_F(CudfDecimalTest, compactDecimalAggregations) {
