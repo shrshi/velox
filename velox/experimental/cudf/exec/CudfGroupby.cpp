@@ -48,7 +48,7 @@
 namespace {
 
 using namespace facebook::velox;
-using cudf_velox::castDecimalInputToDecimal128;
+using cudf_velox::prepareDecimalSumInput;
 using cudf_velox::CountInputKind;
 using cudf_velox::finalizeDecimalAverage;
 using cudf_velox::get_output_mr;
@@ -348,7 +348,7 @@ void addDecimalRawPartialSingleSumRequest(
     cuda::stream_ref stream,
     uint32_t& sumIdx,
     std::unique_ptr<cudf::column>& castedInput) {
-  auto inputView = castDecimalInputToDecimal128(input, castedInput, stream);
+  auto inputView = prepareDecimalSumInput(input, castedInput, stream);
   auto& request = requests.emplace_back();
   sumIdx = requests.size() - 1;
   request.values = inputView;
@@ -431,8 +431,8 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
   uint32_t countIdx_{0};
   std::unique_ptr<cudf::column> decodedSum_;
   std::unique_ptr<cudf::column> decodedCount_;
-  // Holds the DECIMAL64->DECIMAL128 cast of raw input (kPartial/kSingle), kept
-  // alive while the groupby request references its view.
+  // Holds the width-prepared raw input (kPartial/kSingle), kept alive while
+  // the groupby request references its view.
   std::unique_ptr<cudf::column> castedInput_;
 };
 
@@ -515,8 +515,8 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
   uint32_t countIdx_{0};
   std::unique_ptr<cudf::column> decodedSum_;
   std::unique_ptr<cudf::column> decodedCount_;
-  // Holds the DECIMAL64->DECIMAL128 cast of raw input (kPartial/kSingle), kept
-  // alive while the groupby request references its view.
+  // Holds the width-prepared raw input (kPartial/kSingle), kept alive while
+  // the groupby request references its view.
   std::unique_ptr<cudf::column> castedInput_;
 };
 
