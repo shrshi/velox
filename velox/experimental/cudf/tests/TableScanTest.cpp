@@ -927,6 +927,7 @@ TEST_F(TableScanTest, canonicalizesDecimalWidthAcrossSplits) {
       {makeFlatVector<int64_t>({200, -400, 600}, DECIMAL(7, 2)),
        makeFlatVector<int64_t>({4, 5, 6})})});
 
+  core::PlanNodeId orderById;
   auto plan = PlanBuilder(pool_.get())
                   .startTableScan()
                   .connectorId(kCudfHiveConnectorId)
@@ -937,6 +938,7 @@ TEST_F(TableScanTest, canonicalizesDecimalWidthAcrossSplits) {
                           allRegularColumns(rowType))
                   .endTableScan()
                   .orderBy({"c0 ASC NULLS LAST"}, false)
+                  .capturePlanNodeId(orderById)
                   .planNode();
   for (const bool experimental : {false, true}) {
     for (const auto& paths :
@@ -944,7 +946,7 @@ TEST_F(TableScanTest, canonicalizesDecimalWidthAcrossSplits) {
           std::vector{decimal64Path, decimal32Path}}) {
       SCOPED_TRACE(fmt::format(
           "experimental={}, first={}", experimental, paths.front()->getPath()));
-      AssertQueryBuilder(plan, duckDbQueryRunner_)
+      auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
           .connectorSessionProperty(
               kCudfHiveConnectorId,
               cudf_velox::connector::hive::CudfHiveConfig::
@@ -958,6 +960,11 @@ TEST_F(TableScanTest, canonicalizesDecimalWidthAcrossSplits) {
           .maxDrivers(1)
           .splits(makeCudfHiveConnectorSplits(paths))
           .assertResults("SELECT c0, c1 FROM tmp ORDER BY c0");
+      EXPECT_EQ(
+          toPlanStats(task->taskStats())
+              .at(orderById)
+              .operatorStats.count("CudfToVelox"),
+          1);
     }
   }
 }
