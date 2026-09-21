@@ -51,8 +51,9 @@ using CudfHybridScanReader =
 using CudfHybridScanReaderPtr = std::unique_ptr<CudfHybridScanReader>;
 
 /// Normalizes decimal columns, recursively, to their logical Velox types.
-/// If preserveCompactDecimals is true, matching-scale DECIMAL32 columns are
-/// left unchanged. columnTypes must describe every column after
+/// If preserveCompactDecimals is true, logical precisions up to 9 use
+/// DECIMAL32; other decimals use Velox's native logical width. columnTypes
+/// must describe every column after
 /// numPrependedColumns, which are left unchanged. Casts and buffer releases
 /// use the supplied stream.
 std::unique_ptr<cudf::table> castDecimalColumnsToVeloxTypes(
@@ -133,8 +134,8 @@ class CudfSplitReader : public NvtxHelper {
   // Read the next table chunk from the parquet reader (regular or hybrid).
   // Returns nullopt when no more data. By default, all decimals have their
   // logical Velox scale and storage width before downstream processing. When
-  // compact preservation is enabled, matching-scale DECIMAL32 columns remain
-  // compact. A prepended row-index column is not part of the logical schema.
+  // compact preservation is enabled, logical precisions up to 9 use DECIMAL32.
+  // A prepended row-index column is not part of the logical schema.
   virtual std::optional<std::unique_ptr<cudf::table>> readNextChunk();
 
   // Setup the cuDF data source

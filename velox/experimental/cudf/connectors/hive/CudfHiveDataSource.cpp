@@ -124,8 +124,7 @@ std::optional<SubfieldFilterDecimalType> parquetDecimalType(
 
 SubfieldFilterDecimalTypes parquetDecimalTypes(
     std::span<const cudf::io::parquet::SchemaElement> metadataSchema,
-    const RowTypePtr& readerSchema,
-    bool preservedOutputOnly = false) {
+    const RowTypePtr& readerSchema) {
   VELOX_CHECK(
       !metadataSchema.empty(), "Cannot build a filter from an empty schema");
 
@@ -142,12 +141,7 @@ SubfieldFilterDecimalTypes parquetDecimalTypes(
     const auto& logicalType = readerSchema->findChild(child.name);
     if (logicalType->isDecimal()) {
       if (auto decimalType = parquetDecimalType(child)) {
-        const auto logicalScale = getDecimalPrecisionScale(*logicalType).second;
-        if (!preservedOutputOnly ||
-            (decimalType->type == cudf::type_id::DECIMAL32 &&
-             decimalType->isDecimal && decimalType->scale == logicalScale)) {
-          decimalTypes.emplace(child.name, *decimalType);
-        }
+        decimalTypes.emplace(child.name, *decimalType);
       }
     }
   }
@@ -362,8 +356,21 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
               -> cudf::ast::expression const* {
             postReadFilterTree_ = cudf::ast::tree{};
             postReadFilterScalars_.clear();
-            const auto decimalTypes = parquetDecimalTypes(
-                metadata.schema, readerFilterType, /*preservedOutputOnly=*/true);
+            SubfieldFilterDecimalTypes decimalTypes;
+            for (const auto& [subfield, _] : subfieldFilters_) {
+              const auto& fieldName = subfield.toString();
+              const auto& type = readerFilterType->findChild(fieldName);
+              if (type->isDecimal()) {
+                const auto [precision, scale] =
+                    getDecimalPrecisionScale(*type);
+                if (precision <= std::numeric_limits<int32_t>::digits10) {
+                  decimalTypes.emplace(
+                      fieldName,
+                      SubfieldFilterDecimalType{
+                          cudf::type_id::DECIMAL32, scale});
+                }
+              }
+            }
             return &createAstFromSubfieldFilters(
                 subfieldFilters_,
                 postReadFilterTree_,
