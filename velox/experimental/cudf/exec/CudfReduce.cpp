@@ -55,7 +55,7 @@ using facebook::velox::cudf_velox::ResolvedAggregateInfo;
 using facebook::velox::cudf_velox::serializeDecimalPartialOrIntermediateState;
 using facebook::velox::cudf_velox::validateIntermediateColumnType;
 
-#define DEFINE_SIMPLE_REDUCE_AGGREGATOR(Name, name)                            \
+#define DEFINE_SIMPLE_REDUCE_AGGREGATOR(Name, name, PreserveCompactDecimal)   \
   struct Reduce##Name##Aggregator : ReduceAggregator {                         \
     Reduce##Name##Aggregator(                                                  \
         core::AggregationNode::Step step,                                      \
@@ -78,7 +78,6 @@ using facebook::velox::cudf_velox::validateIntermediateColumnType;
         rmm::device_async_resource_ref mr) override {                          \
       auto const aggRequest =                                                  \
           cudf::make_##name##_aggregation<cudf::reduce_aggregation>();         \
-      auto const cudfOutputType = cudf_velox::veloxToCudfDataType(outputType); \
       /* Mask only applies at raw input, where maskIndex is set; the           \
          injected column owns the lifetime through cudf::reduce. cudf          \
          reduce(SUM/MIN/MAX) over an all-null group yields a null              \
@@ -87,15 +86,19 @@ using facebook::velox::cudf_velox::validateIntermediateColumnType;
           input, inputIndex, maskIndex, stream, get_temp_mr());                \
       auto const reduceInput =                                                 \
           injected ? injected->view() : input.column(inputIndex);              \
+      auto const cudfOutputType = PreserveCompactDecimal                       \
+          ? cudf_velox::decimalAggregationOutputType(                          \
+                reduceInput.type(), outputType)                                \
+          : cudf_velox::veloxToCudfDataType(outputType);                       \
       auto const resultScalar = cudf::reduce(                                  \
           reduceInput, *aggRequest, cudfOutputType, stream, get_temp_mr());    \
       return cudf::make_column_from_scalar(*resultScalar, 1, stream, mr);      \
     }                                                                          \
   };
 
-DEFINE_SIMPLE_REDUCE_AGGREGATOR(Sum, sum)
-DEFINE_SIMPLE_REDUCE_AGGREGATOR(Min, min)
-DEFINE_SIMPLE_REDUCE_AGGREGATOR(Max, max)
+DEFINE_SIMPLE_REDUCE_AGGREGATOR(Sum, sum, false)
+DEFINE_SIMPLE_REDUCE_AGGREGATOR(Min, min, true)
+DEFINE_SIMPLE_REDUCE_AGGREGATOR(Max, max, true)
 
 struct ReduceCountAggregator : ReduceAggregator {
   ReduceCountAggregator(

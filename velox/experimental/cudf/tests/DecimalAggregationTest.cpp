@@ -290,7 +290,8 @@ class CudfDecimalTest : public exec::test::OperatorTestBase {
   RowVectorPtr runDecimalOperators(
       const core::PlanNodePtr& plan,
       CudfVectorPtr input,
-      const std::vector<cudf::size_type>& resultChannels) {
+      const std::vector<cudf::size_type>& resultChannels,
+      const std::vector<cudf::type_id>& resultPhysicalTypes = {}) {
     core::PlanFragment fragment;
     fragment.planNode = plan;
     auto queryCtx = core::QueryCtx::create(executor_.get());
@@ -335,10 +336,18 @@ class CudfDecimalTest : public exec::test::OperatorTestBase {
       input = std::dynamic_pointer_cast<CudfVector>(current->getOutput());
       VELOX_CHECK_NOT_NULL(input);
     }
-    for (auto channel : resultChannels) {
-      EXPECT_EQ(
-          input->getTableView().column(channel).type(),
-          veloxToCudfDataType(plan->outputType()->childAt(channel)));
+    for (size_t i = 0; i < resultChannels.size(); ++i) {
+      const auto channel = resultChannels[i];
+      if (resultPhysicalTypes.empty()) {
+        EXPECT_EQ(
+            input->getTableView().column(channel).type(),
+            veloxToCudfDataType(plan->outputType()->childAt(channel)));
+      } else {
+        EXPECT_EQ(resultPhysicalTypes.size(), resultChannels.size());
+        EXPECT_EQ(
+            input->getTableView().column(channel).type().id(),
+            resultPhysicalTypes[i]);
+      }
     }
     // Select only aggregate results so window pass-through DECIMAL32 columns
     // do not require decimal32 Arrow import support.
@@ -574,6 +583,81 @@ TEST_F(CudfDecimalTest, compactDecimalInputPreparedForSum) {
   EXPECT_EQ(
       copyColumnData<int64_t>(result->view(), stream),
       (std::vector<int64_t>{2'700'000'000}));
+}
+
+TEST_F(CudfDecimalTest, compactDecimalMinMax) {
+  const auto decimalType = DECIMAL(7, 2);
+  auto logicalInput = makeRowVector({
+      makeFlatVector<int64_t>({0, 0, 1, 1}),
+      makeFlatVector<int64_t>({300, -500, 100, -700}, decimalType),
+      makeFlatVector<int64_t>({0, 1, 2, 3}),
+  });
+  auto stream = cudfGlobalStreamPool().get_stream();
+  auto table = with_arrow::toCudfTable(
+      logicalInput, pool(), stream, cudf::get_current_device_resource_ref());
+  auto columns = table->release();
+  columns[1] = makeDecimalColumn<int32_t>({300, -500, 100, -700}, 2, nullptr, stream);
+  auto makeInput = [&]() {
+    std::vector<std::unique_ptr<cudf::column>> copy;
+    copy.reserve(columns.size());
+    for (const auto& column : columns) {
+      copy.push_back(std::make_unique<cudf::column>(column->view(), stream));
+    }
+    return std::make_shared<CudfVector>(
+        pool(),
+        logicalInput->type(),
+        logicalInput->size(),
+        std::make_unique<cudf::table>(std::move(copy)),
+        stream);
+  };
+
+  for (const bool grouped : {false, true}) {
+    auto builder = exec::test::PlanBuilder().values({logicalInput});
+    const std::vector<std::string> keys =
+        grouped ? std::vector<std::string>{"c0"} : std::vector<std::string>{};
+    builder.singleAggregation(keys, {"min(c1)", "max(c1)"});
+    auto expected = grouped
+        ? makeRowVector({
+              makeFlatVector<int64_t>({0, 1}),
+              makeFlatVector<int64_t>({-500, -700}, decimalType),
+              makeFlatVector<int64_t>({300, 100}, decimalType),
+          })
+        : makeRowVector({
+              makeFlatVector<int64_t>({-700}, decimalType),
+              makeFlatVector<int64_t>({300}, decimalType),
+          });
+    const auto channels = grouped
+        ? std::vector<cudf::size_type>{0, 1, 2}
+        : std::vector<cudf::size_type>{0, 1};
+    const auto physicalTypes = grouped
+        ? std::vector{
+              cudf::type_id::INT64,
+              cudf::type_id::DECIMAL32,
+              cudf::type_id::DECIMAL32}
+        : std::vector{
+              cudf::type_id::DECIMAL32, cudf::type_id::DECIMAL32};
+    auto result = runDecimalOperators(
+        builder.planNode(), makeInput(), channels, physicalTypes);
+    ASSERT_TRUE(exec::test::assertEqualResults({expected}, {result}));
+  }
+
+  auto plan = exec::test::PlanBuilder()
+                  .values({logicalInput})
+                  .window({
+                      "min(c1) over (partition by c0 order by c2 rows between unbounded preceding and unbounded following)",
+                      "max(c1) over (partition by c0 order by c2 rows between unbounded preceding and current row)",
+                  })
+                  .planNode();
+  auto result = runDecimalOperators(
+      plan,
+      makeInput(),
+      {3, 4},
+      {cudf::type_id::DECIMAL32, cudf::type_id::DECIMAL32});
+  auto expected = makeRowVector({
+      makeFlatVector<int64_t>({-500, -500, -700, -700}, decimalType),
+      makeFlatVector<int64_t>({300, 300, 100, 100}, decimalType),
+  });
+  ASSERT_TRUE(exec::test::assertEqualResults({expected}, {result}));
 }
 
 TEST_F(CudfDecimalTest, compactDecimalAggregations) {

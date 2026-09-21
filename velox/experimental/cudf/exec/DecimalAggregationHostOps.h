@@ -64,6 +64,12 @@ cudf::column_view prepareDecimalSumInput(
     std::unique_ptr<cudf::column>& holder,
     cuda::stream_ref stream);
 
+/** Returns the canonical compact physical type when a DECIMAL32 result can be
+ * preserved, otherwise the native cuDF type for the logical Velox type. */
+cudf::data_type decimalAggregationOutputType(
+    cudf::data_type physicalResultType,
+    const TypePtr& logicalResultType);
+
 /**
  * Ensures the partial-row count column is INT64, casting with the temporary
  * memory resource (the result is consumed internally, not part of operator

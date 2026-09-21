@@ -204,7 +204,7 @@ struct StreamingGroupbyAverageAggregator final : StreamingGroupbyAggregator {
   size_t countResultIndex_{0};
 };
 
-template <auto MakeAggregation>
+template <auto MakeAggregation, bool PreserveCompactDecimal = false>
 struct SimpleGroupbyAggregator final : GroupbyAggregator {
   SimpleGroupbyAggregator(
       core::AggregationNode::Step step,
@@ -238,7 +238,9 @@ struct SimpleGroupbyAggregator final : GroupbyAggregator {
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
     auto column = std::move(results[outputIndex_].results[0]);
-    const auto cudfType = cudf_velox::veloxToCudfDataType(resultType);
+    const auto cudfType = PreserveCompactDecimal
+        ? cudf_velox::decimalAggregationOutputType(column->type(), resultType)
+        : cudf_velox::veloxToCudfDataType(resultType);
     if (column->type() != cudfType) {
       column = cudf::cast(*column, cudfType, stream, mr);
     }
@@ -252,9 +254,11 @@ struct SimpleGroupbyAggregator final : GroupbyAggregator {
 using GroupbySumAggregator = SimpleGroupbyAggregator<
     &cudf::make_sum_aggregation<cudf::groupby_aggregation>>;
 using GroupbyMinAggregator = SimpleGroupbyAggregator<
-    &cudf::make_min_aggregation<cudf::groupby_aggregation>>;
+    &cudf::make_min_aggregation<cudf::groupby_aggregation>,
+    true>;
 using GroupbyMaxAggregator = SimpleGroupbyAggregator<
-    &cudf::make_max_aggregation<cudf::groupby_aggregation>>;
+    &cudf::make_max_aggregation<cudf::groupby_aggregation>,
+    true>;
 
 // Decimal SUM and AVG aggregators are separate implementations, as they need to
 // handle the VARBINARY encoded intermediate state for streaming aggregation.

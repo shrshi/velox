@@ -24,6 +24,8 @@
 
 #include <cudf/unary.hpp>
 
+#include <limits>
+
 namespace facebook::velox::cudf_velox {
 
 void validateIntermediateColumnType(cudf::column_view const& column) {
@@ -74,6 +76,20 @@ cudf::column_view prepareDecimalSumInput(
       stream,
       get_temp_mr());
   return holder->view();
+}
+
+cudf::data_type decimalAggregationOutputType(
+    cudf::data_type physicalResultType,
+    const TypePtr& logicalResultType) {
+  if (physicalResultType.id() == cudf::type_id::DECIMAL32 &&
+      logicalResultType->isDecimal()) {
+    const auto [precision, scale] =
+        getDecimalPrecisionScale(*logicalResultType);
+    if (precision <= std::numeric_limits<int32_t>::digits10) {
+      return cudf::data_type{cudf::type_id::DECIMAL32, -scale};
+    }
+  }
+  return veloxToCudfDataType(logicalResultType);
 }
 
 std::unique_ptr<cudf::column> castCountColumnToInt64(

@@ -1136,7 +1136,7 @@ RowVectorPtr CudfWindow::doGetOutput() {
           : sortedView.column(*inputColIdx);
       if (baseName == "sum" &&
           func.functionCall->inputs()[0]->type()->isDecimal()) {
-        inputCol = castDecimalInputToDecimal128(
+        inputCol = prepareDecimalSumInput(
             inputCol, decimalSumInputOwners[funcIndex], stream_);
       }
       const bool isFullPartition =
@@ -1228,15 +1228,18 @@ RowVectorPtr CudfWindow::doGetOutput() {
   for (size_t i = 0; i < windowResultCols.size(); ++i) {
     auto& resultColumn = windowResultCols[i];
     VELOX_CHECK_NOT_NULL(resultColumn);
+    const auto baseName = stripFunctionPrefix(
+        windowNode_->windowFunctions()[i].functionCall->name(), prefix);
+    const auto& logicalResultType = outputType_->childAt(numInputCols + i);
     auto expectedType =
-        veloxToCudfDataType(outputType_->childAt(numInputCols + i));
+        (baseName == "min" || baseName == "max")
+        ? decimalAggregationOutputType(resultColumn->type(), logicalResultType)
+        : veloxToCudfDataType(logicalResultType);
     if (resultColumn->type() != expectedType) {
       resultColumn =
           cudf::cast(resultColumn->view(), expectedType, stream_, mr);
     }
 
-    const auto baseName = stripFunctionPrefix(
-        windowNode_->windowFunctions()[i].functionCall->name(), prefix);
     if (baseName == "count" && resultColumn->null_count() > 0) {
       cudf::numeric_scalar<int64_t> zero(0, true, stream_, mr);
       resultColumn =
