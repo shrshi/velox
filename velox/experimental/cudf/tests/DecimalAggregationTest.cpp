@@ -740,8 +740,15 @@ TEST_F(CudfDecimalTest, compactDecimalAggregations) {
         } else {
           builder.singleAggregation(keys, {"sum(c1)", "avg(c1)"});
         }
+        const auto physicalTypes = grouped
+            ? std::vector{
+                  cudf::type_id::INT64,
+                  cudf::type_id::DECIMAL128,
+                  cudf::type_id::DECIMAL32}
+            : std::vector{
+                  cudf::type_id::DECIMAL128, cudf::type_id::DECIMAL32};
         auto result = runDecimalOperators(
-            builder.planNode(), makeInput(compact), channels);
+            builder.planNode(), makeInput(compact), channels, physicalTypes);
         ASSERT_TRUE(exec::test::assertEqualResults({expected}, {result}));
       }
     }

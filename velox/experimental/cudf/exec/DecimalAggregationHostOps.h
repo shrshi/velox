@@ -70,6 +70,10 @@ cudf::data_type decimalAggregationOutputType(
     cudf::data_type physicalResultType,
     const TypePtr& logicalResultType);
 
+/** Returns the canonical physical type for a logical decimal result. */
+cudf::data_type canonicalDecimalAggregationOutputType(
+    const TypePtr& logicalResultType);
+
 /**
  * Ensures the partial-row count column is INT64, casting with the temporary
  * memory resource (the result is consumed internally, not part of operator

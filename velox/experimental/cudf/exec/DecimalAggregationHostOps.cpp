@@ -78,18 +78,21 @@ cudf::column_view prepareDecimalSumInput(
   return holder->view();
 }
 
+cudf::data_type canonicalDecimalAggregationOutputType(
+    const TypePtr& logicalResultType) {
+  const auto [precision, scale] = getDecimalPrecisionScale(*logicalResultType);
+  if (precision <= std::numeric_limits<int32_t>::digits10) {
+    return cudf::data_type{cudf::type_id::DECIMAL32, -scale};
+  }
+  return veloxToCudfDataType(logicalResultType);
+}
+
 cudf::data_type decimalAggregationOutputType(
     cudf::data_type physicalResultType,
     const TypePtr& logicalResultType) {
-  if (physicalResultType.id() == cudf::type_id::DECIMAL32 &&
-      logicalResultType->isDecimal()) {
-    const auto [precision, scale] =
-        getDecimalPrecisionScale(*logicalResultType);
-    if (precision <= std::numeric_limits<int32_t>::digits10) {
-      return cudf::data_type{cudf::type_id::DECIMAL32, -scale};
-    }
-  }
-  return veloxToCudfDataType(logicalResultType);
+  return physicalResultType.id() == cudf::type_id::DECIMAL32
+      ? canonicalDecimalAggregationOutputType(logicalResultType)
+      : veloxToCudfDataType(logicalResultType);
 }
 
 std::unique_ptr<cudf::column> castCountColumnToInt64(
@@ -119,7 +122,7 @@ std::unique_ptr<cudf::column> finalizeDecimalAverage(
     rmm::device_async_resource_ref mr) {
   count = castCountColumnToInt64(std::move(count), stream);
   auto avgCol = computeDecimalAverage(sum->view(), count->view(), stream, mr);
-  auto const cudfOutType = veloxToCudfDataType(resultType);
+  auto const cudfOutType = canonicalDecimalAggregationOutputType(resultType);
   if (avgCol->type() != cudfOutType) {
     avgCol = cudf::cast(avgCol->view(), cudfOutType, stream, mr);
   }
