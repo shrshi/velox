@@ -60,6 +60,10 @@ class CudfLocalPartition : public CudfOperatorBase {
       const std::shared_ptr<const core::LocalPartitionNode>& planNode);
 
  protected:
+  bool acceptsNativeDecimalSumState() const override {
+    return true;
+  }
+
   void doAddInput(RowVectorPtr input) override;
 
   RowVectorPtr doGetOutput() override {

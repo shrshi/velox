@@ -78,6 +78,7 @@ struct GroupbyAggregator {
   VectorPtr constant;
   TypePtr resultType;
   std::optional<uint32_t> maskIndex;
+  CudfColumnEncoding nativeState;
 
   virtual void addGroupbyRequest(
       cudf::table_view const& tbl,
@@ -173,6 +174,10 @@ class CudfGroupby : public CudfOperatorBase {
   bool isFinished() override;
 
  protected:
+  bool acceptsNativeDecimalSumState() const override {
+    return true;
+  }
+
   void doAddInput(RowVectorPtr input) override;
 
   RowVectorPtr doGetOutput() override;
@@ -191,6 +196,12 @@ class CudfGroupby : public CudfOperatorBase {
       rmm::device_async_resource_ref mr);
 
   CudfVectorPtr releaseAndResetBufferedResult();
+
+  void configureNativeAggregators(bool enabled);
+  void prepareNativeInput(CudfVectorPtr& input);
+
+  std::vector<CudfColumnEncoding> nativeStateEncodings_;
+  std::optional<bool> nativeInput_;
 
   bool initializeStreamingGroupby(
       const RowTypePtr& inputRowSchema,

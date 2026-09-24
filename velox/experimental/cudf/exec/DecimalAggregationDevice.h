@@ -34,6 +34,9 @@ namespace facebook::velox::cudf_velox::detail {
 // words).
 constexpr size_t kDecimalSumStateSize = 32;
 
+// Tests valid DECIMAL128 rows against the DECIMAL(38) unscaled range.
+bool decimalSumResultOverflows(cudf::column_view sum, cuda::stream_ref stream);
+
 /**
  * Reduces a DECIMAL64 column directly into one DECIMAL128 sum and one INT64
  * non-null count without materializing a DECIMAL128 input column.

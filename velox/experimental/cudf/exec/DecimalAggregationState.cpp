@@ -30,6 +30,15 @@
 
 namespace facebook::velox::cudf_velox {
 
+void validateDecimalSumResult(cudf::column_view sum, cuda::stream_ref stream) {
+  VELOX_CHECK(
+      sum.type().id() == cudf::type_id::DECIMAL128,
+      "Decimal sum result requires DECIMAL128 column");
+  VELOX_USER_CHECK(
+      !detail::decimalSumResultOverflows(sum, stream),
+      "Decimal overflow in SUM result: exceeds DECIMAL(38) range");
+}
+
 DecimalSumStateColumns reduceDecimal64SumCount(
     const cudf::column_view& input,
     cuda::stream_ref stream,

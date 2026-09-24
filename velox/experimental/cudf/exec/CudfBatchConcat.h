@@ -45,6 +45,10 @@ class CudfBatchConcat : public CudfOperatorBase {
   bool isFinished() override;
 
  protected:
+  bool acceptsNativeDecimalSumState() const override {
+    return true;
+  }
+
   void doAddInput(RowVectorPtr input) override;
   RowVectorPtr doGetOutput() override;
   void doClose() override;

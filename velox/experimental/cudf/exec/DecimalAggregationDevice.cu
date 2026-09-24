@@ -31,6 +31,7 @@
 #include <cuda/std/span>
 #include <cuda/std/type_traits>
 #include <cuda_runtime.h>
+#include <thrust/logical.h>
 #include <thrust/transform.h>
 
 #include <concepts>
@@ -188,6 +189,21 @@ void launchDeviceFor(
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
+struct DecimalSumOutOfRange {
+  cudf::column_device_view sum;
+
+  __device__ bool operator()(cudf::size_type idx) const {
+    if (sum.is_null(idx)) {
+      return false;
+    }
+    constexpr __int128_t limit =
+        static_cast<__int128_t>(10'000'000'000'000'000'000ULL) *
+        10'000'000'000'000'000'000ULL; // 10^38
+    const auto value = sum.element<__int128_t>(idx);
+    return value <= -limit || value >= limit;
+  }
+};
+
 struct StateValidPredicate {
   cudf::column_device_view sum;
   cudf::column_device_view count;
@@ -233,6 +249,19 @@ std::pair<rmm::device_buffer, cudf::size_type> buildStateValidityMaskImpl(
 } // namespace
 
 namespace detail {
+
+bool decimalSumResultOverflows(cudf::column_view sum, cuda::stream_ref stream) {
+  if (sum.size() == 0) {
+    return false;
+  }
+  auto deviceView = cudf::column_device_view::create(sum, stream);
+  auto begin = cuda::counting_iterator<cudf::size_type>{0};
+  return thrust::any_of(
+      rmm::exec_policy(stream),
+      begin,
+      begin + sum.size(),
+      DecimalSumOutOfRange{*deviceView});
+}
 
 void reduceDecimal64SumCount(
     cudf::column_view input,

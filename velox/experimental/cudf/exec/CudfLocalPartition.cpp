@@ -210,6 +210,10 @@ void CudfLocalPartition::doAddInput(RowVectorPtr input) {
       if (partitionFunctionType_ == PartitionFunctionType::kHash) {
         std::vector<cudf::size_type> partitionKeyIndices;
         for (const auto& idx : partitionKeyIndices_) {
+          VELOX_CHECK(
+              cudfVector->physicalEncodings()[idx].encoding ==
+                  CudfPhysicalEncoding::kDefault,
+              "Native decimal SUM state cannot be a partition key");
           partitionKeyIndices.push_back(static_cast<cudf::size_type>(idx));
         }
 
@@ -261,7 +265,8 @@ void CudfLocalPartition::doAddInput(RowVectorPtr input) {
           outputType_,
           partitionData.num_rows(),
           std::make_unique<cudf::table>(partitionData, stream, get_output_mr()),
-          stream);
+          stream,
+          cudfVector->physicalEncodings());
       enqueuePartition(i, partitionCudfVector);
     }
   } else {

@@ -20,6 +20,7 @@
 #include "velox/experimental/cudf/exec/DecimalAggregationHostOps.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationState.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/NativeDecimalSumEligibility.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
@@ -50,6 +51,7 @@ namespace {
 using namespace facebook::velox;
 using cudf_velox::castDecimal64InputToDecimal128;
 using cudf_velox::CountInputKind;
+using cudf_velox::CudfPhysicalEncoding;
 using cudf_velox::finalizeDecimalAverage;
 using cudf_velox::get_output_mr;
 using cudf_velox::get_temp_mr;
@@ -57,6 +59,7 @@ using cudf_velox::GroupbyAggregator;
 using cudf_velox::ResolvedAggregateInfo;
 using cudf_velox::serializeDecimalPartialOrIntermediateState;
 using cudf_velox::StreamingGroupbyAggregator;
+using cudf_velox::validateDecimalSumResult;
 using cudf_velox::validateIntermediateColumnType;
 
 size_t streamingGroupbySafeCapacity() {
@@ -375,7 +378,18 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
       std::vector<cudf::groupby::aggregation_request>& requests,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
-    if (step == core::AggregationNode::Step::kIntermediate) {
+    if (nativeState.encoding ==
+        CudfPhysicalEncoding::kNativeDecimal64SumState) {
+      auto input = materializeMaskedInput(tbl, inputIndex, stream, mr);
+      const cudf::data_type expectedType{
+          step == core::AggregationNode::Step::kPartial
+              ? cudf::type_id::DECIMAL64
+              : cudf::type_id::DECIMAL128,
+          -nativeState.scale};
+      VELOX_CHECK(input.type() == expectedType);
+      addDecimalRawPartialSingleSumRequest(
+          input, requests, false, stream, sumIdx_, castedInput_);
+    } else if (step == core::AggregationNode::Step::kIntermediate) {
       addDecimalDecodedSumCountRequests(
           tbl,
           inputIndex,
@@ -409,6 +423,13 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
     auto col = std::move(results[sumIdx_].results[0]);
+    if (nativeState.encoding ==
+        CudfPhysicalEncoding::kNativeDecimal64SumState) {
+      if (step == core::AggregationNode::Step::kFinal) {
+        validateDecimalSumResult(col->view(), stream);
+      }
+      return col;
+    }
     if (step == core::AggregationNode::Step::kPartial) {
       auto count = std::move(results[sumIdx_].results[1]);
       return serializeDecimalPartialOrIntermediateState(
@@ -1527,6 +1548,25 @@ void CudfGroupby::initialize() {
     }
   }
 
+  const auto eligible = nativeDecimalSumEligibility(
+      *aggregationNode_,
+      *operatorCtx_->task()->planFragment().planNode,
+      operatorCtx_->execCtx()->queryCtx(),
+      pool());
+  nativeStateEncodings_.resize(outputType_->size());
+  for (size_t i = 0; i < eligible.size(); ++i) {
+    if (eligible[i]) {
+      nativeStateEncodings_[groupingKeyOutputChannels_.size() + i] = {
+          CudfPhysicalEncoding::kNativeDecimal64SumState,
+          getDecimalPrecisionScale(
+              *aggregationNode_->aggregates()[i].rawInputTypes[0])
+              .second};
+    }
+  }
+  if (isPartialOutput_) {
+    configureNativeAggregators(true);
+  }
+
   streamingGroupbyEnabled_ = initializeStreamingGroupby(
       inputRowSchema,
       aggregationInput.constants,
@@ -1543,6 +1583,59 @@ void CudfGroupby::initialize() {
   // TODO: Add support for grouping sets and group ids.
 
   aggregationNode_.reset();
+}
+
+void CudfGroupby::configureNativeAggregators(bool enabled) {
+  for (size_t i = 0; i < aggregators_.size(); ++i) {
+    const auto encoding = enabled
+        ? nativeStateEncodings_[groupingKeyOutputChannels_.size() + i]
+        : CudfColumnEncoding{};
+    aggregators_[i]->nativeState = encoding;
+    if (!intermediateAggregators_.empty()) {
+      intermediateAggregators_[i]->nativeState = encoding;
+    }
+  }
+}
+
+void CudfGroupby::prepareNativeInput(CudfVectorPtr& input) {
+  bool matches =
+      !isPartialOutput_ && !isSingleStep_ && input->hasNativeDecimalSumState();
+  if (matches) {
+    for (size_t i = 0; i < aggregationInputChannels_.size(); ++i) {
+      if (i >= nativeStateEncodings_.size() ||
+          input->physicalEncodings()[aggregationInputChannels_[i]] !=
+              nativeStateEncodings_[i]) {
+        matches = false;
+        break;
+      }
+    }
+  }
+  if (!nativeInput_.has_value()) {
+    nativeInput_ = matches;
+    if (!isPartialOutput_) {
+      configureNativeAggregators(matches);
+    }
+  } else if (*nativeInput_ && !matches) {
+    // Never concatenate native sums with CPU/serialized states. Once an edge
+    // falls back, keep it serialized for the remainder of this operator.
+    if (bufferedResult_) {
+      const auto values =
+          materializeNativeDecimalSumState(bufferedResult_, get_output_mr());
+      stats_.wlock()->addRuntimeStat(
+          "nativeDecimalSumMaterializedValues", RuntimeCounter(values));
+    }
+    nativeInput_ = false;
+    configureNativeAggregators(false);
+  }
+  if (!*nativeInput_ && input->hasNativeDecimalSumState()) {
+    const auto values =
+        materializeNativeDecimalSumState(input, get_output_mr());
+    stats_.wlock()->addRuntimeStat(
+        "nativeDecimalSumMaterializedValues", RuntimeCounter(values));
+  } else if (*nativeInput_) {
+    stats_.wlock()->addRuntimeStat(
+        "nativeDecimalSumConsumedRows", RuntimeCounter(input->size()));
+  }
 }
 
 void CudfGroupby::computePartialGroupbyIncrementally(CudfVectorPtr tbl) {
@@ -1677,6 +1770,7 @@ void CudfGroupby::doAddInput(RowVectorPtr input) {
 
   auto cudfInput = std::dynamic_pointer_cast<cudf_velox::CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
+  prepareNativeInput(cudfInput);
 
   if (streamingGroupbyEnabled_) {
     computeFinalGroupbyStreaming(std::move(cudfInput));
@@ -1748,8 +1842,19 @@ CudfVectorPtr CudfGroupby::doGroupByAggregation(
     return nullptr;
   }
 
+  std::vector<CudfColumnEncoding> encodings(outputType->size());
+  for (size_t i = 0; i < aggregators.size(); ++i) {
+    if (exec::isPartialOutput(aggregators[i]->step)) {
+      encodings[groupByKeys.size() + i] = aggregators[i]->nativeState;
+    }
+  }
   return std::make_shared<cudf_velox::CudfVector>(
-      pool(), outputType, numRows, std::move(resultTable), stream);
+      pool(),
+      outputType,
+      numRows,
+      std::move(resultTable),
+      stream,
+      std::move(encodings));
 }
 
 CudfVectorPtr CudfGroupby::releaseAndResetBufferedResult() {
@@ -1758,6 +1863,10 @@ CudfVectorPtr CudfGroupby::releaseAndResetBufferedResult() {
       numOutputRows == 0 ? 0 : (numOutputRows * 1.0) / numInputRows_ * 100;
   {
     auto lockedStats = stats_.wlock();
+    if (bufferedResult_->hasNativeDecimalSumState()) {
+      lockedStats->addRuntimeStat(
+          "nativeDecimalSumProducedRows", RuntimeCounter(numOutputRows));
+    }
     lockedStats->addRuntimeStat(
         std::string(exec::HashAggregation::kFlushRowCount),
         RuntimeCounter(numOutputRows));

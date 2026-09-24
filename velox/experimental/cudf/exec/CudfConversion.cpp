@@ -161,7 +161,7 @@ RowVectorPtr CudfFromVelox::doGetOutput() {
     auto emptyTable = std::make_unique<cudf::table>();
     return std::make_shared<CudfVector>(
         input->pool(),
-        outputType_,
+        input->type(),
         input->size(),
         std::move(emptyTable),
         stream);
@@ -179,7 +179,7 @@ RowVectorPtr CudfFromVelox::doGetOutput() {
   const auto size = tbl->num_rows();
 
   return std::make_shared<CudfVector>(
-      input->pool(), outputType_, size, std::move(tbl), stream);
+      input->pool(), input->type(), size, std::move(tbl), stream);
 }
 
 void CudfFromVelox::doClose() {

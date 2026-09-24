@@ -30,6 +30,19 @@
 
 namespace facebook::velox::cudf_velox {
 
+enum class CudfPhysicalEncoding {
+  kDefault,
+  kNativeDecimal64SumState,
+};
+
+struct CudfColumnEncoding {
+  CudfPhysicalEncoding encoding{CudfPhysicalEncoding::kDefault};
+  // Velox decimal scale (the physical cuDF scale is its negation).
+  int32_t scale{0};
+
+  bool operator==(const CudfColumnEncoding&) const = default;
+};
+
 // Vector class which holds GPU data from cuDF.
 // Can be constructed either from an owned cudf::table or from packed_table.
 // When constructed from packed_table, the data remains packed and tabView_
@@ -48,7 +61,8 @@ class CudfVector : public RowVector {
       TypePtr type,
       vector_size_t size,
       std::unique_ptr<cudf::table>&& table,
-      cuda::stream_ref stream);
+      cuda::stream_ref stream,
+      std::vector<CudfColumnEncoding> physicalEncodings = {});
 
   /// Constructs a CudfVector from packed_table.
   /// The packed data is retained and tabView_ references the table view inside
@@ -58,7 +72,8 @@ class CudfVector : public RowVector {
       TypePtr type,
       vector_size_t size,
       std::unique_ptr<cudf::packed_table>&& packedTable,
-      cuda::stream_ref stream);
+      cuda::stream_ref stream,
+      std::vector<CudfColumnEncoding> physicalEncodings = {});
 
   cuda::stream_ref stream() const {
     return stream_;
@@ -68,7 +83,16 @@ class CudfVector : public RowVector {
     return tabView_;
   }
 
+  const std::vector<CudfColumnEncoding>& physicalEncodings() const {
+    return physicalEncodings_;
+  }
+
+  bool hasNativeDecimalSumState() const;
+
+  std::string physicalEncodingString() const;
+
   /// Releases ownership of the underlying table.
+  /// The caller must also preserve physicalEncodings() when transporting it.
   /// If constructed from packed_table, materializes a table from the view
   /// first (which copies the data).
   std::unique_ptr<cudf::table> release();
@@ -82,6 +106,8 @@ class CudfVector : public RowVector {
   uint64_t estimateFlatSize() const override;
 
  private:
+  void validatePhysicalEncodings();
+
   uint64_t retainedSizeImpl(uint64_t& totalStringBufferSize) const override;
 
   // Storage for either an owned table or packed table.
@@ -97,6 +123,7 @@ class CudfVector : public RowVector {
 
   cuda::stream_ref stream_;
   uint64_t flatSize_;
+  std::vector<CudfColumnEncoding> physicalEncodings_;
 };
 
 using CudfVectorPtr = std::shared_ptr<CudfVector>;

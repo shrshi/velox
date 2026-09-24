@@ -27,6 +27,13 @@
 
 namespace facebook::velox::cudf_velox {
 
+/// Replaces native decimal SUM columns with CPU-compatible VARBINARY state.
+/// Leaves aliases of the original vector unchanged. Returns the number of
+/// converted state values (rows times native columns); zero is a no-op.
+uint64_t materializeNativeDecimalSumState(
+    CudfVectorPtr& vector,
+    rmm::device_async_resource_ref mr);
+
 // Concatenate a vector of cuDF tables into a single table
 [[nodiscard]] std::unique_ptr<cudf::table> concatenateTables(
     std::vector<std::unique_ptr<cudf::table>> tables,
@@ -50,6 +57,9 @@ namespace facebook::velox::cudf_velox {
  * needed
  * @param stream CUDA stream for concatenation and memory management
  * @param mr Memory resource for output allocation
+ * Physical encodings must match across inputs. Since the returned table has
+ * no metadata, callers must preserve the input physicalEncodings separately.
+ *
  * @return Single concatenated table
  */
 [[nodiscard]] std::unique_ptr<cudf::table> getConcatenatedTable(

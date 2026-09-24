@@ -24,6 +24,11 @@
 
 namespace facebook::velox::cudf_velox {
 
+/// Validates that every non-null DECIMAL128 sum fits DECIMAL(38, scale).
+/// Throws a user error on overflow. Synchronizes the supplied stream to obtain
+/// the device validation result; does not copy the column to the host.
+void validateDecimalSumResult(cudf::column_view sum, cuda::stream_ref stream);
+
 struct DecimalSumStateColumns {
   std::unique_ptr<cudf::column> sum;
   std::unique_ptr<cudf::column> count;

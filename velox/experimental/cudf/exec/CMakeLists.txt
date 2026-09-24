@@ -42,6 +42,7 @@ add_library(
   DecimalAggregationHostOps.cpp
   DecimalAggregationState.cpp
   GpuResources.cpp
+  NativeDecimalSumEligibility.cpp
   OperatorAdapters.cpp
   PrestoAggregateFunctions.cpp
   SparkAggregateFunctions.cpp
