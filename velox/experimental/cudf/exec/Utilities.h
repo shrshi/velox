@@ -29,9 +29,17 @@ namespace facebook::velox::cudf_velox {
 
 /// Replaces native decimal SUM columns with CPU-compatible VARBINARY state.
 /// Leaves aliases of the original vector unchanged. Returns the number of
-/// converted state values (rows times native columns); zero is a no-op.
+/// converted state values (rows times native columns).
 uint64_t materializeNativeDecimalSumState(
     CudfVectorPtr& vector,
+    rmm::device_async_resource_ref mr);
+
+/// Materializes only the specified channels. Repeated channels are converted
+/// once; default-encoded channels are unchanged. Unselected columns retain
+/// their physical encodings. Leaves aliases of the original vector unchanged.
+uint64_t materializeNativeDecimalSumState(
+    CudfVectorPtr& vector,
+    const std::vector<column_index_t>& channels,
     rmm::device_async_resource_ref mr);
 
 // Concatenate a vector of cuDF tables into a single table
@@ -57,8 +65,11 @@ uint64_t materializeNativeDecimalSumState(
  * needed
  * @param stream CUDA stream for concatenation and memory management
  * @param mr Memory resource for output allocation
- * Physical encodings must match across inputs. Since the returned table has
- * no metadata, callers must preserve the input physicalEncodings separately.
+ * Columns with differing encodings across inputs are materialized before
+ * concatenation; matching native columns remain native. The returned table has
+ * no metadata. Use getConcatenatedCudfVectorsBatched when the output must
+ * retain physical encodings; input metadata captured before this call may be
+ * stale.
  *
  * @return Single concatenated table
  */
@@ -95,7 +106,8 @@ uint64_t materializeNativeDecimalSumState(
  * needed
  * @param stream CUDA stream for asynchronous operations and memory management
  * @return Vector of concatenated tables (multiple if input exceeded size
- * limits)
+ * limits). Like getConcatenatedTable, mismatched encodings are materialized;
+ * use getConcatenatedCudfVectorsBatched to retain the resulting metadata.
  */
 [[nodiscard]] std::vector<std::unique_ptr<cudf::table>>
 getConcatenatedTableBatched(

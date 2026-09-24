@@ -16,20 +16,13 @@
 #pragma once
 
 #include "velox/core/PlanNode.h"
-#include "velox/core/QueryCtx.h"
 
 namespace facebook::velox::cudf_velox {
 
-/// Returns one eligibility flag per aggregate in 'aggregation'. Only direct,
-/// unshared grouped PARTIAL -> single-source hash LocalPartition -> grouped
-/// FINAL paths qualify. Both aggregations must be supported by cuDF and have
-/// identical layouts containing only ordinary DECIMAL64 SUMs. This proves plan
-/// compatibility, not operator replacement; unsupported runtime consumers must
-/// still materialize native state.
+/// Returns one eligibility flag per aggregate, independent of plan adjacency.
+/// PARTIAL proves raw DECIMAL64 SUM semantics; FINAL must additionally validate
+/// incoming encoding metadata. Unsupported operators materialize native state.
 std::vector<bool> nativeDecimalSumEligibility(
-    const core::AggregationNode& aggregation,
-    const core::PlanNode& planRoot,
-    core::QueryCtx* queryCtx,
-    memory::MemoryPool* pool);
+    const core::AggregationNode& aggregation);
 
 } // namespace facebook::velox::cudf_velox

@@ -77,18 +77,33 @@ size_t maxBatchRows() {
   return static_cast<size_t>(std::numeric_limits<cudf::size_type>::max());
 }
 
-void checkMatchingPhysicalEncodings(const std::vector<CudfVectorPtr>& vectors) {
+void normalizePhysicalEncodings(
+    std::vector<CudfVectorPtr>& vectors,
+    rmm::device_async_resource_ref mr) {
   if (vectors.empty()) {
     return;
   }
   VELOX_CHECK_NOT_NULL(vectors.front());
+  const auto& encodings = vectors.front()->physicalEncodings();
+  std::vector<bool> mismatched(encodings.size(), false);
   for (const auto& vector : vectors) {
     VELOX_CHECK_NOT_NULL(vector);
-    VELOX_CHECK(
-        vector->physicalEncodings() == vectors.front()->physicalEncodings(),
-        "Cannot concatenate different cuDF physical encodings: {} vs {}",
-        vectors.front()->physicalEncodingString(),
-        vector->physicalEncodingString());
+    VELOX_CHECK_EQ(vector->physicalEncodings().size(), encodings.size());
+    for (size_t i = 0; i < encodings.size(); ++i) {
+      mismatched[i] =
+          mismatched[i] || vector->physicalEncodings()[i] != encodings[i];
+    }
+  }
+  std::vector<column_index_t> channels;
+  for (size_t i = 0; i < mismatched.size(); ++i) {
+    if (mismatched[i]) {
+      channels.push_back(i);
+    }
+  }
+  if (!channels.empty()) {
+    for (auto& vector : vectors) {
+      materializeNativeDecimalSumState(vector, channels, mr);
+    }
   }
 }
 
@@ -105,7 +120,36 @@ uint64_t materializeNativeDecimalSumState(
     CudfVectorPtr& vector,
     rmm::device_async_resource_ref mr) {
   VELOX_CHECK_NOT_NULL(vector);
-  if (!vector->hasNativeDecimalSumState()) {
+  std::vector<column_index_t> channels;
+  for (size_t i = 0; i < vector->physicalEncodings().size(); ++i) {
+    if (vector->physicalEncodings()[i].encoding ==
+        CudfPhysicalEncoding::kNativeDecimal64SumState) {
+      channels.push_back(i);
+    }
+  }
+  return materializeNativeDecimalSumState(vector, channels, mr);
+}
+
+uint64_t materializeNativeDecimalSumState(
+    CudfVectorPtr& vector,
+    const std::vector<column_index_t>& channels,
+    rmm::device_async_resource_ref mr) {
+  VELOX_CHECK_NOT_NULL(vector);
+  if (channels.empty()) {
+    return 0;
+  }
+  auto encodings = vector->physicalEncodings();
+  std::vector<bool> materialize(encodings.size(), false);
+  bool hasNative = false;
+  for (const auto channel : channels) {
+    VELOX_CHECK_LT(channel, encodings.size());
+    if (encodings[channel].encoding ==
+        CudfPhysicalEncoding::kNativeDecimal64SumState) {
+      materialize[channel] = true;
+      hasNative = true;
+    }
+  }
+  if (!hasNative) {
     return 0;
   }
   auto stream = vector->stream();
@@ -115,10 +159,10 @@ uint64_t materializeNativeDecimalSumState(
   uint64_t convertedValues = 0;
   for (size_t i = 0; i < vector->physicalEncodings().size(); ++i) {
     auto column = vector->getTableView().column(i);
-    if (vector->physicalEncodings()[i].encoding ==
-        CudfPhysicalEncoding::kNativeDecimal64SumState) {
+    if (materialize[i]) {
       columns.push_back(
           serializeDecimalSumState(column, counts->view(), stream, mr));
+      encodings[i] = {};
       convertedValues += vector->size();
     } else {
       columns.push_back(std::make_unique<cudf::column>(column, stream, mr));
@@ -129,7 +173,8 @@ uint64_t materializeNativeDecimalSumState(
       vector->type(),
       vector->size(),
       std::make_unique<cudf::table>(std::move(columns)),
-      stream);
+      stream,
+      std::move(encodings));
   // Packed storage can have a different deallocation stream.
   vector->rebindStream(stream);
   vector = std::move(output);
@@ -189,7 +234,7 @@ std::unique_ptr<cudf::table> getConcatenatedTable(
     return makeEmptyTable(tableType);
   }
 
-  checkMatchingPhysicalEncodings(tables);
+  normalizePhysicalEncodings(tables, mr);
   auto inputStreams = std::vector<cuda::stream_ref>();
   auto tableViews = std::vector<cudf::table_view>();
 
@@ -227,7 +272,7 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
     return concatTables;
   }
 
-  checkMatchingPhysicalEncodings(tables);
+  normalizePhysicalEncodings(tables, mr);
   std::vector<std::unique_ptr<cudf::table>> outputTables;
   auto const maxRows = maxBatchRows();
   size_t start = 0;
@@ -289,7 +334,7 @@ std::vector<CudfVectorPtr> getConcatenatedCudfVectorsBatched(
 
   std::vector<CudfVectorPtr> outputVectors;
   if (tableType->size() > 0) {
-    checkMatchingPhysicalEncodings(vectors);
+    normalizePhysicalEncodings(vectors, mr);
     auto encodings = vectors.empty() ? std::vector<CudfColumnEncoding>{}
                                      : vectors.front()->physicalEncodings();
     auto tables =

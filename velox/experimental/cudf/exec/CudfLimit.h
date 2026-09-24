@@ -39,6 +39,10 @@ class CudfLimit : public CudfOperatorBase {
   }
 
  protected:
+  bool acceptsNativeDecimalSumState() const override {
+    return true;
+  }
+
   void doAddInput(RowVectorPtr input) override;
   RowVectorPtr doGetOutput() override;
 

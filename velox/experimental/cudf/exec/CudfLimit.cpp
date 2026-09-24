@@ -98,7 +98,8 @@ RowVectorPtr CudfLimit::doGetOutput() {
         input_->type(),
         outputSize,
         std::move(materializedTable),
-        cudfInput->stream());
+        cudfInput->stream(),
+        cudfInput->physicalEncodings());
     input_.reset();
     return output;
   }
@@ -131,7 +132,8 @@ RowVectorPtr CudfLimit::doGetOutput() {
       input_->type(),
       remainingLimit_,
       std::move(materializedTable),
-      cudfInput->stream());
+      cudfInput->stream(),
+      cudfInput->physicalEncodings());
   input_.reset();
   remainingLimit_ = 0;
   return output;

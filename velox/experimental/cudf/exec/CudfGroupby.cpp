@@ -1548,11 +1548,14 @@ void CudfGroupby::initialize() {
     }
   }
 
-  const auto eligible = nativeDecimalSumEligibility(
-      *aggregationNode_,
-      *operatorCtx_->task()->planFragment().planNode,
-      operatorCtx_->execCtx()->queryCtx(),
-      pool());
+  const auto eligible = nativeDecimalSumEligibility(*aggregationNode_);
+  nativeInputs_.resize(numAggregates_);
+  for (size_t i = 0; i < eligible.size(); ++i) {
+    LOG(INFO) << "Native decimal SUM eligibility: node=" << planNodeId()
+              << ", step="
+              << core::AggregationNode::toName(aggregationNode_->step())
+              << ", aggregate=" << i << ", eligible=" << eligible[i];
+  }
   nativeStateEncodings_.resize(outputType_->size());
   for (size_t i = 0; i < eligible.size(); ++i) {
     if (eligible[i]) {
@@ -1598,41 +1601,53 @@ void CudfGroupby::configureNativeAggregators(bool enabled) {
 }
 
 void CudfGroupby::prepareNativeInput(CudfVectorPtr& input) {
-  bool matches =
-      !isPartialOutput_ && !isSingleStep_ && input->hasNativeDecimalSumState();
-  if (matches) {
-    for (size_t i = 0; i < aggregationInputChannels_.size(); ++i) {
-      if (i >= nativeStateEncodings_.size() ||
-          input->physicalEncodings()[aggregationInputChannels_[i]] !=
-              nativeStateEncodings_[i]) {
-        matches = false;
-        break;
+  const auto numKeys = groupingKeyOutputChannels_.size();
+  std::vector<column_index_t> materializeChannels;
+  for (size_t i = 0; i < aggregationInputChannels_.size(); ++i) {
+    const bool nativeConsumer = !isPartialOutput_ && !isSingleStep_ &&
+        i >= numKeys && i < numKeys + numAggregates_ &&
+        nativeStateEncodings_[i].encoding ==
+            CudfPhysicalEncoding::kNativeDecimal64SumState &&
+        nativeInputs_[i - numKeys] != false &&
+        input->physicalEncodings()[aggregationInputChannels_[i]] ==
+            nativeStateEncodings_[i];
+    if (!nativeConsumer) {
+      materializeChannels.push_back(aggregationInputChannels_[i]);
+    }
+  }
+  auto materializedValues = materializeNativeDecimalSumState(
+      input, materializeChannels, get_output_mr());
+  bool consumedNative = false;
+  std::vector<column_index_t> bufferedChannels;
+  if (!isPartialOutput_ && !isSingleStep_) {
+    for (size_t i = 0; i < numAggregates_; ++i) {
+      const auto channel = numKeys + i;
+      const auto& encoding =
+          input->physicalEncodings()[aggregationInputChannels_[channel]];
+      const bool native =
+          encoding.encoding == CudfPhysicalEncoding::kNativeDecimal64SumState &&
+          encoding == nativeStateEncodings_[channel];
+      if (nativeInputs_[i] == true && !native) {
+        bufferedChannels.push_back(channel);
       }
+      nativeInputs_[i] = native;
+      aggregators_[i]->nativeState = native ? encoding : CudfColumnEncoding{};
+      if (!intermediateAggregators_.empty()) {
+        intermediateAggregators_[i]->nativeState = aggregators_[i]->nativeState;
+      }
+      consumedNative |= native;
     }
   }
-  if (!nativeInput_.has_value()) {
-    nativeInput_ = matches;
-    if (!isPartialOutput_) {
-      configureNativeAggregators(matches);
-    }
-  } else if (*nativeInput_ && !matches) {
-    // Never concatenate native sums with CPU/serialized states. Once an edge
-    // falls back, keep it serialized for the remainder of this operator.
-    if (bufferedResult_) {
-      const auto values =
-          materializeNativeDecimalSumState(bufferedResult_, get_output_mr());
-      stats_.wlock()->addRuntimeStat(
-          "nativeDecimalSumMaterializedValues", RuntimeCounter(values));
-    }
-    nativeInput_ = false;
-    configureNativeAggregators(false);
+  if (bufferedResult_ && !bufferedChannels.empty()) {
+    materializedValues += materializeNativeDecimalSumState(
+        bufferedResult_, bufferedChannels, get_output_mr());
   }
-  if (!*nativeInput_ && input->hasNativeDecimalSumState()) {
-    const auto values =
-        materializeNativeDecimalSumState(input, get_output_mr());
+  if (materializedValues) {
     stats_.wlock()->addRuntimeStat(
-        "nativeDecimalSumMaterializedValues", RuntimeCounter(values));
-  } else if (*nativeInput_) {
+        "nativeDecimalSumMaterializedValues",
+        RuntimeCounter(materializedValues));
+  }
+  if (consumedNative) {
     stats_.wlock()->addRuntimeStat(
         "nativeDecimalSumConsumedRows", RuntimeCounter(input->size()));
   }
@@ -1859,6 +1874,9 @@ CudfVectorPtr CudfGroupby::doGroupByAggregation(
 
 CudfVectorPtr CudfGroupby::releaseAndResetBufferedResult() {
   auto numOutputRows = bufferedResult_->size();
+  LOG(INFO) << "Native decimal SUM output: node=" << planNodeId()
+            << ", rows=" << numOutputRows
+            << ", encoding=" << bufferedResult_->physicalEncodingString();
   const double aggregationPct =
       numOutputRows == 0 ? 0 : (numOutputRows * 1.0) / numInputRows_ * 100;
   {

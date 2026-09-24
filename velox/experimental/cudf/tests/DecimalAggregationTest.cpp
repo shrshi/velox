@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationState.h"
 #include "velox/experimental/cudf/exec/NativeDecimalSumEligibility.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
@@ -245,6 +246,42 @@ class CudfDecimalTest : public exec::test::OperatorTestBase {
   void TearDown() override {
     unregisterCudf();
     exec::test::OperatorTestBase::TearDown();
+  }
+
+  void assertNativeSumStats(
+      const std::shared_ptr<exec::Task>& task,
+      bool expectMaterialization = false) {
+    int64_t produced = 0;
+    int64_t consumed = 0;
+    int64_t materialized = 0;
+    uint64_t partialInputVectors = 0;
+    uint64_t partialDrivers = 0;
+    for (const auto& pipeline : task->taskStats().pipelineStats) {
+      for (const auto& op : pipeline.operatorStats) {
+        if (op.operatorType == "CudfGroupbyPARTIAL") {
+          partialInputVectors += op.inputVectors;
+          partialDrivers += op.numDrivers;
+        }
+        for (const auto& [name, metric] : op.runtimeStats) {
+          if (name == "nativeDecimalSumProducedRows") {
+            produced += metric.sum;
+          } else if (name == "nativeDecimalSumConsumedRows") {
+            consumed += metric.sum;
+          } else if (name == "nativeDecimalSumMaterializedValues") {
+            materialized += metric.sum;
+          }
+        }
+      }
+    }
+    EXPECT_GT(produced, 0);
+    EXPECT_GT(consumed, 0);
+    EXPECT_GT(partialDrivers, 0);
+    EXPECT_GT(partialInputVectors, partialDrivers);
+    if (expectMaterialization) {
+      EXPECT_GT(materialized, 0);
+    } else {
+      EXPECT_EQ(materialized, 0);
+    }
   }
 };
 
@@ -808,7 +845,7 @@ TEST_F(CudfDecimalTest, decimalSumPartialFinalVarbinary) {
       .assertResults("SELECT k, sum(d) AS s FROM tmp GROUP BY k");
 }
 
-TEST_F(CudfDecimalTest, nativeDecimalSumLocalExchangeAndFallback) {
+TEST_F(CudfDecimalTest, nativeDecimalSumDirectAndLocalExchange) {
   constexpr int64_t maxDecimal = 999'999'999'999'999'999;
   const auto decimalType = DECIMAL(18, 2);
   auto input = makeRowVector(
@@ -829,7 +866,6 @@ TEST_F(CudfDecimalTest, nativeDecimalSumLocalExchangeAndFallback) {
             0},
            decimalType)});
   const std::vector<RowVectorPtr> batches{input, input, input, input};
-  auto queryCtx = core::QueryCtx::create();
   for (const auto& [exchange, partialMemory] :
        std::vector<std::pair<bool, std::string>>{
            {false, "1"}, {true, "1"}, {true, "1048576"}}) {
@@ -846,12 +882,8 @@ TEST_F(CudfDecimalTest, nativeDecimalSumLocalExchangeAndFallback) {
     const auto plan = builder.finalAggregation().planNode();
     const auto final =
         std::dynamic_pointer_cast<const core::AggregationNode>(plan);
-    EXPECT_EQ(
-        nativeDecimalSumEligibility(*partial, *plan, queryCtx.get(), pool()),
-        std::vector<bool>{exchange});
-    EXPECT_EQ(
-        nativeDecimalSumEligibility(*final, *plan, queryCtx.get(), pool()),
-        std::vector<bool>{exchange});
+    EXPECT_EQ(nativeDecimalSumEligibility(*partial), std::vector<bool>{true});
+    EXPECT_EQ(nativeDecimalSumEligibility(*final), std::vector<bool>{true});
 
     unregisterCudf();
     auto expected =
@@ -860,33 +892,126 @@ TEST_F(CudfDecimalTest, nativeDecimalSumLocalExchangeAndFallback) {
     auto task =
         exec::test::AssertQueryBuilder(plan)
             .maxDrivers(2)
+            .config(CudfFromVelox::kGpuBatchSizeRows, "1")
             .config(
                 core::QueryConfig::kMaxPartialAggregationMemory, partialMemory)
             .assertResults(expected);
+    assertNativeSumStats(task);
+  }
+}
+
+TEST_F(CudfDecimalTest, nativeDecimalSumProjectionBridges) {
+  const auto decimalType = DECIMAL(18, 2);
+  const auto otherDecimalType = DECIMAL(12, 3);
+  auto input = makeRowVector(
+      {"k", "d", "e"},
+      {makeFlatVector<int32_t>({0, 0, 1, 1, 2, 2, 3, 3}),
+       makeNullableFlatVector<int64_t>(
+           {100, -100, std::nullopt, std::nullopt, 200, std::nullopt, -50, -20},
+           decimalType),
+       makeNullableFlatVector<int64_t>(
+           {1000, 2000, std::nullopt, std::nullopt, -3000, 1000, 0, 0},
+           otherDecimalType)});
+  for (const auto& partialMemory : {"1", "1048576"}) {
+    SCOPED_TRACE(partialMemory);
+    auto builder =
+        exec::test::PlanBuilder()
+            .values({input, input, input, input}, true)
+            .partialAggregation(
+                {"k"}, {"sum(d) AS s", "count(d) AS n", "sum(e) AS t"});
+    auto partial = std::dynamic_pointer_cast<const core::AggregationNode>(
+        builder.planNode());
+    EXPECT_EQ(
+        nativeDecimalSumEligibility(*partial),
+        (std::vector<bool>{true, false, true}));
+    auto plan =
+        builder.project({"t AS t0", "k AS key0", "n AS n0", "s AS s0"})
+            .project({"s0 AS s1", "n0 AS n1", "key0 AS key1", "t0 AS t1"})
+            .filter("key1 > 0")
+            .limit(0, 1000000, true)
+            .localPartition({"key1"})
+            .project({"n1 AS n2", "t1 AS t2", "s1 AS s2", "key1 AS key2"})
+            .project({"t2 AS t3", "key2 AS key3", "n2 AS n3", "s2 AS s3"})
+            .finalAggregation(
+                {"key3"},
+                {"sum(t3) AS total_e", "sum(s3) AS total_d", "count(n3) AS n"},
+                {{otherDecimalType}, {decimalType}, {decimalType}})
+            .planNode();
+    auto final = std::dynamic_pointer_cast<const core::AggregationNode>(plan);
+    EXPECT_EQ(
+        nativeDecimalSumEligibility(*final),
+        (std::vector<bool>{true, true, false}));
+    unregisterCudf();
+    auto expected =
+        exec::test::AssertQueryBuilder(plan).maxDrivers(2).copyResults(pool());
+    registerCudf();
+    auto task =
+        exec::test::AssertQueryBuilder(plan)
+            .maxDrivers(2)
+            .config(CudfFromVelox::kGpuBatchSizeRows, "1")
+            .config(
+                core::QueryConfig::kMaxPartialAggregationMemory, partialMemory)
+            .assertResults(expected);
+    assertNativeSumStats(task);
+  }
+}
+
+TEST_F(CudfDecimalTest, nativeDecimalSumExpressionMaterializesOnlyItsInput) {
+  const auto decimalType = DECIMAL(18, 2);
+  auto input = makeRowVector(
+      {"k", "d", "e"},
+      {makeFlatVector<int32_t>({0, 0, 1, 1, 2, 2}),
+       makeNullableFlatVector<int64_t>(
+           {100, -100, std::nullopt, std::nullopt, 200, std::nullopt},
+           decimalType),
+       makeNullableFlatVector<int64_t>(
+           {500, -200, std::nullopt, std::nullopt, -50, 20}, decimalType)});
+  for (bool filterState : {false, true}) {
+    SCOPED_TRACE(filterState);
+    auto builder =
+        exec::test::PlanBuilder()
+            .values({input, input, input, input}, true)
+            .partialAggregation({"k"}, {"sum(d) AS s", "sum(e) AS t"});
+    if (filterState) {
+      builder.filter("s IS NOT NULL");
+    } else {
+      // IS NULL is supported on GPU for VARBINARY. length(VARBINARY) is not;
+      // using it would test CPU operator fallback rather than selective
+      // conversion.
+      builder.project({"k", "s", "t", "s IS NULL AS missing"});
+    }
+    auto plan = builder.localPartition({"k"})
+                    .finalAggregation(
+                        {"k"},
+                        {"sum(t) AS total_e", "sum(s) AS total_d"},
+                        {{decimalType}, {decimalType}})
+                    .planNode();
+    unregisterCudf();
+    auto expected =
+        exec::test::AssertQueryBuilder(plan).maxDrivers(2).copyResults(pool());
+    registerCudf();
+    auto task =
+        exec::test::AssertQueryBuilder(plan)
+            .maxDrivers(2)
+            .config(CudfFromVelox::kGpuBatchSizeRows, "1")
+            .config(core::QueryConfig::kMaxPartialAggregationMemory, "1")
+            .assertResults(expected);
+    assertNativeSumStats(task, true);
     int64_t produced = 0;
-    int64_t consumed = 0;
     int64_t materialized = 0;
     for (const auto& pipeline : task->taskStats().pipelineStats) {
       for (const auto& op : pipeline.operatorStats) {
         for (const auto& [name, metric] : op.runtimeStats) {
           if (name == "nativeDecimalSumProducedRows") {
             produced += metric.sum;
-          } else if (name == "nativeDecimalSumConsumedRows") {
-            consumed += metric.sum;
           } else if (name == "nativeDecimalSumMaterializedValues") {
             materialized += metric.sum;
           }
         }
       }
     }
-    if (exchange) {
-      EXPECT_GT(produced, 0);
-      EXPECT_GT(consumed, 0);
-    } else {
-      EXPECT_EQ(produced, 0);
-      EXPECT_EQ(consumed, 0);
-    }
-    EXPECT_EQ(materialized, 0);
+    // Two native SUM columns were produced, but only s was interpreted.
+    EXPECT_EQ(materialized, produced);
   }
 }
 
@@ -1028,10 +1153,76 @@ TEST_F(CudfDecimalTest, nativeDecimalSumConcatMetadata) {
   EXPECT_FALSE(isValidAt(mask, 3));
   auto serialized = native;
   materializeNativeDecimalSumState(serialized, mr);
-  VELOX_ASSERT_THROW(
-      getConcatenatedCudfVectorsBatched(
-          pool(), {native, serialized}, type, stream, mr),
-      "Cannot concatenate different cuDF physical encodings");
+  auto mixed = getConcatenatedCudfVectorsBatched(
+      pool(), {native, serialized}, type, stream, mr);
+  ASSERT_EQ(mixed.size(), 1);
+  EXPECT_FALSE(mixed[0]->hasNativeDecimalSumState());
+  auto decoded =
+      deserializeDecimalSumState(mixed[0]->getTableView().column(0), 2, stream);
+  const auto decodedSums =
+      copyColumnData<int128_t>(decoded.sum->view(), stream);
+  ASSERT_EQ(decodedSums.size(), 4);
+  EXPECT_EQ(decodedSums[0], 123);
+  EXPECT_EQ(decodedSums[2], 123);
+  EXPECT_EQ(copyNullMask(decoded.sum->view(), stream), mask);
+  EXPECT_TRUE(native->hasNativeDecimalSumState());
+}
+
+TEST_F(CudfDecimalTest, nativeDecimalSumConcatNormalizesOnlyMixedColumns) {
+  const auto stream = cudf::get_default_stream();
+  const auto mr = cudf::get_current_device_resource_ref();
+  const auto type = ROW({{"s", VARBINARY()}, {"t", VARBINARY()}});
+  const std::vector<bool> valid{true, false, true};
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(
+      makeDecimalColumn<int128_t>({123, 0, -123}, 2, &valid, stream));
+  columns.push_back(
+      makeDecimalColumn<int128_t>({500, 0, -200}, 3, &valid, stream));
+  auto native = std::make_shared<CudfVector>(
+      pool(),
+      type,
+      3,
+      std::make_unique<cudf::table>(std::move(columns)),
+      stream,
+      std::vector<CudfColumnEncoding>{
+          {CudfPhysicalEncoding::kNativeDecimal64SumState, 2},
+          {CudfPhysicalEncoding::kNativeDecimal64SumState, 3}});
+  auto mixed = native;
+  EXPECT_EQ(materializeNativeDecimalSumState(mixed, {0}, mr), 3);
+  EXPECT_EQ(mixed->physicalEncodings()[0], CudfColumnEncoding{});
+  EXPECT_EQ(mixed->physicalEncodings()[1], native->physicalEncodings()[1]);
+  EXPECT_EQ(materializeNativeDecimalSumState(mixed, {0}, mr), 0);
+  for (bool nativeFirst : {false, true}) {
+    SCOPED_TRACE(nativeFirst);
+    auto inputs = nativeFirst ? std::vector<CudfVectorPtr>{native, mixed}
+                              : std::vector<CudfVectorPtr>{mixed, native};
+    auto output = getConcatenatedCudfVectorsBatched(
+        pool(), std::move(inputs), type, stream, mr);
+    ASSERT_EQ(output.size(), 1);
+    EXPECT_EQ(output[0]->physicalEncodings(), mixed->physicalEncodings());
+    EXPECT_EQ(
+        output[0]->getTableView().column(0).type().id(), cudf::type_id::STRING);
+    auto decoded = deserializeDecimalSumState(
+        output[0]->getTableView().column(0), 2, stream);
+    const auto sums = copyColumnData<int128_t>(decoded.sum->view(), stream);
+    const auto retained = output[0]->getTableView().column(1);
+    const auto otherSums = copyColumnData<int128_t>(retained, stream);
+    const auto sumMask = copyNullMask(decoded.sum->view(), stream);
+    const auto otherMask = copyNullMask(retained, stream);
+    ASSERT_EQ(sums.size(), 6);
+    ASSERT_EQ(otherSums.size(), 6);
+    for (size_t i = 0; i < 6; ++i) {
+      EXPECT_EQ(isValidAt(sumMask, i), valid[i % 3]);
+      EXPECT_EQ(isValidAt(otherMask, i), valid[i % 3]);
+      if (valid[i % 3]) {
+        EXPECT_EQ(sums[i], i % 3 == 0 ? 123 : -123);
+        EXPECT_EQ(otherSums[i], i % 3 == 0 ? 500 : -200);
+      }
+    }
+    EXPECT_EQ(
+        native->getTableView().column(0).type().id(),
+        cudf::type_id::DECIMAL128);
+  }
 }
 
 TEST_F(CudfDecimalTest, decimalPartialSumVarbinaryToVeloxRoundTrip) {

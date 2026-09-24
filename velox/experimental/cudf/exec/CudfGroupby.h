@@ -201,7 +201,7 @@ class CudfGroupby : public CudfOperatorBase {
   void prepareNativeInput(CudfVectorPtr& input);
 
   std::vector<CudfColumnEncoding> nativeStateEncodings_;
-  std::optional<bool> nativeInput_;
+  std::vector<std::optional<bool>> nativeInputs_;
 
   bool initializeStreamingGroupby(
       const RowTypePtr& inputRowSchema,

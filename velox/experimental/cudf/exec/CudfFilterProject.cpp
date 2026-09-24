@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/Validation.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
@@ -172,6 +173,34 @@ void CudfFilterProject::initialize() {
 
   const auto inputType = project_ ? project_->sources()[0]->outputType()
                                   : filter_->sources()[0]->outputType();
+  std::vector<bool> expressionInputs(inputType->size(), false);
+  const auto collectInputs = [&](const auto& self,
+                                 const core::TypedExprPtr& expr) -> void {
+    if (auto field = core::TypedExprs::asFieldAccess(expr)) {
+      if (field->isInputColumn() && inputType->containsChild(field->name())) {
+        expressionInputs[inputType->getChildIdx(field->name())] = true;
+      } else {
+        // Unknown or nested field access: conservatively materialize all state.
+        std::fill(expressionInputs.begin(), expressionInputs.end(), true);
+      }
+      return;
+    }
+    if (expr->isInputKind()) {
+      std::fill(expressionInputs.begin(), expressionInputs.end(), true);
+      return;
+    }
+    for (const auto& input : expr->inputs()) {
+      self(self, input);
+    }
+  };
+  for (const auto& expr : allExprs) {
+    collectInputs(collectInputs, expr);
+  }
+  for (column_index_t i = 0; i < expressionInputs.size(); ++i) {
+    if (expressionInputs[i]) {
+      expressionInputChannels_.push_back(i);
+    }
+  }
 
   // convert to AST
   if (CudfConfig::getInstance().debugEnabled) {
@@ -213,7 +242,15 @@ void CudfFilterProject::initialize() {
 }
 
 void CudfFilterProject::doAddInput(RowVectorPtr input) {
-  input_ = std::move(input);
+  auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
+  VELOX_CHECK_NOT_NULL(cudfInput);
+  const auto values = materializeNativeDecimalSumState(
+      cudfInput, expressionInputChannels_, get_output_mr());
+  if (values > 0) {
+    stats_.wlock()->addRuntimeStat(
+        "nativeDecimalSumMaterializedValues", RuntimeCounter(values));
+  }
+  input_ = std::move(cudfInput);
 }
 
 RowVectorPtr CudfFilterProject::doGetOutput() {
@@ -228,6 +265,11 @@ RowVectorPtr CudfFilterProject::doGetOutput() {
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
   VELOX_CHECK_NOT_NULL(cudfInput);
   auto stream = cudfInput->stream();
+  std::vector<CudfColumnEncoding> outputEncodings(outputType_->size());
+  for (const auto& identity : identityProjections_) {
+    outputEncodings[identity.outputChannel] =
+        cudfInput->physicalEncodings()[identity.inputChannel];
+  }
   auto inputTableColumns = cudfInput->release()->release();
   auto outputSize = input_->size();
 
@@ -251,7 +293,12 @@ RowVectorPtr CudfFilterProject::doGetOutput() {
     return nullptr;
   }
   auto cudfOutput = std::make_shared<CudfVector>(
-      input_->pool(), outputType_, size, std::move(outputTable), stream);
+      input_->pool(),
+      outputType_,
+      size,
+      std::move(outputTable),
+      stream,
+      std::move(outputEncodings));
   input_.reset();
   return cudfOutput;
 }

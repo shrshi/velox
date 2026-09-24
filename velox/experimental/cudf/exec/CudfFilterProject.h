@@ -56,6 +56,10 @@ class CudfFilterProject : public CudfOperatorBase {
   bool isFinished() override;
 
  protected:
+  bool acceptsNativeDecimalSumState() const override {
+    return true;
+  }
+
   void doAddInput(RowVectorPtr input) override;
   RowVectorPtr doGetOutput() override;
 
@@ -76,6 +80,8 @@ class CudfFilterProject : public CudfOperatorBase {
   std::shared_ptr<const core::ProjectNode> project_;
   std::shared_ptr<const core::FilterNode> filter_;
 
+  // Columns read by filters or computed projections, not identity projections.
+  std::vector<column_index_t> expressionInputChannels_;
   std::vector<CudfExpressionPtr> projectEvaluators_;
   CudfExpressionPtr filterEvaluator_;
 
