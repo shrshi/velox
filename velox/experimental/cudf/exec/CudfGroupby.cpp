@@ -1729,8 +1729,15 @@ void CudfGroupby::computeFinalGroupbyIncrementally(CudfVectorPtr tbl) {
 
   auto concatenatedTable =
       cudf::concatenate(tablesToConcat, finalStream, get_temp_mr());
-  cudf::detail::join_streams(
-      std::vector<cuda::stream_ref>{finalStream}, inputTableStream);
+
+  // Concatenation has consumed these inputs on finalStream. Associate their
+  // deallocation with that stream and release them before allocating group-by
+  // workspace and output.
+  VELOX_CHECK(bufferedResult_->rebindStream(finalStream));
+  VELOX_CHECK(tbl->rebindStream(finalStream));
+  bufferedResult_.reset();
+  tbl.reset();
+
   auto compactedOutput = doGroupByAggregation(
       concatenatedTable->view(),
       groupingKeyOutputChannels_,
@@ -1785,6 +1792,7 @@ void CudfGroupby::doAddInput(RowVectorPtr input) {
 
   auto cudfInput = std::dynamic_pointer_cast<cudf_velox::CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
+  input.reset();
   prepareNativeInput(cudfInput);
 
   if (streamingGroupbyEnabled_) {
@@ -1800,7 +1808,7 @@ void CudfGroupby::doAddInput(RowVectorPtr input) {
       computeSingleGroupbyIncrementally(cudfInput);
       return;
     } else {
-      computeFinalGroupbyIncrementally(cudfInput);
+      computeFinalGroupbyIncrementally(std::move(cudfInput));
       return;
     }
   }
