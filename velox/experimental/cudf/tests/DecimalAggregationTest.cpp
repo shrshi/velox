@@ -250,6 +250,16 @@ class CudfDecimalTest : public exec::test::OperatorTestBase {
     exec::test::OperatorTestBase::TearDown();
   }
 
+  bool hasStreamingGroupbyStat(
+      const std::shared_ptr<exec::Task>& task,
+      const core::PlanNodeId& planNodeId) {
+    const auto planStats = exec::toPlanStats(task->taskStats());
+    const auto it = planStats.find(planNodeId);
+    return it != planStats.end() &&
+        it->second.customStats.count(
+            std::string{kStreamingGroupbyUsedStat}) > 0;
+  }
+
   void assertNativeSumStats(
       const std::shared_ptr<exec::Task>& task,
       bool expectMaterialization = false) {
@@ -852,6 +862,38 @@ TEST_F(CudfDecimalTest, decimalSumPartialFinalVarbinary) {
           .customStats.count(
               std::string{kDirectGroupbyFinalizationStat}),
       0);
+}
+
+TEST_F(CudfDecimalTest, decimalSumFinalUsesStreamingGroupby) {
+  auto& config = CudfConfig::getInstance();
+  const auto savedStreamingGroupbyEnabled = config.streamingGroupbyEnabled;
+  config.streamingGroupbyEnabled = true;
+  SCOPE_EXIT {
+    config.streamingGroupbyEnabled = savedStreamingGroupbyEnabled;
+  };
+
+  const auto decimalType = DECIMAL(18, 2);
+  auto input = makeRowVector(
+      {"k", "d"},
+      {makeFlatVector<int32_t>({0, 1, 2, 3}),
+       makeNullableFlatVector<int64_t>(
+           {100, -200, std::nullopt, 400}, decimalType)});
+  auto builder = exec::test::PlanBuilder()
+                     .values({input, input, input, input}, true)
+                     .partialAggregation({"k"}, {"sum(d) AS s"});
+  const auto plan = builder.finalAggregation().planNode();
+  const auto finalAggregationId = plan->id();
+
+  unregisterCudf();
+  auto expected =
+      exec::test::AssertQueryBuilder(plan).maxDrivers(2).copyResults(pool());
+  registerCudf();
+  auto task = exec::test::AssertQueryBuilder(plan)
+                  .maxDrivers(2)
+                  .config(CudfFromVelox::kGpuBatchSizeRows, "1")
+                  .config(core::QueryConfig::kMaxPartialAggregationMemory, "1")
+                  .assertResults(expected);
+  EXPECT_TRUE(hasStreamingGroupbyStat(task, finalAggregationId));
 }
 
 TEST_F(CudfDecimalTest, nativeDecimalSumDirectAndLocalExchange) {
