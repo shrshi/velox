@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
+#include "velox/experimental/cudf/exec/CudfGroupby.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationState.h"
 #include "velox/experimental/cudf/exec/NativeDecimalSumEligibility.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
@@ -26,6 +27,7 @@
 
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/file/FileSystems.h"
+#include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
@@ -841,8 +843,15 @@ TEST_F(CudfDecimalTest, decimalSumPartialFinalVarbinary) {
                   .finalAggregation()
                   .planNode();
 
-  facebook::velox::exec::test::AssertQueryBuilder(plan, duckDbQueryRunner_)
-      .assertResults("SELECT k, sum(d) AS s FROM tmp GROUP BY k");
+  auto task = facebook::velox::exec::test::AssertQueryBuilder(
+                  plan, duckDbQueryRunner_)
+                  .assertResults("SELECT k, sum(d) AS s FROM tmp GROUP BY k");
+  const auto stats = exec::toPlanStats(task->taskStats());
+  EXPECT_GT(
+      stats.at(plan->id())
+          .customStats.count(
+              std::string{kDirectGroupbyFinalizationStat}),
+      0);
 }
 
 TEST_F(CudfDecimalTest, nativeDecimalSumDirectAndLocalExchange) {

@@ -606,15 +606,20 @@ TEST_F(AggregationTest, avgSingleGrouped) {
       "avg(c1)", "avg(c2)", "avg(c4)", "avg(c5)"};
 
   std::string keyName = "c0";
-  auto op = PlanBuilder()
-                .values(vectors)
-                .singleAggregation({keyName}, aggregates)
-                .planNode();
+  core::PlanNodeId aggId;
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .plan(PlanBuilder()
+                            .values(vectors)
+                            .singleAggregation({keyName}, aggregates)
+                            .capturePlanNodeId(aggId)
+                            .planNode())
+                  .assertResults(
+                      "SELECT " + keyName +
+                      ", avg(c1), avg(c2), avg(c4), avg(c5) " +
+                      "FROM tmp GROUP BY " + keyName);
 
-  assertQuery(
-      op,
-      "SELECT " + keyName + ", avg(c1), avg(c2), avg(c4), avg(c5) " +
-          "FROM tmp GROUP BY " + keyName);
+  EXPECT_TRUE(hasStreamingGroupbyStat(
+      task, aggId, cudf_velox::kDirectGroupbyFinalizationStat));
 }
 
 TEST_F(AggregationTest, avgPartialFinalGrouped) {
@@ -626,16 +631,21 @@ TEST_F(AggregationTest, avgPartialFinalGrouped) {
       "avg(c1)", "avg(c2)", "avg(c4)", "avg(c5)"};
 
   std::string keyName = "c0";
-  auto op = PlanBuilder()
-                .values(vectors)
-                .partialAggregation({keyName}, aggregates)
-                .finalAggregation()
-                .planNode();
+  core::PlanNodeId finalAggId;
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .plan(PlanBuilder()
+                            .values(vectors)
+                            .partialAggregation({keyName}, aggregates)
+                            .finalAggregation()
+                            .capturePlanNodeId(finalAggId)
+                            .planNode())
+                  .assertResults(
+                      "SELECT " + keyName +
+                      ", avg(c1), avg(c2), avg(c4), avg(c5) " +
+                      "FROM tmp GROUP BY " + keyName);
 
-  assertQuery(
-      op,
-      "SELECT " + keyName + ", avg(c1), avg(c2), avg(c4), avg(c5) " +
-          "FROM tmp GROUP BY " + keyName);
+  EXPECT_TRUE(hasStreamingGroupbyStat(
+      task, finalAggId, cudf_velox::kDirectGroupbyFinalizationStat));
 }
 
 TEST_F(AggregationTest, avgSingleGlobal) {
@@ -1092,6 +1102,29 @@ TEST_F(AggregationTest, finalAggregationStreamsOnAddInput) {
   const auto planStats = toPlanStats(task->taskStats());
   EXPECT_GT(planStats.at(partialAggId).customStats.at("flushRowCount").sum, 0);
   EXPECT_GT(planStats.at(finalAggId).outputRows, 0);
+  EXPECT_TRUE(hasStreamingGroupbyStat(
+      task, finalAggId, cudf_velox::kDirectGroupbyFinalizationStat));
+}
+
+TEST_F(AggregationTest, directFinalizationSumAndAvg) {
+  auto vectors = makeVectors(rowType_, 10, 100);
+  createDuckDbTable(vectors);
+
+  core::PlanNodeId finalAggId;
+  auto task =
+      AssertQueryBuilder(duckDbQueryRunner_)
+          .config(QueryConfig::kMaxPartialAggregationMemory, 1)
+          .plan(PlanBuilder()
+                    .values(vectors)
+                    .partialAggregation({"c0", "c6"}, {"sum(c2)", "avg(c4)"})
+                    .finalAggregation()
+                    .capturePlanNodeId(finalAggId)
+                    .planNode())
+          .assertResults(
+              "SELECT c0, c6, sum(c2), avg(c4) FROM tmp GROUP BY c0, c6");
+
+  EXPECT_TRUE(hasStreamingGroupbyStat(
+      task, finalAggId, cudf_velox::kDirectGroupbyFinalizationStat));
 }
 
 TEST_F(AggregationTest, finalAggregationStreamingMixedAggs) {
@@ -1116,6 +1149,8 @@ TEST_F(AggregationTest, finalAggregationStreamingMixedAggs) {
 
   const auto planStats = toPlanStats(task->taskStats());
   EXPECT_GT(planStats.at(finalAggId).outputRows, 0);
+  EXPECT_TRUE(hasStreamingGroupbyStat(
+      task, finalAggId, cudf_velox::kDirectGroupbyFinalizationStat));
 }
 
 TEST_F(AggregationTest, finalAggregationStreamingMultiKey) {
@@ -1961,13 +1996,18 @@ TEST_F(AggregationTest, stddevSampPartialFinalGrouped) {
   createDuckDbTable({data});
 
   // Test with bigint input
-  auto op = PlanBuilder()
-                .values({data})
-                .partialAggregation({"c0"}, {"stddev_samp(c1)"})
-                .finalAggregation()
-                .planNode();
-
-  assertQuery(op, "SELECT c0, stddev_samp(c1) FROM tmp GROUP BY c0");
+  core::PlanNodeId finalAggId;
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .plan(PlanBuilder()
+                            .values({data})
+                            .partialAggregation({"c0"}, {"stddev_samp(c1)"})
+                            .finalAggregation()
+                            .capturePlanNodeId(finalAggId)
+                            .planNode())
+                  .assertResults(
+                      "SELECT c0, stddev_samp(c1) FROM tmp GROUP BY c0");
+  EXPECT_TRUE(hasStreamingGroupbyStat(
+      task, finalAggId, cudf_velox::kDirectGroupbyFinalizationStat));
 
   // Test with double input
   auto op2 = PlanBuilder()
@@ -2315,13 +2355,17 @@ TEST_F(AggregationTest, avgAllNullsPartialFinal) {
   });
   createDuckDbTable({data});
 
-  auto op = PlanBuilder()
-                .values({data})
-                .partialAggregation({"c0"}, {"avg(c1)"})
-                .finalAggregation()
-                .planNode();
-
-  assertQuery(op, "SELECT c0, avg(c1) FROM tmp GROUP BY c0");
+  core::PlanNodeId finalAggId;
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .plan(PlanBuilder()
+                            .values({data})
+                            .partialAggregation({"c0"}, {"avg(c1)"})
+                            .finalAggregation()
+                            .capturePlanNodeId(finalAggId)
+                            .planNode())
+                  .assertResults("SELECT c0, avg(c1) FROM tmp GROUP BY c0");
+  EXPECT_TRUE(hasStreamingGroupbyStat(
+      task, finalAggId, cudf_velox::kDirectGroupbyFinalizationStat));
 
   auto op2 = PlanBuilder()
                  .values({data})
@@ -2353,12 +2397,16 @@ TEST_F(AggregationTest, avgNaNInputs) {
   });
   createDuckDbTable({data});
 
-  auto op = PlanBuilder()
-                .values({data})
-                .singleAggregation({"c0"}, {"avg(c1)"})
-                .planNode();
-
-  assertQuery(op, "SELECT c0, avg(c1) FROM tmp GROUP BY c0");
+  core::PlanNodeId aggId;
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .plan(PlanBuilder()
+                            .values({data})
+                            .singleAggregation({"c0"}, {"avg(c1)"})
+                            .capturePlanNodeId(aggId)
+                            .planNode())
+                  .assertResults("SELECT c0, avg(c1) FROM tmp GROUP BY c0");
+  EXPECT_TRUE(hasStreamingGroupbyStat(
+      task, aggId, cudf_velox::kDirectGroupbyFinalizationStat));
 }
 
 // Test that zero-column rows flow correctly through CudfFromVelox.
