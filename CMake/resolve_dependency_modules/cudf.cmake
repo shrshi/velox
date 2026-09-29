@@ -53,14 +53,14 @@ set(
 )
 velox_resolve_dependency_url(kvikio)
 
-# cudf commit 6862b2a from 2026-09-28 (main branch), includes NVIDIA/cudf#24092
+# cuDF terminal streaming finalization from shrshi/cudf, based on main 6763fa0.
 set(VELOX_cudf_VERSION 26.12 CACHE STRING "cudf version")
-set(VELOX_cudf_COMMIT 6862b2a975675d68b92f8961ee5ca8e92b833925)
+set(VELOX_cudf_COMMIT 171d9656c6a98b263ce18f4d6769b6c6d28da210)
 set(
   VELOX_cudf_BUILD_SHA256_CHECKSUM
-  d91d82d613f288a4943285686123cc44c735c0437096cb7afa665c23e839a8e9
+  55b7a05ebd751744015b66e2389059c7090ba308ec3f72ec944c5a191a9dd688
 )
-set(VELOX_cudf_SOURCE_URL "https://github.com/rapidsai/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
+set(VELOX_cudf_SOURCE_URL "https://github.com/shrshi/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
 velox_resolve_dependency_url(cudf)
 
 # Probe for a system UCX install. The variables are used only to gate ucxx
