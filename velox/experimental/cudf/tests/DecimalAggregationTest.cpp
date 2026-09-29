@@ -42,6 +42,11 @@
 #include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
+
+#include <rmm/cuda_stream.hpp>
+#include <rmm/mr/cuda_async_memory_resource.hpp>
+#include <rmm/mr/tracking_resource_adaptor.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -864,22 +869,192 @@ TEST_F(CudfDecimalTest, decimalSumPartialFinalVarbinary) {
       0);
 }
 
+TEST_F(CudfDecimalTest, decimalGroupbyReleasesRequestTemporaries) {
+  rmm::cuda_stream streamOwner;
+  const cuda::stream_ref stream = streamOwner;
+  rmm::mr::tracking_resource_adaptor tracking{
+      rmm::mr::cuda_async_memory_resource{}};
+  auto previousResource = cudf::set_current_device_resource(tracking);
+  SCOPE_EXIT {
+    stream.sync();
+    cudf::set_current_device_resource(std::move(previousResource));
+  };
+  const rmm::device_async_resource_ref mr{tracking};
+  const auto decimalType = DECIMAL(12, 2);
+  auto input = makeRowVector(
+      {makeFlatVector<int64_t>({0}),
+       makeFlatVector<int64_t>({100}, decimalType)});
+
+  for (const auto& function : {"sum", "avg"}) {
+    SCOPED_TRACE(function);
+    auto builder = exec::test::PlanBuilder().values({input}).partialAggregation(
+        {"c0"}, {fmt::format("{}(c1)", function)});
+    auto partialNode = std::dynamic_pointer_cast<const core::AggregationNode>(
+        builder.planNode());
+    auto finalNode = std::dynamic_pointer_cast<const core::AggregationNode>(
+        builder.finalAggregation().planNode());
+    auto partial = toGroupbyAggregators(
+        *partialNode,
+        partialNode->step(),
+        partialNode->outputType(),
+        {nullptr},
+        {});
+    auto final = toGroupbyAggregators(
+        *finalNode, finalNode->step(), finalNode->outputType(), {nullptr}, {});
+
+    // Reuse both adapters, but do not let the next request hide a retained
+    // temporary by replacing it. Check allocation ownership after each release.
+    for (int64_t batch = 1; batch <= 2; ++batch) {
+      SCOPED_TRACE(batch);
+      {
+        auto keys = makeInt64Column({0, 0, 0}, nullptr, stream);
+        const std::vector<bool> valid{true, false, true};
+        auto values = makeDecimalColumn<int64_t>(
+            {100 * batch, 0, 300 * batch}, 2, &valid, stream);
+        const cudf::table_view rawInput{{keys->view(), values->view()}};
+        cudf::groupby::groupby partialGroupby(cudf::table_view{{keys->view()}});
+        std::vector<cudf::groupby::aggregation_request> requests;
+        partial[0]->addGroupbyRequest(rawInput, requests, stream, mr);
+        auto* castData =
+            const_cast<int128_t*>(requests[0].values.data<int128_t>());
+        ASSERT_EQ(tracking.get_outstanding_allocations().count(castData), 1);
+        auto [partialKeys, partialResults] =
+            partialGroupby.aggregate(requests, stream, mr);
+        requests.clear();
+        partial[0]->releaseInput();
+        EXPECT_EQ(tracking.get_outstanding_allocations().count(castData), 0);
+        auto state = partial[0]->makeOutputColumn(partialResults, stream, mr);
+
+        const cudf::table_view stateInput{
+            {partialKeys->view().column(0), state->view()}};
+        cudf::groupby::groupby finalGroupby(partialKeys->view());
+        final[0]->addGroupbyRequest(stateInput, requests, stream, mr);
+        std::vector<void*> decodedData;
+        for (const auto& request : requests) {
+          decodedData.push_back(const_cast<void*>(request.values.head()));
+          ASSERT_EQ(
+              tracking.get_outstanding_allocations().count(decodedData.back()),
+              1);
+        }
+        auto [finalKeys, finalResults] =
+            finalGroupby.aggregate(requests, stream, mr);
+        requests.clear();
+        final[0]->releaseInput();
+        for (auto* data : decodedData) {
+          EXPECT_EQ(tracking.get_outstanding_allocations().count(data), 0);
+        }
+        auto result = final[0]->makeOutputColumn(finalResults, stream, mr);
+        ASSERT_EQ(result->size(), 1);
+        EXPECT_EQ(result->null_count(), 0);
+        if (std::string_view(function) == "sum") {
+          EXPECT_EQ(
+              copyColumnData<int128_t>(result->view(), stream),
+              std::vector<int128_t>{400 * batch});
+        } else {
+          EXPECT_EQ(
+              copyColumnData<int64_t>(result->view(), stream),
+              std::vector<int64_t>{200 * batch});
+        }
+      }
+      EXPECT_EQ(tracking.get_allocated_bytes(), 0);
+    }
+  }
+}
+
+TEST_F(CudfDecimalTest, streamingDecimalSumReleasesDecodedInput) {
+  rmm::cuda_stream streamOwner;
+  const cuda::stream_ref stream = streamOwner;
+  rmm::mr::tracking_resource_adaptor tracking{
+      rmm::mr::cuda_async_memory_resource{}};
+  auto previousResource = cudf::set_current_device_resource(tracking);
+  SCOPE_EXIT {
+    stream.sync();
+    cudf::set_current_device_resource(std::move(previousResource));
+  };
+  const rmm::device_async_resource_ref mr{tracking};
+  auto input = makeRowVector(
+      {makeFlatVector<int64_t>({0}),
+       makeFlatVector<int64_t>({100}, DECIMAL(12, 2))});
+  const auto plan = exec::test::PlanBuilder()
+                        .values({input})
+                        .partialAggregation({"c0"}, {"sum(c1)"})
+                        .finalAggregation()
+                        .planNode();
+  const auto node =
+      std::dynamic_pointer_cast<const core::AggregationNode>(plan);
+  auto adapters = toStreamingGroupbyAggregators(
+      *node,
+      node->sources()[0]->outputType(),
+      {0, 1},
+      node->outputType(),
+      {nullptr},
+      {});
+  ASSERT_TRUE(adapters.has_value());
+  auto& adapter = *adapters->at(0);
+  std::unique_ptr<cudf::groupby::streaming_groupby> groupby;
+  for (int64_t batch = 1; batch <= 2; ++batch) {
+    auto keys = makeInt64Column({0}, nullptr, stream);
+    auto sums = makeDecimalColumn<int128_t>({100 * batch}, 2, nullptr, stream);
+    auto counts = makeInt64Column({1}, nullptr, stream);
+    auto state =
+        serializeDecimalSumState(sums->view(), counts->view(), stream, mr);
+    const cudf::table_view stateInput{{keys->view(), state->view()}};
+    std::vector<cudf::column_view> prepared{keys->view()};
+    adapter.prepareInput(stateInput, prepared, stream);
+    auto* decodedData = const_cast<void*>(prepared.back().head());
+    ASSERT_EQ(tracking.get_outstanding_allocations().count(decodedData), 1);
+    if (!groupby) {
+      std::vector<cudf::groupby::streaming_aggregation_request> requests;
+      adapter.addStreamingRequest(requests);
+      groupby = std::make_unique<cudf::groupby::streaming_groupby>(
+          std::vector<cudf::size_type>{0},
+          requests,
+          4,
+          cudf::null_policy::INCLUDE,
+          mr);
+    }
+    groupby->aggregate(cudf::table_view{prepared}, stream);
+    prepared.clear();
+    adapter.releaseInput();
+    EXPECT_EQ(tracking.get_outstanding_allocations().count(decodedData), 0);
+  }
+  auto [keys, results] = groupby->finalize(stream, mr);
+  auto result = adapter.makeOutputColumn(results, stream, mr);
+  EXPECT_EQ(
+      copyColumnData<int128_t>(result->view(), stream),
+      std::vector<int128_t>{300});
+}
+
 TEST_F(CudfDecimalTest, decimalSumFinalUsesStreamingGroupby) {
   auto& config = CudfConfig::getInstance();
   const auto savedStreamingGroupbyEnabled = config.streamingGroupbyEnabled;
+  const auto savedCapacityMultiplier =
+      config.streamingGroupbyCapacityMultiplier;
+  const auto savedConcatEnabled = config.concatOptimizationEnabled;
+  const auto savedBatchSizeMin = config.batchSizeMinThreshold;
   config.streamingGroupbyEnabled = true;
+  config.streamingGroupbyCapacityMultiplier = 2.0;
+  config.concatOptimizationEnabled = true;
+  config.batchSizeMinThreshold = 1;
   SCOPE_EXIT {
     config.streamingGroupbyEnabled = savedStreamingGroupbyEnabled;
+    config.streamingGroupbyCapacityMultiplier = savedCapacityMultiplier;
+    config.concatOptimizationEnabled = savedConcatEnabled;
+    config.batchSizeMinThreshold = savedBatchSizeMin;
   };
 
   const auto decimalType = DECIMAL(18, 2);
-  auto input = makeRowVector(
-      {"k", "d"},
-      {makeFlatVector<int32_t>({0, 1, 2, 3}),
-       makeNullableFlatVector<int64_t>(
-           {100, -200, std::nullopt, 400}, decimalType)});
+  std::vector<RowVectorPtr> batches;
+  for (int32_t batch = 0; batch < 8; ++batch) {
+    batches.push_back(makeRowVector(
+        {"k", "d"},
+        {makeNullableFlatVector<int32_t>(
+             {0, 2 * batch + 1, 2 * batch + 2, std::nullopt}),
+         makeNullableFlatVector<int64_t>(
+             {100, -200, std::nullopt, 400}, decimalType)}));
+  }
   auto builder = exec::test::PlanBuilder()
-                     .values({input, input, input, input}, true)
+                     .values(batches, true)
                      .partialAggregation({"k"}, {"sum(d) AS s"});
   const auto plan = builder.finalAggregation().planNode();
   const auto finalAggregationId = plan->id();
@@ -890,10 +1065,16 @@ TEST_F(CudfDecimalTest, decimalSumFinalUsesStreamingGroupby) {
   registerCudf();
   auto task = exec::test::AssertQueryBuilder(plan)
                   .maxDrivers(2)
-                  .config(CudfFromVelox::kGpuBatchSizeRows, "1")
+                  .config(CudfFromVelox::kGpuBatchSizeRows, "4")
                   .config(core::QueryConfig::kMaxPartialAggregationMemory, "1")
                   .assertResults(expected);
   EXPECT_TRUE(hasStreamingGroupbyStat(task, finalAggregationId));
+  const auto stats = exec::toPlanStats(task->taskStats());
+  EXPECT_GT(
+      stats.at(finalAggregationId)
+          .customStats.at(std::string{kStreamingGroupbyRebuildsStat})
+          .sum,
+      0);
 }
 
 TEST_F(CudfDecimalTest, nativeDecimalSumDirectAndLocalExchange) {

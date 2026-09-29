@@ -63,6 +63,10 @@ struct StreamingGroupbyAggregator {
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) = 0;
 
+  // Release request temporaries after their last use has been enqueued on the
+  // stream passed to prepareInput().
+  virtual void releaseInput() {}
+
   virtual ~StreamingGroupbyAggregator() = default;
 
  protected:
@@ -93,6 +97,12 @@ struct GroupbyAggregator {
       std::vector<cudf::groupby::aggregation_result>& results,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) = 0;
+
+  // Release request temporaries after aggregate() has enqueued their last use
+  // on the stream passed to addGroupbyRequest().
+  virtual void releaseInput() {
+    maskedValues_.reset();
+  }
 
   virtual bool supportsDirectFinalization() const {
     return false;
