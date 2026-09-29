@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationState.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
 #include "velox/common/testutil/TestValue.h"
@@ -211,7 +212,8 @@ std::unique_ptr<cudf::table> makeEmptyTable(TypePtr const& inputType) {
           cudf::data_type(cudf::type_id::STRUCT),
           0,
           rmm::device_buffer(),
-          rmm::device_buffer(),
+          cuda::device_buffer<std::byte>{
+              getDefaultStreamForCurrentThread(), get_output_mr()},
           0,
           tbl->release());
       emptyColumns.push_back(std::move(structColumn));

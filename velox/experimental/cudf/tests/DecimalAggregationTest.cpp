@@ -45,6 +45,7 @@
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream.hpp>
+#include <rmm/mr/callback_memory_resource.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/tracking_resource_adaptor.hpp>
 
@@ -70,12 +71,15 @@ int64_t computeAvgRaw(const std::vector<int64_t>& values) {
 
 constexpr int kBitsPerWord = 8 * sizeof(cudf::bitmask_type);
 
-std::pair<rmm::device_buffer, cudf::size_type> makeNullMask(
+std::pair<cuda::device_buffer<std::byte>, cudf::size_type> makeNullMask(
     const std::vector<bool>& valid,
     cuda::stream_ref stream) {
   auto numBits = static_cast<cudf::size_type>(valid.size());
   if (numBits == 0) {
-    return {rmm::device_buffer{}, 0};
+    return {
+        cuda::device_buffer<std::byte>{
+            stream, cudf::get_current_device_resource_ref()},
+        0};
   }
   auto maskBytes = cudf::bitmask_allocation_size_bytes(numBits);
   auto numWords = maskBytes / sizeof(cudf::bitmask_type);
@@ -90,7 +94,8 @@ std::pair<rmm::device_buffer, cudf::size_type> makeNullMask(
       ++nullCount;
     }
   }
-  rmm::device_buffer mask(maskBytes, stream);
+  auto mask =
+      cudf::create_null_mask(numBits, cudf::mask_state::UNINITIALIZED, stream);
   if (!host.empty()) {
     auto status = cudaMemcpyAsync(
         mask.data(),
@@ -1009,7 +1014,7 @@ TEST_F(CudfDecimalTest, streamingDecimalSumReleasesDecodedInput) {
       groupby = std::make_unique<cudf::groupby::streaming_groupby>(
           std::vector<cudf::size_type>{0},
           requests,
-          4,
+          4096,
           cudf::null_policy::INCLUDE,
           mr);
     }
@@ -1018,7 +1023,30 @@ TEST_F(CudfDecimalTest, streamingDecimalSumReleasesDecodedInput) {
     adapter.releaseInput();
     EXPECT_EQ(tracking.get_outstanding_allocations().count(decodedData), 0);
   }
-  auto [keys, results] = groupby->finalize(stream, mr);
+  const auto bytesBeforeFinalize = tracking.get_allocated_bytes();
+  bool allocatedOutput = false;
+  auto outputUpstream = mr;
+  rmm::mr::callback_memory_resource outputResource{
+      [&](std::size_t bytes, cuda::stream_ref outputStream, void*) {
+        // Key locations (8 bytes/slot) and hash slots (4 bytes at load factor
+        // 0.5) must be released before the first output allocation.
+        if (!allocatedOutput) {
+          EXPECT_LE(
+              tracking.get_allocated_bytes() + 4096 * 16, bytesBeforeFinalize);
+          allocatedOutput = true;
+        }
+        return outputUpstream.allocate(
+            outputStream, bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
+      },
+      [&](void* ptr, std::size_t bytes, cuda::stream_ref outputStream, void*) {
+        outputUpstream.deallocate(
+            outputStream, ptr, bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
+      }};
+  auto [keys, results] = groupby->finalize_and_release(stream, outputResource);
+  EXPECT_TRUE(allocatedOutput);
+  EXPECT_EQ(groupby->distinct_keys(), 0);
+  EXPECT_THROW(groupby->finalize(stream, mr), cudf::logic_error);
+  EXPECT_THROW(groupby->finalize_and_release(stream, mr), cudf::logic_error);
   auto result = adapter.makeOutputColumn(results, stream, mr);
   EXPECT_EQ(
       copyColumnData<int128_t>(result->view(), stream),

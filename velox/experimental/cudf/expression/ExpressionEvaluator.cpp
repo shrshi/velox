@@ -2160,7 +2160,12 @@ class RowConstructorFunction : public CudfFunction {
 
     VELOX_CHECK_EQ(nextInputColumnIndex, inputColumns.size());
     return cudf::make_structs_column(
-        outputSize, std::move(children), 0, rmm::device_buffer{}, stream, mr);
+        outputSize,
+        std::move(children),
+        0,
+        cuda::device_buffer<std::byte>{stream, mr},
+        stream,
+        mr);
   }
 
  private:
