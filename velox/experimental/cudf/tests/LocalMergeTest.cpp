@@ -15,7 +15,9 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/CudfPlanNodes.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/tests/utils/CudfPlanTestUtils.h"
 
 #include "velox/core/QueryConfig.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
@@ -28,6 +30,7 @@ using namespace facebook::velox;
 using namespace facebook::velox::exec;
 using namespace facebook::velox::exec::test;
 using namespace facebook::velox::common::testutil;
+using facebook::velox::cudf_velox::test::rewriteToCudfPlan;
 
 namespace {
 
@@ -64,7 +67,7 @@ class LocalMergeTest : public OperatorTestBase {
                                .planNode()})
                       .planNode();
       CursorParameters params;
-      params.planNode = plan;
+      params.planNode = rewriteToCudfPlan(plan);
       params.maxDrivers = 1;
       assertQueryOrdered(
           params,
@@ -83,7 +86,9 @@ class LocalMergeTest : public OperatorTestBase {
                  .planNode();
 
       assertQueryOrdered(
-          plan, "SELECT * FROM tmp ORDER BY " + orderByClause, {keyIndex});
+          rewriteToCudfPlan(plan),
+          "SELECT * FROM tmp ORDER BY " + orderByClause,
+          {keyIndex});
     }
   }
 
@@ -115,7 +120,7 @@ class LocalMergeTest : public OperatorTestBase {
                                  .planNode()})
                         .planNode();
         CursorParameters params;
-        params.planNode = plan;
+        params.planNode = rewriteToCudfPlan(plan);
         params.maxDrivers = 1;
         assertQueryOrdered(
             params,
@@ -134,7 +139,9 @@ class LocalMergeTest : public OperatorTestBase {
                    .planNode();
 
         assertQueryOrdered(
-            plan, "SELECT * FROM tmp " + orderBySql, sortingKeys);
+            rewriteToCudfPlan(plan),
+            "SELECT * FROM tmp " + orderBySql,
+            sortingKeys);
       }
     }
   }
@@ -164,6 +171,40 @@ TEST_F(LocalMergeTest, localMerge) {
 
   testTwoKeys(vectors, "c0", "c3");
   testTwoKeys(vectors, "c3", "c0");
+}
+
+TEST_F(LocalMergeTest, preservesRewrittenSourcesAndOrdering) {
+  using namespace facebook::velox::cudf_velox;
+  auto data = makeRowVector({makeFlatVector<int64_t>({3, 1, 2})});
+  for (int numSources : {1, 2, 3}) {
+    auto ids = std::make_shared<core::PlanNodeIdGenerator>();
+    std::vector<core::PlanNodePtr> sources;
+    for (int i = 0; i < numSources; ++i) {
+      sources.push_back(PlanBuilder(ids)
+                            .values({data})
+                            .project({"c0 + 1 AS c0"})
+                            .orderBy({"c0"}, true)
+                            .planNode());
+    }
+    auto original = PlanBuilder(ids).localMerge({"c0"}, sources).planNode();
+    auto rewritten = rewriteToCudfPlan(original);
+    ASSERT_EQ(rewritten->name(), "LocalMerge");
+    EXPECT_EQ(rewritten->id(), original->id());
+    ASSERT_EQ(rewritten->sources().size(), numSources);
+    for (const auto& source : rewritten->sources()) {
+      // No round-robin partition may separate the sorted stream from merge.
+      ASSERT_NE(dynamic_cast<const CudfToVeloxNode*>(source.get()), nullptr);
+      ASSERT_NE(
+          dynamic_cast<const CudfOrderByNode*>(source->sources()[0].get()),
+          nullptr);
+      EXPECT_NE(
+          source->toString(true, true).find("CudfFilterProject"),
+          std::string::npos);
+    }
+    auto expected = makeRowVector({makeFlatVector<int64_t>(
+        3 * numSources, [&](auto row) { return 2 + row / numSources; })});
+    AssertQueryBuilder(rewritten).maxDrivers(2).assertResults({expected});
+  }
 }
 
 TEST_F(LocalMergeTest, offByOne) {

@@ -584,6 +584,26 @@ class Rewriter {
       return rewriteLocalPartition(localPartition, requestedMode);
     }
 
+    if (auto merge =
+            std::dynamic_pointer_cast<const core::LocalMergeNode>(node)) {
+      std::vector<core::PlanNodePtr> sources;
+      for (const auto& source : merge->sources()) {
+        auto rewritten = rewriteImpl(source, Mode::kCpu);
+        if (rewritten.mode == Mode::kGpu) {
+          // LocalMerge requires sorted input. Convert without inserting the
+          // round-robin partition used at ordinary CPU/GPU boundaries.
+          rewritten.node = std::make_shared<CudfToVeloxNode>(
+              source->id() + "_to_velox", rewritten.node);
+        }
+        sources.push_back(std::move(rewritten.node));
+      }
+      return {
+          core::LocalMergeNode::Builder(*merge)
+              .sources(std::move(sources))
+              .build(),
+          Mode::kCpu};
+    }
+
     if (auto aggregate =
             std::dynamic_pointer_cast<const core::AggregationNode>(node)) {
       if (canUseGpuAggregation(aggregate)) {
@@ -866,6 +886,11 @@ class Rewriter {
       }
     }
 
+    VELOX_CHECK(
+        rebuilt != node || newSources == node->sources(),
+        "GPU plan rewrite cannot reconnect children of {}[{}]",
+        node->name(),
+        node->id());
     return {rebuilt, Mode::kCpu};
   }
 
