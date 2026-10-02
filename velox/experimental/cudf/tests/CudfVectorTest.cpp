@@ -213,95 +213,56 @@ class CudfVectorTest : public ::testing::Test, public VectorTestBase {
   }
 };
 
-TEST_F(CudfVectorTest, nativeSumEncodingValidation) {
+TEST_F(CudfVectorTest, decimal128StateStorage) {
   TestCudaStream stream;
-  const std::vector<CudfColumnEncoding> native{
-      {CudfPhysicalEncoding::kNativeDecimal64SumState, 2}};
+  const auto type = ROW({"sum"}, {DECIMAL(38, 2)});
   CudfVector vector(
-      pool_.get(),
-      ROW({"sum"}, {VARBINARY()}),
-      4,
-      makeNativeSumTable(stream.view()),
-      stream.view(),
-      native);
-  EXPECT_EQ(vector.physicalEncodings(), native);
-  EXPECT_TRUE(vector.hasNativeDecimalSumState());
+      pool_.get(), type, 4, makeNativeSumTable(stream.view()), stream.view());
+  EXPECT_EQ(*vector.type(), *type);
+  EXPECT_EQ(
+      vector.getTableView().column(0).type(),
+      cudf::data_type(cudf::type_id::DECIMAL128, -2));
   EXPECT_EQ(vector.getTableView().column(0).null_count(), 1);
   EXPECT_EQ(
       vector.estimateFlatSize(),
       4 * sizeof(__int128_t) + cudf::bitmask_allocation_size_bytes(4));
   EXPECT_EQ(vector.retainedSize(), vector.estimateFlatSize());
-  EXPECT_EQ(
-      vector.physicalEncodingString(), "NativeDecimal64SumState(scale=2)");
 
   CudfVector allValid(
       pool_.get(),
-      ROW({"sum"}, {VARBINARY()}),
+      type,
       4,
       makeNativeSumTable(stream.view(), false),
-      stream.view(),
-      native);
+      stream.view());
   EXPECT_FALSE(allValid.getTableView().column(0).nullable());
-  EXPECT_TRUE(allValid.hasNativeDecimalSumState());
-
-  auto construct = [&](TypePtr type,
-                       std::vector<CudfColumnEncoding> encodings) {
-    return std::make_shared<CudfVector>(
-        pool_.get(),
-        std::move(type),
-        4,
-        makeNativeSumTable(stream.view()),
-        stream.view(),
-        std::move(encodings));
-  };
-  EXPECT_THROW(
-      construct(ROW({"sum"}, {DECIMAL(38, 2)}), native), VeloxException);
-  EXPECT_THROW(construct(ROW({"sum"}, {VARBINARY()}), {}), VeloxException);
-  EXPECT_THROW(
-      construct(
-          ROW({"sum"}, {VARBINARY()}),
-          {{CudfPhysicalEncoding::kNativeDecimal64SumState, 3}}),
-      VeloxException);
-  EXPECT_THROW(
-      construct(ROW({"sum"}, {VARBINARY()}), {native[0], native[0]}),
-      VeloxException);
-  EXPECT_THROW(
-      std::make_shared<CudfVector>(
-          pool_.get(),
-          ROW({"sum"}, {VARBINARY()}),
-          4,
-          makeTable(stream.view(), cudf::get_current_device_resource_ref()),
-          stream.view(),
-          native),
-      VeloxException);
+  EXPECT_EQ(allValid.estimateFlatSize(), 4 * sizeof(__int128_t));
 }
 
-TEST_F(CudfVectorTest, nativeSumPackedSplitPreservesEncoding) {
+TEST_F(CudfVectorTest, decimal128PackedSplitPreservesTypeAndNulls) {
   TestCudaStream stream;
   auto table = makeNativeSumTable(stream.view());
-  const std::vector<CudfColumnEncoding> native{
-      {CudfPhysicalEncoding::kNativeDecimal64SumState, 2}};
+  const auto type = ROW({"sum"}, {DECIMAL(38, 2)});
   auto partitions = cudf::contiguous_split(
       table->view(),
       {2},
       stream.view(),
       cudf::get_current_device_resource_ref());
+  int partitionIndex = 0;
   for (auto& partition : partitions) {
     CudfVector vector(
         pool_.get(),
-        ROW({"sum"}, {VARBINARY()}),
+        type,
         2,
         std::make_unique<cudf::packed_table>(std::move(partition)),
-        stream.view(),
-        native);
-    EXPECT_EQ(vector.physicalEncodings(), native);
-    EXPECT_TRUE(vector.hasNativeDecimalSumState());
+        stream.view());
+    EXPECT_EQ(*vector.type(), *type);
+    EXPECT_EQ(vector.getTableView().column(0).null_count(), partitionIndex++);
     auto released = vector.release();
     EXPECT_EQ(released->num_rows(), 2);
     EXPECT_EQ(
         released->view().column(0).type(),
         cudf::data_type(cudf::type_id::DECIMAL128, -2));
-    EXPECT_EQ(vector.physicalEncodings(), native);
+    EXPECT_EQ(*vector.type(), *type);
   }
 }
 
@@ -318,8 +279,6 @@ TEST_F(CudfVectorTest, retainedSizeReportsDeviceStorage) {
       std::move(table),
       stream.view());
 
-  EXPECT_EQ(vector.physicalEncodings(), std::vector<CudfColumnEncoding>(1));
-  EXPECT_FALSE(vector.hasNativeDecimalSumState());
   EXPECT_EQ(vector.estimateFlatSize(), 4 * sizeof(int32_t));
   EXPECT_EQ(vector.retainedSize(), vector.estimateFlatSize());
 }

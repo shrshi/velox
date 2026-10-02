@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/tests/CudfFunctionBaseTest.h"
+#include "velox/experimental/cudf/tests/utils/CudfPlanTestUtils.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/exec/FilterProject.h"
@@ -30,11 +31,15 @@
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
 using namespace facebook::velox::exec::test;
+using cudf_velox::test::rewriteToCudfPlan;
 
 class AdapterOperatorTest : public OperatorTestBase {
  protected:
   void SetUp() override {
     OperatorTestBase::SetUp();
+    savedDriverAdapter_ =
+        cudf_velox::CudfConfig::getInstance().enableDriverAdapter;
+    cudf_velox::CudfConfig::getInstance().enableDriverAdapter = true;
     savedCpuFallback_ = cudf_velox::CudfConfig::getInstance().allowCpuFallback;
     cudf_velox::CudfConfig::getInstance().allowCpuFallback = false;
     cudf_velox::registerCudf();
@@ -43,6 +48,8 @@ class AdapterOperatorTest : public OperatorTestBase {
   void TearDown() override {
     cudf_velox::unregisterCudf();
     cudf_velox::CudfConfig::getInstance().allowCpuFallback = savedCpuFallback_;
+    cudf_velox::CudfConfig::getInstance().enableDriverAdapter =
+        savedDriverAdapter_;
     OperatorTestBase::TearDown();
   }
 
@@ -63,6 +70,7 @@ class AdapterOperatorTest : public OperatorTestBase {
   }
 
   bool savedCpuFallback_{true};
+  bool savedDriverAdapter_{false};
 };
 
 namespace {
@@ -201,6 +209,25 @@ class DecliningAdapter : public cudf_velox::OperatorAdapter {
 
 TEST_F(AdapterOperatorTest, adapterStatsMergedIntoPlanNode) {
   auto data = makeRowVector({"c0"}, {makeFlatVector<int32_t>({1, 2, 3, 4, 5})});
+  core::PlanNodeId projNodeId;
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .project({"c0 * 2 as x"})
+                  .capturePlanNodeId(projNodeId)
+                  .planNode();
+  std::shared_ptr<exec::Task> task;
+  AssertQueryBuilder(plan).copyResults(pool(), task);
+  auto stats = toPlanStats(task->taskStats());
+  auto& projStats = stats.at(projNodeId);
+  EXPECT_TRUE(projStats.isMultiOperatorTypeNode());
+  EXPECT_TRUE(projStats.operatorStats.count("CudfToVelox"));
+}
+
+TEST_F(AdapterOperatorTest, physicalOperatorsHaveDedicatedPlanNodeStats) {
+  cudf_velox::unregisterCudf();
+  cudf_velox::CudfConfig::getInstance().enableDriverAdapter = false;
+  cudf_velox::registerCudf();
+  auto data = makeRowVector({"c0"}, {makeFlatVector<int32_t>({1, 2, 3, 4, 5})});
 
   core::PlanNodeId projNodeId;
   auto plan = PlanBuilder()
@@ -210,13 +237,15 @@ TEST_F(AdapterOperatorTest, adapterStatsMergedIntoPlanNode) {
                   .planNode();
 
   std::shared_ptr<exec::Task> task;
-  AssertQueryBuilder(plan).copyResults(pool(), task);
+  AssertQueryBuilder(rewriteToCudfPlan(plan)).copyResults(pool(), task);
 
   auto stats = toPlanStats(task->taskStats());
   auto& projStats = stats.at(projNodeId);
 
-  EXPECT_TRUE(projStats.isMultiOperatorTypeNode());
-  EXPECT_TRUE(projStats.operatorStats.count("CudfToVelox"));
+  EXPECT_FALSE(projStats.isMultiOperatorTypeNode());
+  EXPECT_TRUE(projStats.operatorStats.count("CudfFilterProject"));
+  EXPECT_TRUE(
+      stats.at(projNodeId + "_to_velox").operatorStats.count("CudfToVelox"));
 }
 
 // An empty replacement is an adapter error, not CPU fallback.

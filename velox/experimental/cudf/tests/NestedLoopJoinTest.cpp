@@ -16,7 +16,9 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/tests/utils/CudfPlanTestUtils.h"
 
+#include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
@@ -26,6 +28,7 @@
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
 using namespace facebook::velox::exec::test;
+using cudf_velox::test::rewriteToCudfPlan;
 
 class CudfNestedLoopJoinTest : public HiveConnectorTestBase {
  protected:
@@ -38,6 +41,22 @@ class CudfNestedLoopJoinTest : public HiveConnectorTestBase {
   void TearDown() override {
     cudf_velox::unregisterCudf();
     HiveConnectorTestBase::TearDown();
+  }
+
+  std::shared_ptr<Task> assertQuery(
+      const core::PlanNodePtr& plan,
+      const std::string& duckDbSql) {
+    return HiveConnectorTestBase::assertQuery(
+        rewriteToCudfPlan(plan), duckDbSql);
+  }
+
+  std::shared_ptr<Task> assertQuery(
+      const CursorParameters& params,
+      const std::string& duckDbSql) {
+    auto cudfParams = params;
+    cudfParams.planNode =
+        rewriteToCudfPlan(params.planNode, params.maxDrivers, params.queryCtx);
+    return HiveConnectorTestBase::assertQuery(cudfParams, duckDbSql);
   }
 
   template <typename T>
@@ -1574,7 +1593,7 @@ TEST_F(CudfNestedLoopJoinTest, leftSemiProjectWithNulls) {
   auto expected = makeRowVector(
       {makeNullableFlatVector<int32_t>({1, std::nullopt, 10}),
        makeFlatVector<bool>({true, false, false})});
-  AssertQueryBuilder builder{plan};
+  AssertQueryBuilder builder{rewriteToCudfPlan(plan)};
   auto result = builder.copyResults(pool());
   facebook::velox::test::assertEqualVectors(expected, result);
 }
@@ -1647,7 +1666,7 @@ TEST_F(CudfNestedLoopJoinTest, leftSemiProjectLikeConditionSpanningBothSides) {
   // matches %err%; date matches nothing.
   auto task =
       AssertQueryBuilder(duckDbQueryRunner_)
-          .plan(plan)
+          .plan(rewriteToCudfPlan(plan))
           .assertResults(
               "SELECT t.t_val, EXISTS (SELECT 1 FROM u WHERE t.t_val LIKE u.u_pattern) FROM t");
 
@@ -1735,14 +1754,14 @@ TEST_F(CudfNestedLoopJoinTest, emptyBuildConsumeInput) {
                       {"c0", "u_c0"})
                   .planNode();
 
-  AssertQueryBuilder builder{plan, duckDbQueryRunner_};
+  AssertQueryBuilder builder{rewriteToCudfPlan(plan), duckDbQueryRunner_};
   auto task = builder.assertEmptyResults();
 
   // Verify all 300 probe rows were consumed (matches CPU NLJ behavior).
-  // Pipeline 0, operator 1 is the NLJ probe (operator 0 is Values).
-  auto inputPositions =
-      task->taskStats().pipelineStats[0].operatorStats[1].inputPositions;
-  ASSERT_EQ(inputPositions, 300);
+  const auto stats = exec::toPlanStats(task->taskStats());
+  const auto& operators = stats.at(plan->id()).operatorStats;
+  ASSERT_NE(operators.count("CudfNestedLoopJoinProbe"), 0);
+  ASSERT_EQ(operators.at("CudfNestedLoopJoinProbe")->inputRows, 300);
 }
 
 // With no equi-join keys, the LIKE condition becomes the entire join
@@ -1776,7 +1795,8 @@ TEST_F(CudfNestedLoopJoinTest, likeConditionSpanningBothSides) {
   auto expected = makeRowVector(
       {makeFlatVector<std::string>({"apple", "banana", "cherry"}),
        makeFlatVector<std::string>({"app%", "ban%", "%err%"})});
-  auto task = AssertQueryBuilder(plan).assertResults(expected);
+  auto task =
+      AssertQueryBuilder(rewriteToCudfPlan(plan)).assertResults(expected);
 
   bool sawCudfNestedLoopJoinProbe = false;
   for (auto& pipeline : task->taskStats().pipelineStats) {
@@ -1823,7 +1843,7 @@ TEST_F(CudfNestedLoopJoinTest, likeConditionSpanningBothSidesOuterJoins) {
 
     auto task =
         AssertQueryBuilder(duckDbQueryRunner_)
-            .plan(plan)
+            .plan(rewriteToCudfPlan(plan))
             .assertResults(
                 fmt::format(
                     "SELECT t.t_val, u.u_pattern FROM t {} u ON t.t_val LIKE u.u_pattern",
@@ -1877,7 +1897,7 @@ TEST_F(
 
   auto task =
       AssertQueryBuilder(duckDbQueryRunner_)
-          .plan(plan)
+          .plan(rewriteToCudfPlan(plan))
           .assertResults(
               "SELECT t.t_val, u.u_pattern FROM t FULL JOIN u ON t.t_val LIKE u.u_pattern");
 
@@ -1909,7 +1929,7 @@ TEST_F(CudfNestedLoopJoinTest, crossJoinZeroColumnBuild) {
 
   auto expected =
       makeRowVector({"p0"}, {makeFlatVector<int64_t>({4, 4, 4, 5, 5, 5})});
-  AssertQueryBuilder(plan).assertResults(expected);
+  AssertQueryBuilder(rewriteToCudfPlan(plan)).assertResults(expected);
 }
 
 TEST_F(CudfNestedLoopJoinTest, crossJoinZeroColumnBuildAndOutput) {
@@ -1927,5 +1947,6 @@ TEST_F(CudfNestedLoopJoinTest, crossJoinZeroColumnBuildAndOutput) {
                       {})
                   .planNode();
 
-  AssertQueryBuilder(plan).assertResults(makeRowVector(ROW({}), 6));
+  AssertQueryBuilder(rewriteToCudfPlan(plan))
+      .assertResults(makeRowVector(ROW({}), 6));
 }

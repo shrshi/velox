@@ -15,6 +15,7 @@
  */
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/tests/utils/CudfPlanTestUtils.h"
 
 #include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
@@ -66,7 +67,8 @@ class TopNRowNumberTest : public OperatorTestBase {
   void assertGpuTopNRowNumber(
       const core::PlanNodePtr& plan,
       const std::string& duckDbSql) {
-    auto task = assertQuery(plan, duckDbSql);
+    auto task =
+        assertQuery(cudf_velox::test::rewriteToCudfPlan(plan), duckDbSql);
     ASSERT_TRUE(wasCudfTopNRowNumberUsed(task));
     ASSERT_FALSE(wasCpuTopNRowNumberUsed(task));
   }
@@ -283,7 +285,7 @@ TEST_F(TopNRowNumberTest, rankFallsBackToCpu) {
                   .topNRank("rank", {"c0"}, {"c1"}, 2, true)
                   .planNode();
   auto task = assertQuery(
-      plan,
+      cudf_velox::test::rewriteToCudfPlan(plan),
       "SELECT * FROM (SELECT *, rank() over (partition by c0 order by c1) as row_number FROM tmp) "
       "WHERE row_number <= 2");
   ASSERT_FALSE(wasCudfTopNRowNumberUsed(task));

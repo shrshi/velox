@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/tests/utils/CudfHiveConnectorTestBase.h"
+#include "velox/experimental/cudf/tests/utils/CudfPlanTestUtils.h"
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/file/FileSystems.h"
@@ -126,7 +127,9 @@ CudfHiveConnectorTestBase::assertQuery(
     const std::vector<std::shared_ptr<TempFilePath>>& filePaths,
     const std::string& duckDbSql) {
   return OperatorTestBase::assertQuery(
-      plan, makeCudfHiveConnectorSplits(filePaths), duckDbSql);
+      facebook::velox::cudf_velox::test::rewriteToCudfPlan(plan),
+      makeCudfHiveConnectorSplits(filePaths),
+      duckDbSql);
 }
 
 std::shared_ptr<facebook::velox::exec::Task>
@@ -136,11 +139,17 @@ CudfHiveConnectorTestBase::assertQuery(
         std::shared_ptr<facebook::velox::connector::ConnectorSplit>>& splits,
     const std::string& duckDbSql,
     const int32_t numPrefetchSplit) {
+  auto queryCtx = core::QueryCtx::create(
+      executor_.get(),
+      core::QueryConfig({
+          {core::QueryConfig::kMaxSplitPreloadPerDriver,
+           std::to_string(numPrefetchSplit)},
+      }));
   return facebook::velox::exec::test::AssertQueryBuilder(
-             plan, duckDbQueryRunner_)
-      .config(
-          facebook::velox::core::QueryConfig::kMaxSplitPreloadPerDriver,
-          std::to_string(numPrefetchSplit))
+             facebook::velox::cudf_velox::test::rewriteToCudfPlan(
+                 plan, 32, queryCtx),
+             duckDbQueryRunner_)
+      .queryCtx(queryCtx)
       .splits(splits)
       .assertResults(duckDbSql);
 }

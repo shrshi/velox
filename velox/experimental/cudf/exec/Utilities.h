@@ -27,21 +27,6 @@
 
 namespace facebook::velox::cudf_velox {
 
-/// Replaces native decimal SUM columns with CPU-compatible VARBINARY state.
-/// Leaves aliases of the original vector unchanged. Returns the number of
-/// converted state values (rows times native columns).
-uint64_t materializeNativeDecimalSumState(
-    CudfVectorPtr& vector,
-    rmm::device_async_resource_ref mr);
-
-/// Materializes only the specified channels. Repeated channels are converted
-/// once; default-encoded channels are unchanged. Unselected columns retain
-/// their physical encodings. Leaves aliases of the original vector unchanged.
-uint64_t materializeNativeDecimalSumState(
-    CudfVectorPtr& vector,
-    const std::vector<column_index_t>& channels,
-    rmm::device_async_resource_ref mr);
-
 // Concatenate a vector of cuDF tables into a single table
 [[nodiscard]] std::unique_ptr<cudf::table> concatenateTables(
     std::vector<std::unique_ptr<cudf::table>> tables,

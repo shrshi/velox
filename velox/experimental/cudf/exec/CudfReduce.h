@@ -26,6 +26,8 @@ struct ReduceAggregator {
   VectorPtr constant;
   TypePtr resultType;
   std::optional<uint32_t> maskIndex;
+  bool nativeInput{false};
+  bool nativeOutput{false};
 
   virtual std::unique_ptr<cudf::column> doReduce(
       cudf::table_view const& input,
@@ -53,7 +55,7 @@ struct ReduceAggregator {
 // 'maskChannels' carries the post-permutation mask column index per aggregate;
 // pass the raw-input mask channels for raw steps and an empty vector otherwise.
 std::vector<std::unique_ptr<ReduceAggregator>> toReduceAggregators(
-    core::AggregationNode const& aggregationNode,
+    const CudfAggregationNode& aggregationNode,
     core::AggregationNode::Step step,
     TypePtr const& outputType,
     std::vector<VectorPtr> const& constants,
@@ -76,6 +78,11 @@ class CudfReduce : public CudfOperatorBase {
       int32_t operatorId,
       exec::DriverCtx* driverCtx,
       std::shared_ptr<const core::AggregationNode> const& aggregationNode);
+
+  CudfReduce(
+      int32_t operatorId,
+      exec::DriverCtx* driverCtx,
+      std::shared_ptr<const CudfAggregationNode> aggregationNode);
 
   void initialize() override;
 
@@ -104,7 +111,7 @@ class CudfReduce : public CudfOperatorBase {
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr);
 
-  std::shared_ptr<const core::AggregationNode> aggregationNode_;
+  std::shared_ptr<const CudfAggregationNode> aggregationNode_;
   std::vector<std::unique_ptr<ReduceAggregator>> aggregators_;
 
   std::vector<column_index_t> aggregationInputChannels_;

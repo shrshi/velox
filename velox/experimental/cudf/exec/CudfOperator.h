@@ -131,16 +131,6 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
     ensureCudaContextForThread();
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kAddInput, className_);
-    if (!acceptsNativeDecimalSumState()) {
-      auto vector = std::dynamic_pointer_cast<CudfVector>(input);
-      if (vector && vector->hasNativeDecimalSumState()) {
-        const auto values =
-            materializeNativeDecimalSumState(vector, get_output_mr());
-        stats_.wlock()->addRuntimeStat(
-            "nativeDecimalSumMaterializedValues", RuntimeCounter(values));
-        input = std::move(vector);
-      }
-    }
     doAddInput(std::move(input));
     checkCudaErrorInDebug();
   }
@@ -173,11 +163,6 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
   }
 
  protected:
-  // Opt in only when the operator preserves metadata or validates native state.
-  virtual bool acceptsNativeDecimalSumState() const {
-    return false;
-  }
-
   virtual void doAddInput(RowVectorPtr input) = 0;
 
   virtual RowVectorPtr doGetOutput() = 0;

@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfAggregation.h"
+#include "velox/experimental/cudf/exec/CudfPlanRewriter.h"
 #include "velox/experimental/cudf/exec/CudfReduce.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationHostOps.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationState.h"
@@ -52,6 +53,7 @@ using facebook::velox::cudf_velox::get_temp_mr;
 using facebook::velox::cudf_velox::ReduceAggregator;
 using facebook::velox::cudf_velox::ResolvedAggregateInfo;
 using facebook::velox::cudf_velox::serializeDecimalPartialOrIntermediateState;
+using facebook::velox::cudf_velox::validateDecimalSumResult;
 using facebook::velox::cudf_velox::validateIntermediateColumnType;
 
 #define DEFINE_SIMPLE_REDUCE_AGGREGATOR(Name, name)                            \
@@ -462,6 +464,17 @@ struct ReduceDecimalSumAggregator : ReduceAggregator {
         input, inputIndex, maskIndex, stream, get_temp_mr());
     cudf::column_view inputCol =
         injected ? injected->view() : input.column(inputIndex);
+    if (nativeInput || nativeOutput) {
+      VELOX_CHECK(
+          inputCol.type().id() ==
+          (nativeInput ? cudf::type_id::DECIMAL128 : cudf::type_id::DECIMAL64));
+      auto sum =
+          singleOrRawDecimalSumWithCast(inputCol, outputType, stream, mr);
+      if (!exec::isPartialOutput(step)) {
+        validateDecimalSumResult(sum->view(), stream);
+      }
+      return sum;
+    }
     switch (step) {
       case core::AggregationNode::Step::kSingle:
         return singleOrRawDecimalSumWithCast(inputCol, outputType, stream, mr);
@@ -765,7 +778,7 @@ std::unique_ptr<ReduceAggregator> createReduceAggregator(
 namespace facebook::velox::cudf_velox {
 
 std::vector<std::unique_ptr<ReduceAggregator>> toReduceAggregators(
-    core::AggregationNode const& aggregationNode,
+    const CudfAggregationNode& aggregationNode,
     core::AggregationNode::Step step,
     TypePtr const& outputType,
     std::vector<VectorPtr> const& constants,
@@ -775,8 +788,16 @@ std::vector<std::unique_ptr<ReduceAggregator>> toReduceAggregators(
 
   std::vector<std::unique_ptr<ReduceAggregator>> aggregators;
   aggregators.reserve(params.size());
-  for (const auto& p : params) {
-    aggregators.push_back(createReduceAggregator(p));
+  for (size_t i = 0; i < params.size(); ++i) {
+    auto aggregator = createReduceAggregator(params[i]);
+    const auto& state = aggregationNode.nativeDecimalSumStates()[i];
+    const bool originalStep = step == aggregationNode.step();
+    aggregator->nativeInput =
+        originalStep ? state.input : !exec::isRawInput(step) && state.buffer;
+    aggregator->nativeOutput = originalStep
+        ? state.output
+        : exec::isPartialOutput(step) && state.buffer;
+    aggregators.push_back(std::move(aggregator));
   }
   return aggregators;
 }
@@ -839,6 +860,16 @@ CudfReduce::CudfReduce(
     int32_t operatorId,
     exec::DriverCtx* driverCtx,
     std::shared_ptr<core::AggregationNode const> const& aggregationNode)
+    : CudfReduce(
+          operatorId,
+          driverCtx,
+          CudfPlanRewriter::translateForAdapterAs<CudfAggregationNode>(
+              aggregationNode)) {}
+
+CudfReduce::CudfReduce(
+    int32_t operatorId,
+    exec::DriverCtx* driverCtx,
+    std::shared_ptr<const CudfAggregationNode> aggregationNode)
     : CudfOperatorBase(
           operatorId,
           driverCtx,

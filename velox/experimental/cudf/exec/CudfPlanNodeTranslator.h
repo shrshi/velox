@@ -15,18 +15,19 @@
  */
 #pragma once
 
-#include "velox/core/PlanNode.h"
+#include "velox/exec/Operator.h"
 
 namespace facebook::velox::cudf_velox {
 
-class CudfAggregationNode;
+/// Translates cuDF plan nodes to cuDF operators. Used by LocalPlanner
+class CudfPlanNodeTranslator : public exec::Operator::PlanNodeTranslator {
+ public:
+  std::unique_ptr<exec::Operator> toOperator(
+      exec::DriverCtx* ctx,
+      int32_t id,
+      const core::PlanNodePtr& node) override;
 
-/// Semantic candidates only. The plan rewriter must additionally prove a
-/// GPU-local producer-to-consumer path before selecting native state.
-std::vector<bool> nativeDecimalSumEligibility(
-    const core::AggregationNode& aggregation);
-
-std::vector<bool> nativeDecimalSumEligibility(
-    const CudfAggregationNode& aggregation);
+  std::optional<uint32_t> maxDrivers(const core::PlanNodePtr& node) override;
+};
 
 } // namespace facebook::velox::cudf_velox

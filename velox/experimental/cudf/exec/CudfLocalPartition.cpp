@@ -194,14 +194,6 @@ void CudfLocalPartition::doAddInput(RowVectorPtr input) {
   flushVectorPool();
   auto cudfVector = std::dynamic_pointer_cast<CudfVector>(input);
   VELOX_CHECK(cudfVector, "Input must be a CudfVector");
-  const auto materializedValues = materializeNativeDecimalSumState(
-      cudfVector, partitionKeyIndices_, get_output_mr());
-  if (materializedValues > 0) {
-    stats_.wlock()->addRuntimeStat(
-        "nativeDecimalSumMaterializedValues",
-        RuntimeCounter(materializedValues));
-  }
-  input = cudfVector;
   recordOutputStats(input);
   auto stream = cudfVector->stream();
 
@@ -269,8 +261,7 @@ void CudfLocalPartition::doAddInput(RowVectorPtr input) {
           outputType_,
           partitionData.num_rows(),
           std::make_unique<cudf::table>(partitionData, stream, get_output_mr()),
-          stream,
-          cudfVector->physicalEncodings());
+          stream);
       enqueuePartition(i, partitionCudfVector);
     }
   } else {

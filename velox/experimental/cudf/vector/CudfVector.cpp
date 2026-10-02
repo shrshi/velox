@@ -117,8 +117,7 @@ CudfVector::CudfVector(
     TypePtr type,
     vector_size_t size,
     std::unique_ptr<cudf::table>&& table,
-    cuda::stream_ref stream,
-    std::vector<CudfColumnEncoding> physicalEncodings)
+    cuda::stream_ref stream)
     : RowVector(
           pool,
           std::move(type),
@@ -127,15 +126,14 @@ CudfVector::CudfVector(
           std::vector<VectorPtr>(),
           std::nullopt),
       tableStorage_{std::move(table)},
-      stream_{stream},
-      physicalEncodings_{std::move(physicalEncodings)} {
+      stream_{stream} {
   logDefaultStreamIfNeeded(stream_, "CudfVector(table)");
   auto& tablePtr = std::get<std::unique_ptr<cudf::table>>(tableStorage_);
   auto [bytes, tableOut] = getTableSize(std::move(tablePtr));
   flatSize_ = bytes;
   tablePtr = std::move(tableOut);
   tabView_ = tablePtr->view();
-  validatePhysicalEncodings();
+  VELOX_CHECK_EQ(this->type()->size(), tabView_.num_columns());
 }
 
 CudfVector::CudfVector(
@@ -143,8 +141,7 @@ CudfVector::CudfVector(
     TypePtr type,
     vector_size_t size,
     std::unique_ptr<cudf::packed_table>&& packedTable,
-    cuda::stream_ref stream,
-    std::vector<CudfColumnEncoding> physicalEncodings)
+    cuda::stream_ref stream)
     : RowVector(
           pool,
           std::move(type),
@@ -153,72 +150,14 @@ CudfVector::CudfVector(
           std::vector<VectorPtr>(),
           std::nullopt),
       tableStorage_{std::move(packedTable)},
-      stream_{stream},
-      physicalEncodings_{std::move(physicalEncodings)} {
+      stream_{stream} {
   logDefaultStreamIfNeeded(stream_, "CudfVector(packed_table)");
   auto& packedPtr =
       std::get<std::unique_ptr<cudf::packed_table>>(tableStorage_);
   tabView_ = packedPtr->table;
   // For packed table, flatSize is the size of the GPU data buffer
   flatSize_ = packedPtr->data.gpu_data->size();
-  validatePhysicalEncodings();
-}
-
-void CudfVector::validatePhysicalEncodings() {
-  VELOX_CHECK_EQ(type()->size(), tabView_.num_columns());
-  if (physicalEncodings_.empty()) {
-    physicalEncodings_.resize(type()->size());
-  }
-  VELOX_CHECK_EQ(physicalEncodings_.size(), type()->size());
-  for (size_t i = 0; i < physicalEncodings_.size(); ++i) {
-    const auto& encoding = physicalEncodings_[i];
-    switch (encoding.encoding) {
-      case CudfPhysicalEncoding::kDefault:
-        VELOX_CHECK_EQ(encoding.scale, 0);
-        if (type()->childAt(i)->isVarbinary()) {
-          VELOX_CHECK(
-              tabView_.column(i).type().id() == cudf::type_id::STRING,
-              "Untagged VARBINARY requires a physical STRING column");
-        }
-        break;
-      case CudfPhysicalEncoding::kNativeDecimal64SumState:
-        VELOX_CHECK(type()->childAt(i)->isVarbinary());
-        VELOX_CHECK_GE(encoding.scale, 0);
-        VELOX_CHECK_LE(encoding.scale, 18);
-        VELOX_CHECK(
-            tabView_.column(i).type() ==
-                cudf::data_type(cudf::type_id::DECIMAL128, -encoding.scale),
-            "Native decimal SUM state requires DECIMAL128 at scale {}",
-            -encoding.scale);
-        break;
-      default:
-        VELOX_FAIL("Unknown cuDF physical encoding");
-    }
-  }
-}
-
-bool CudfVector::hasNativeDecimalSumState() const {
-  return std::any_of(
-      physicalEncodings_.begin(),
-      physicalEncodings_.end(),
-      [](const auto& encoding) {
-        return encoding.encoding ==
-            CudfPhysicalEncoding::kNativeDecimal64SumState;
-      });
-}
-
-std::string CudfVector::physicalEncodingString() const {
-  std::string result;
-  for (size_t i = 0; i < physicalEncodings_.size(); ++i) {
-    const auto& encoding = physicalEncodings_[i];
-    if (i > 0) {
-      result += ", ";
-    }
-    result += encoding.encoding == CudfPhysicalEncoding::kDefault
-        ? "Default"
-        : fmt::format("NativeDecimal64SumState(scale={})", encoding.scale);
-  }
-  return result;
+  VELOX_CHECK_EQ(this->type()->size(), tabView_.num_columns());
 }
 
 std::unique_ptr<cudf::table> CudfVector::release() {

@@ -17,6 +17,7 @@
 #pragma once
 
 #include "velox/experimental/cudf/exec/CudfOperator.h"
+#include "velox/experimental/cudf/exec/CudfPlanNodes.h"
 
 #include "velox/exec/Operator.h"
 
@@ -27,6 +28,11 @@ class CudfLimit : public CudfOperatorBase {
       int32_t operatorId,
       exec::DriverCtx* driverCtx,
       const std::shared_ptr<const core::LimitNode>& limitNode);
+
+  CudfLimit(
+      int32_t operatorId,
+      exec::DriverCtx* driverCtx,
+      std::shared_ptr<const CudfLimitNode> limitNode);
 
   bool needsInput() const override;
 
@@ -39,10 +45,6 @@ class CudfLimit : public CudfOperatorBase {
   }
 
  protected:
-  bool acceptsNativeDecimalSumState() const override {
-    return true;
-  }
-
   void doAddInput(RowVectorPtr input) override;
   RowVectorPtr doGetOutput() override;
 

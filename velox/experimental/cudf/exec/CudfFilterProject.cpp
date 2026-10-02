@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
+#include "velox/experimental/cudf/exec/CudfPlanRewriter.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/Validation.h"
@@ -113,27 +114,37 @@ CudfFilterProject::CudfFilterProject(
     velox::exec::DriverCtx* driverCtx,
     const std::shared_ptr<const core::FilterNode>& filter,
     const std::shared_ptr<const core::ProjectNode>& project)
+    : CudfFilterProject(
+          operatorId,
+          driverCtx,
+          CudfPlanRewriter::translateForAdapterAs<CudfFilterProjectNode>(
+              project
+                  ? std::static_pointer_cast<const core::PlanNode>(project)
+                  : std::static_pointer_cast<const core::PlanNode>(filter))) {}
+
+CudfFilterProject::CudfFilterProject(
+    int32_t operatorId,
+    velox::exec::DriverCtx* driverCtx,
+    std::shared_ptr<const CudfFilterProjectNode> planNode)
     : CudfOperatorBase(
           operatorId,
           driverCtx,
-          project ? project->outputType() : filter->outputType(),
-          project ? project->id() : filter->id(),
+          planNode->outputType(),
+          planNode->id(),
           "CudfFilterProject",
           nvtx3::rgb{220, 20, 60}, // Crimson
           NvtxMethodFlag::kAll,
           std::nullopt,
-          project ? std::static_pointer_cast<const core::PlanNode>(project)
-                  : std::static_pointer_cast<const core::PlanNode>(filter)),
-      hasFilter_(filter != nullptr),
-      project_(project),
-      filter_(filter) {
-  if (filter_ != nullptr && project_ != nullptr) {
+          planNode),
+      hasFilter_(planNode->hasFilter()),
+      planNode_(std::move(planNode)) {
+  if (planNode_->hasFilter() && planNode_->hasProject()) {
     folly::Synchronized<exec::OperatorStats>& opStats = Operator::stats();
     opStats.withWLock([&](auto& stats) {
-      stats.setStatSplitter(
-          [filterId = filter_->id()](const auto& combinedStats) {
-            return splitStats(combinedStats, filterId);
-          });
+      stats.setStatSplitter([filterId = planNode_->filterNodeId().value()](
+                                const auto& combinedStats) {
+        return splitStats(combinedStats, filterId);
+      });
     });
   }
 }
@@ -143,15 +154,14 @@ void CudfFilterProject::initialize() {
 
   std::vector<core::TypedExprPtr> allExprs;
   if (hasFilter_) {
-    VELOX_CHECK_NOT_NULL(filter_);
-    allExprs.push_back(filter_->filter());
+    allExprs.push_back(planNode_->filter());
   }
 
-  if (project_) {
-    const auto& inputType = project_->sources()[0]->outputType();
+  if (planNode_->hasProject()) {
+    const auto& inputType = planNode_->sources()[0]->outputType();
 
-    for (column_index_t i = 0; i < project_->projections().size(); i++) {
-      auto& projection = project_->projections()[i];
+    for (column_index_t i = 0; i < planNode_->projections().size(); i++) {
+      const auto& projection = planNode_->projections()[i];
       bool identityProjection = checkAddIdentityProjection(
           projection, inputType, i, identityProjections_);
       if (!identityProjection) {
@@ -166,41 +176,8 @@ void CudfFilterProject::initialize() {
     isIdentityProjection_ = true;
   }
 
-  auto lazyDereference =
-      (dynamic_cast<const core::LazyDereferenceNode*>(project_.get()) !=
-       nullptr);
-  VELOX_CHECK(!(lazyDereference && filter_));
-
-  const auto inputType = project_ ? project_->sources()[0]->outputType()
-                                  : filter_->sources()[0]->outputType();
-  std::vector<bool> expressionInputs(inputType->size(), false);
-  const auto collectInputs = [&](const auto& self,
-                                 const core::TypedExprPtr& expr) -> void {
-    if (auto field = core::TypedExprs::asFieldAccess(expr)) {
-      if (field->isInputColumn() && inputType->containsChild(field->name())) {
-        expressionInputs[inputType->getChildIdx(field->name())] = true;
-      } else {
-        // Unknown or nested field access: conservatively materialize all state.
-        std::fill(expressionInputs.begin(), expressionInputs.end(), true);
-      }
-      return;
-    }
-    if (expr->isInputKind()) {
-      std::fill(expressionInputs.begin(), expressionInputs.end(), true);
-      return;
-    }
-    for (const auto& input : expr->inputs()) {
-      self(self, input);
-    }
-  };
-  for (const auto& expr : allExprs) {
-    collectInputs(collectInputs, expr);
-  }
-  for (column_index_t i = 0; i < expressionInputs.size(); ++i) {
-    if (expressionInputs[i]) {
-      expressionInputChannels_.push_back(i);
-    }
-  }
+  VELOX_CHECK(!(planNode_->isLazyDereference() && hasFilter_));
+  const auto inputType = planNode_->sources()[0]->outputType();
 
   // convert to AST
   if (CudfConfig::getInstance().debugEnabled) {
@@ -237,19 +214,12 @@ void CudfFilterProject::initialize() {
         optimizeAndCompile);
   }
 
-  filter_.reset();
-  project_.reset();
+  planNode_.reset();
 }
 
 void CudfFilterProject::doAddInput(RowVectorPtr input) {
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
-  const auto values = materializeNativeDecimalSumState(
-      cudfInput, expressionInputChannels_, get_output_mr());
-  if (values > 0) {
-    stats_.wlock()->addRuntimeStat(
-        "nativeDecimalSumMaterializedValues", RuntimeCounter(values));
-  }
   input_ = std::move(cudfInput);
 }
 
@@ -265,11 +235,6 @@ RowVectorPtr CudfFilterProject::doGetOutput() {
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
   VELOX_CHECK_NOT_NULL(cudfInput);
   auto stream = cudfInput->stream();
-  std::vector<CudfColumnEncoding> outputEncodings(outputType_->size());
-  for (const auto& identity : identityProjections_) {
-    outputEncodings[identity.outputChannel] =
-        cudfInput->physicalEncodings()[identity.inputChannel];
-  }
   auto inputTableColumns = cudfInput->release()->release();
   auto outputSize = input_->size();
 
@@ -293,12 +258,7 @@ RowVectorPtr CudfFilterProject::doGetOutput() {
     return nullptr;
   }
   auto cudfOutput = std::make_shared<CudfVector>(
-      input_->pool(),
-      outputType_,
-      size,
-      std::move(outputTable),
-      stream,
-      std::move(outputEncodings));
+      input_->pool(), outputType_, size, std::move(outputTable), stream);
   input_.reset();
   return cudfOutput;
 }
