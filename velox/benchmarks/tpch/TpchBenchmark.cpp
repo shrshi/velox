@@ -76,10 +76,6 @@ void TpchBenchmark::shutdown() {
   queryBuilder_.reset();
 }
 
-exec::test::TpchPlan TpchBenchmark::getQueryPlanForExecution(int32_t queryId) {
-  return queryBuilder_->getQueryPlan(queryId);
-}
-
 void TpchBenchmark::runMain(
     std::ostream& out,
     facebook::velox::RunStats& runStats) {
@@ -88,7 +84,7 @@ void TpchBenchmark::runMain(
   } else {
     auto queryPlan = FLAGS_io_meter_column_pct > 0
         ? queryBuilder_->getIoMeterPlan(FLAGS_io_meter_column_pct)
-        : getQueryPlanForExecution(FLAGS_run_query_verbose);
+        : queryBuilder_->getQueryPlan(FLAGS_run_query_verbose);
     auto [cursor, actualResults] = run(queryPlan, queryConfigs_);
     if (!cursor) {
       LOG(ERROR) << "Query terminated with error. Exiting";
