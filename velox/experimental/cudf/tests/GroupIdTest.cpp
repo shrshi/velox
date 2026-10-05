@@ -16,7 +16,6 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
-#include "velox/experimental/cudf/tests/utils/CudfPlanTestUtils.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
@@ -27,7 +26,6 @@ using namespace facebook::velox;
 using namespace facebook::velox::test;
 using namespace facebook::velox::exec;
 using namespace facebook::velox::exec::test;
-using cudf_velox::test::rewriteToCudfPlan;
 
 class CudfGroupIdTest : public HiveConnectorTestBase {
  protected:
@@ -40,13 +38,6 @@ class CudfGroupIdTest : public HiveConnectorTestBase {
   void TearDown() override {
     cudf_velox::unregisterCudf();
     HiveConnectorTestBase::TearDown();
-  }
-
-  std::shared_ptr<Task> assertQuery(
-      const core::PlanNodePtr& plan,
-      const std::string& duckDbSql) {
-    return HiveConnectorTestBase::assertQuery(
-        rewriteToCudfPlan(plan), duckDbSql);
   }
 };
 
@@ -181,11 +172,11 @@ TEST_F(CudfGroupIdTest, groupingSetsOutput) {
   ASSERT_EQ(*orderGroupIdNode->outputType(), *orderExpectedRowType);
 
   CursorParameters orderParams;
-  orderParams.planNode = rewriteToCudfPlan(orderPlan);
+  orderParams.planNode = orderPlan;
   auto orderResult = readCursor(orderParams);
 
   CursorParameters reversedOrderParams;
-  reversedOrderParams.planNode = rewriteToCudfPlan(reversedOrderPlan);
+  reversedOrderParams.planNode = reversedOrderPlan;
   auto reversedOrderResult = readCursor(reversedOrderParams);
 
   assertEqualResults(orderResult.second, reversedOrderResult.second);
@@ -266,7 +257,7 @@ TEST_F(CudfGroupIdTest, nullHandling) {
                   .groupId({"c0", "c1"}, {{"c0"}, {"c1"}}, {"c2"})
                   .planNode();
 
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan)).copyResults(pool());
+  auto result = AssertQueryBuilder(plan).copyResults(pool());
 
   // Should have 4 rows (2 rows * 2 grouping sets)
   ASSERT_EQ(4, result->size());

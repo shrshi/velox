@@ -16,7 +16,6 @@
 #pragma once
 
 #include "velox/experimental/cudf/exec/CudfOperator.h"
-#include "velox/experimental/cudf/exec/CudfPlanNodes.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 namespace facebook::velox::cudf_velox {
@@ -39,11 +38,6 @@ class CudfTopNRowNumber : public CudfOperatorBase {
       int32_t operatorId,
       exec::DriverCtx* driverCtx,
       const std::shared_ptr<const core::TopNRowNumberNode>& node);
-
-  CudfTopNRowNumber(
-      int32_t operatorId,
-      exec::DriverCtx* driverCtx,
-      std::shared_ptr<const CudfTopNRowNumberNode> node);
 
   bool needsInput() const override {
     return !noMoreInput_;

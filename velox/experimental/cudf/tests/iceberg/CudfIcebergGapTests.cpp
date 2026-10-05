@@ -17,7 +17,6 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 #include "velox/experimental/cudf/tests/iceberg/CudfDeletionVectorTestUtils.h"
 #include "velox/experimental/cudf/tests/iceberg/CudfIcebergTestBase.h"
-#include "velox/experimental/cudf/tests/utils/CudfPlanTestUtils.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/connectors/hive/TableHandle.h"
@@ -31,7 +30,6 @@
 #include <unordered_set>
 
 using namespace facebook::velox::exec::test;
-using facebook::velox::cudf_velox::test::rewriteToCudfPlan;
 using namespace facebook::velox::connector::hive::iceberg;
 using facebook::velox::common::testutil::TempFilePath;
 using facebook::velox::connector::hive::HiveColumnHandle;
@@ -108,9 +106,7 @@ TEST_F(CudfIcebergGapTests, multipleDeletesAtDifferentSequenceNumbers) {
   all.insert(all.end(), splits3.begin(), splits3.end());
 
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(all)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(all).copyResults(pool());
 
   auto expected = makeRowVector({
       makeFlatVector<int64_t>({1, 3, 5, 2, 6}),
@@ -174,9 +170,7 @@ TEST_F(CudfIcebergGapTests, positionalAndEqualityWithSequenceNumbers) {
       makeIcebergSplits(dataFile->getPath(), {posDelete, eqDelete}, {}, 1, 1);
 
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(splits)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
 
   auto expected = makeRowVector({
       makeFlatVector<int64_t>({20, 40, 50, 70}),
@@ -215,9 +209,7 @@ TEST_F(CudfIcebergGapTests, multiColumnPartialMatchDoesNotDelete) {
 
   auto splits = makeIcebergSplits(dataFile->getPath(), {eqDelete});
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(splits)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
 
   auto expected = makeRowVector({
       makeFlatVector<int64_t>({1, 3, 2, 1}),
@@ -259,9 +251,7 @@ TEST_F(CudfIcebergGapTests, equalityDeleteNoMatchAcrossFiles) {
   all.insert(all.end(), splits2.begin(), splits2.end());
 
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(all)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(all).copyResults(pool());
 
   auto expected = makeRowVector({
       makeFlatVector<int64_t>({1, 2, 3, 4, 5, 6}),
@@ -299,9 +289,7 @@ TEST_F(CudfIcebergGapTests, hivePartitionedTable) {
                   .endTableScan()
                   .planNode();
 
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(splits)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
 
   auto expected = makeRowVector({
       makeFlatVector<int64_t>({1, 2, 3}),
@@ -351,9 +339,7 @@ TEST_F(CudfIcebergGapTests, hivePartitionWithEqualityDelete) {
                   .endTableScan()
                   .planNode();
 
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(splits)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
 
   auto expected = makeRowVector({
       makeFlatVector<int64_t>({1, 3, 4, 5}),
@@ -401,9 +387,7 @@ TEST_F(CudfIcebergGapTests, equalityDeleteOnPartitionColumnNotSupported) {
                   .planNode();
 
   const auto runQuery = [&]() {
-    return AssertQueryBuilder(rewriteToCudfPlan(plan))
-        .splits(splits)
-        .copyResults(pool());
+    return AssertQueryBuilder(plan).splits(splits).copyResults(pool());
   };
   VELOX_ASSERT_THROW(
       runQuery(),
@@ -445,9 +429,7 @@ TEST_F(CudfIcebergGapTests, schemaEvolutionAddedColumn) {
                   .endTableScan()
                   .planNode();
 
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(all)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(all).copyResults(pool());
 
   auto expected = makeRowVector({
       makeFlatVector<int64_t>({1, 2, 3, 4}),
@@ -504,9 +486,7 @@ TEST_F(CudfIcebergGapTests, schemaEvolutionWithEqualityDelete) {
                   .endTableScan()
                   .planNode();
 
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(all)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(all).copyResults(pool());
 
   auto expected = makeRowVector({
       makeFlatVector<int64_t>({1, 3, 4}),
@@ -545,9 +525,7 @@ TEST_F(CudfIcebergGapTests, equalityDeleteNullMatchesNull) {
 
   auto splits = makeIcebergSplits(dataFile->getPath(), {eqDelete});
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(splits)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
 
   auto expected = makeRowVector({
       makeFlatVector<int64_t>({1, 3, 5}),
@@ -596,9 +574,7 @@ TEST_F(CudfIcebergGapTests, multipleEqualityDeletesDifferentKeyColumns) {
 
   auto splits = makeIcebergSplits(dataFile->getPath(), {eqDelete1, eqDelete2});
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(splits)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
 
   auto expected = makeRowVector({
       makeFlatVector<int64_t>({1, 3, 5}),
@@ -641,9 +617,7 @@ TEST_F(CudfIcebergGapTests, allRowsDeletedContinuesReading) {
   all.insert(all.end(), splits2.begin(), splits2.end());
 
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(all)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(all).copyResults(pool());
 
   auto expected = makeRowVector({
       makeFlatVector<int64_t>({5, 6}),
@@ -680,9 +654,7 @@ TEST_F(CudfIcebergGapTests, equalityDeleteWithExtraNonKeyColumns) {
 
   auto splits = makeIcebergSplits(dataFile->getPath(), {eqDelete});
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(splits)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
 
   auto expected = makeRowVector({
       makeFlatVector<int64_t>({1, 3, 5}),
@@ -730,9 +702,7 @@ TEST_F(CudfIcebergGapTests, schemaEvolutionColumnAddedInMiddle) {
                   .endTableScan()
                   .planNode();
 
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(all)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(all).copyResults(pool());
 
   auto expected = makeRowVector({
       makeFlatVector<int64_t>({1, 2, 3, 4}),
@@ -780,9 +750,7 @@ TEST_F(CudfIcebergGapTests, emptyDataFileWithDeletes) {
   all.insert(all.end(), splits2.begin(), splits2.end());
 
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(all)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(all).copyResults(pool());
 
   auto expected = makeRowVector({
       makeFlatVector<int64_t>({1, 3}),
@@ -817,9 +785,7 @@ TEST_F(CudfIcebergGapTests, partitionColumnInt32Type) {
                   .endTableScan()
                   .planNode();
 
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(splits)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
 
   auto expected = makeRowVector({
       makeFlatVector<int64_t>({1, 2, 3}),
@@ -854,9 +820,7 @@ TEST_F(CudfIcebergGapTests, partitionColumnInt64Type) {
                   .endTableScan()
                   .planNode();
 
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(splits)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
 
   auto expected = makeRowVector({
       makeFlatVector<int64_t>({10, 20, 30}),
@@ -902,9 +866,7 @@ TEST_F(CudfIcebergGapTests, deletionVectorPlusEqualityDelete) {
       dataFile->getPath(), {dvDelete, eqDelete}, {}, 1, /*dataSeq=*/1);
 
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(splits)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
 
   auto expected = makeRowVector({
       makeFlatVector<int64_t>({20, 40, 50, 70}),
@@ -958,9 +920,7 @@ TEST_F(CudfIcebergGapTests, deletionVectorPlusPositionalDelete) {
       dataFile->getPath(), {dvDelete, posDelete}, {}, 1, /*dataSeq=*/1);
 
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(splits)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
 
   auto expected = makeRowVector({
       makeFlatVector<int64_t>({20, 40, 50}),
@@ -1031,10 +991,9 @@ TEST_F(CudfIcebergGapTests, allDeleteMechanisms) {
       {},
       1,
       /*dataSeq=*/1);
-  auto result =
-      AssertQueryBuilder(rewriteToCudfPlan(makeTableScanPlan(rowType)))
-          .splits(splits)
-          .copyResults(pool());
+  auto result = AssertQueryBuilder(makeTableScanPlan(rowType))
+                    .splits(splits)
+                    .copyResults(pool());
   auto expected = makeRowVector({
       makeFlatVector<int64_t>({20, 50}),
       makeFlatVector<int64_t>({2, 5}),
@@ -1096,7 +1055,7 @@ TEST_F(CudfIcebergGapTests, deletionVectorAcrossMultipleChunks) {
   // Use a small chunk-read-limit to force the reader to emit several output
   // chunks.
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
+  auto result = AssertQueryBuilder(plan)
                     .connectorSessionProperty(
                         kCudfIcebergConnectorId,
                         cudf_velox::connector::hive::CudfHiveConfig::
@@ -1175,7 +1134,7 @@ TEST_F(CudfIcebergGapTests, positionalDeletesAcrossMultipleChunks) {
   // Use a small chunk-read-limit to force the reader to emit several output
   // chunks.
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
+  auto result = AssertQueryBuilder(plan)
                     .connectorSessionProperty(
                         kCudfIcebergConnectorId,
                         cudf_velox::connector::hive::CudfHiveConfig::

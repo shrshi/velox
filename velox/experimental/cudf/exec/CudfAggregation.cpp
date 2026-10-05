@@ -97,6 +97,45 @@ std::string getOriginalName(const std::string& kind) {
   return kind;
 }
 
+bool usesCompactDecimalSum(
+    const core::AggregationNode::Aggregate& aggregate,
+    core::AggregationNode::Step step) {
+  if (aggregate.call->name() !=
+          CudfConfig::getInstance().functionNamePrefix + "sum" ||
+      aggregate.rawInputTypes.size() != 1 ||
+      !aggregate.rawInputTypes[0]->isShortDecimal() ||
+      step == core::AggregationNode::Step::kSingle) {
+    return false;
+  }
+  const auto& inputs = aggregate.call->inputs();
+  const bool decimalInput = !exec::isRawInput(step) && inputs.size() == 1 &&
+      inputs[0]->type()->isDecimal();
+  const bool decimalOutput =
+      exec::isPartialOutput(step) && aggregate.call->type()->isDecimal();
+  if (!decimalInput && !decimalOutput) {
+    return false;
+  }
+  const auto stateType =
+      DECIMAL(38, getDecimalPrecisionScale(*aggregate.rawInputTypes[0]).second);
+  VELOX_USER_CHECK(
+      inputs.size() == 1 &&
+          *inputs[0]->type() ==
+              *(exec::isRawInput(step) ? aggregate.rawInputTypes[0]
+                                       : stateType) &&
+          *aggregate.call->type() == *stateType,
+      "Compact Decimal64 SUM requires a DECIMAL(38, input scale) intermediate");
+  return true;
+}
+
+bool hasCompactDecimalSum(const core::AggregationNode& node) {
+  return std::any_of(
+      node.aggregates().begin(),
+      node.aggregates().end(),
+      [&](const auto& aggregate) {
+        return usesCompactDecimalSum(aggregate, node.step());
+      });
+}
+
 bool aggregationSupportsMask(const std::string& aggregateName) {
   // Mask eligibility is declared at registration (see
   // maskSupportedAggregations() populated in
@@ -204,7 +243,7 @@ std::unique_ptr<cudf::column> maskToValidityColumn(
 }
 
 std::vector<ResolvedAggregateInfo> resolveAggregateInfos(
-    const CudfAggregationNode& aggregationNode,
+    const core::AggregationNode& aggregationNode,
     core::AggregationNode::Step step,
     TypePtr const& outputType,
     std::vector<VectorPtr> const& constants,
@@ -217,12 +256,12 @@ std::vector<ResolvedAggregateInfo> resolveAggregateInfos(
     auto const& aggregate = aggregationNode.aggregates()[i];
     auto const companionStep = getCompanionStep(aggregate.call->name(), step);
     const auto originalName = getOriginalName(aggregate.call->name());
-    const auto& nativeState = aggregationNode.nativeDecimalSumStates()[i];
-    const bool nativeOutput = step == aggregationNode.step()
-        ? nativeState.output
-        : nativeState.buffer;
-    const auto resultType =
-        exec::isPartialOutput(companionStep) && !nativeOutput
+    const bool compact =
+        usesCompactDecimalSum(aggregate, aggregationNode.step());
+    const auto resultType = compact
+        ? DECIMAL(
+              38, getDecimalPrecisionScale(*aggregate.rawInputTypes[0]).second)
+        : exec::isPartialOutput(companionStep)
         ? exec::resolveIntermediateType(originalName, aggregate.rawInputTypes)
         : outputType->childAt(numKeys + i);
     const auto isDecimalAggregate = aggregate.rawInputTypes.size() == 1 &&
@@ -245,13 +284,14 @@ std::vector<ResolvedAggregateInfo> resolveAggregateInfos(
             ? std::make_optional(getCountInputKind(aggregate, constants[i]))
             : std::nullopt,
         maskIndex,
-        isDecimalAggregate);
+        isDecimalAggregate,
+        compact);
   }
   return params;
 }
 
 AggregationInputChannels buildAggregationInputChannels(
-    const CudfAggregationNode& aggregationNode,
+    const core::AggregationNode& aggregationNode,
     exec::OperatorCtx const& operatorCtx,
     RowTypePtr const& inputRowSchema,
     std::vector<column_index_t> const& groupingKeyInputChannels) {
@@ -318,7 +358,7 @@ AggregationInputChannels buildAggregationInputChannels(
   return result;
 }
 
-RowTypePtr getBufferedResultType(const CudfAggregationNode& aggregationNode) {
+RowTypePtr getBufferedResultType(const core::AggregationNode& aggregationNode) {
   const auto outputRowType = asRowType(aggregationNode.outputType());
   const auto numKeys = aggregationNode.groupingKeys().size();
 
@@ -331,7 +371,8 @@ RowTypePtr getBufferedResultType(const CudfAggregationNode& aggregationNode) {
   for (auto i = 0; i < aggregationNode.aggregates().size(); ++i) {
     auto const& aggregate = aggregationNode.aggregates()[i];
     const auto originalName = getOriginalName(aggregate.call->name());
-    types[numKeys + i] = aggregationNode.nativeDecimalSumStates()[i].buffer
+    types[numKeys + i] =
+        usesCompactDecimalSum(aggregate, aggregationNode.step())
         ? DECIMAL(
               38, getDecimalPrecisionScale(*aggregate.rawInputTypes[0]).second)
         : exec::resolveIntermediateType(originalName, aggregate.rawInputTypes);
@@ -348,7 +389,7 @@ bool hasFinalAggs(
 }
 
 void setupGroupingKeyChannelProjections(
-    const CudfAggregationNode& aggregationNode,
+    const core::AggregationNode& aggregationNode,
     std::vector<column_index_t>& groupingKeyInputChannels,
     std::vector<column_index_t>& groupingKeyOutputChannels) {
   VELOX_CHECK(groupingKeyInputChannels.empty());

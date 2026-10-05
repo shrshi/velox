@@ -17,8 +17,6 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfNestedLoopJoin.h"
-#include "velox/experimental/cudf/exec/CudfPlanNodes.h"
-#include "velox/experimental/cudf/exec/CudfPlanRewriter.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
@@ -144,23 +142,13 @@ CudfNestedLoopJoinBuild::CudfNestedLoopJoinBuild(
     int32_t operatorId,
     exec::DriverCtx* driverCtx,
     std::shared_ptr<const core::NestedLoopJoinNode> joinNode)
-    : CudfNestedLoopJoinBuild(
-          operatorId,
-          driverCtx,
-          CudfPlanRewriter::translateForAdapterAs<CudfNestedLoopJoinNode>(
-              joinNode)) {}
-
-CudfNestedLoopJoinBuild::CudfNestedLoopJoinBuild(
-    int32_t operatorId,
-    exec::DriverCtx* driverCtx,
-    std::shared_ptr<const CudfNestedLoopJoinNode> joinNode)
     : CudfJoinBuild(
           operatorId,
           driverCtx,
           joinNode,
           "CudfNestedLoopJoinBuild",
           NvtxMethodFlag::kNoMoreInput),
-      joinNode_(std::move(joinNode)) {}
+      joinNode_(joinNode) {}
 
 void CudfNestedLoopJoinBuild::buildAndPublish(
     std::vector<CudfVectorPtr> inputs) {
@@ -221,16 +209,6 @@ CudfNestedLoopJoinProbe::CudfNestedLoopJoinProbe(
     int32_t operatorId,
     exec::DriverCtx* driverCtx,
     std::shared_ptr<const core::NestedLoopJoinNode> joinNode)
-    : CudfNestedLoopJoinProbe(
-          operatorId,
-          driverCtx,
-          CudfPlanRewriter::translateForAdapterAs<CudfNestedLoopJoinNode>(
-              joinNode)) {}
-
-CudfNestedLoopJoinProbe::CudfNestedLoopJoinProbe(
-    int32_t operatorId,
-    exec::DriverCtx* driverCtx,
-    std::shared_ptr<const CudfNestedLoopJoinNode> joinNode)
     : CudfOperatorBase(
           operatorId,
           driverCtx,
@@ -241,7 +219,7 @@ CudfNestedLoopJoinProbe::CudfNestedLoopJoinProbe(
           NvtxMethodFlag::kGetOutput | NvtxMethodFlag::kNoMoreInput,
           std::nullopt,
           joinNode),
-      joinNode_(std::move(joinNode)) {
+      joinNode_(joinNode) {
   joinType_ = joinNode_->joinType();
   probeType_ = joinNode_->sources()[0]->outputType();
   buildType_ = joinNode_->sources()[1]->outputType();
@@ -1205,13 +1183,9 @@ std::unique_ptr<exec::Operator> CudfNestedLoopJoinBridgeTranslator::toOperator(
     exec::DriverCtx* ctx,
     int32_t id,
     const core::PlanNodePtr& node) {
-  if (auto rawJoin =
+  if (auto joinNode =
           std::dynamic_pointer_cast<const core::NestedLoopJoinNode>(node)) {
-    return std::make_unique<CudfNestedLoopJoinProbe>(id, ctx, rawJoin);
-  }
-  if (auto cudfJoin =
-          std::dynamic_pointer_cast<const CudfNestedLoopJoinNode>(node)) {
-    return std::make_unique<CudfNestedLoopJoinProbe>(id, ctx, cudfJoin);
+    return std::make_unique<CudfNestedLoopJoinProbe>(id, ctx, joinNode);
   }
   return nullptr;
 }
@@ -1219,8 +1193,7 @@ std::unique_ptr<exec::Operator> CudfNestedLoopJoinBridgeTranslator::toOperator(
 std::unique_ptr<exec::JoinBridge>
 CudfNestedLoopJoinBridgeTranslator::toJoinBridge(
     const core::PlanNodePtr& node) {
-  if (std::dynamic_pointer_cast<const core::NestedLoopJoinNode>(node) ||
-      std::dynamic_pointer_cast<const CudfNestedLoopJoinNode>(node)) {
+  if (std::dynamic_pointer_cast<const core::NestedLoopJoinNode>(node)) {
     return std::make_unique<CudfNestedLoopJoinBridge>();
   }
   return nullptr;
@@ -1233,13 +1206,6 @@ exec::OperatorSupplier CudfNestedLoopJoinBridgeTranslator::toOperatorSupplier(
     return [joinNode](int32_t operatorId, exec::DriverCtx* ctx) {
       return std::make_unique<CudfNestedLoopJoinBuild>(
           operatorId, ctx, joinNode);
-    };
-  }
-  if (auto cudfJoin =
-          std::dynamic_pointer_cast<const CudfNestedLoopJoinNode>(node)) {
-    return [cudfJoin](int32_t operatorId, exec::DriverCtx* ctx) {
-      return std::make_unique<CudfNestedLoopJoinBuild>(
-          operatorId, ctx, cudfJoin);
     };
   }
   return nullptr;

@@ -16,7 +16,6 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
-#include "velox/experimental/cudf/tests/utils/CudfPlanTestUtils.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/exec/PlanNodeStats.h"
@@ -29,7 +28,6 @@ namespace facebook::velox::exec {
 
 using namespace facebook::velox::test;
 using namespace facebook::velox::exec::test;
-using cudf_velox::test::rewriteToCudfPlan;
 
 namespace {
 
@@ -50,7 +48,7 @@ class AssignUniqueIdTest : public HiveConnectorTestBase {
       const std::shared_ptr<const core::PlanNode>& plan,
       const std::vector<RowVectorPtr>& input) {
     CursorParameters params;
-    params.planNode = rewriteToCudfPlan(plan);
+    params.planNode = plan;
     params.queryConfigs.insert(
         {cudf_velox::CudfFromVelox::kGpuBatchSizeRows, "1"});
     auto result = readCursor(params);
@@ -75,25 +73,32 @@ class AssignUniqueIdTest : public HiveConnectorTestBase {
     ASSERT_EQ(numColumns, input[0]->childrenSize() + 1);
 
     std::set<int64_t> ids;
-    std::vector<RowVectorPtr> passThroughVectors;
-    passThroughVectors.reserve(vectors.size());
+    size_t inputBatch = 0;
+    vector_size_t inputOffset = 0;
     for (const auto& vector : vectors) {
-      std::vector<VectorPtr> passThroughColumns(
-          vector->children().begin(), vector->children().end() - 1);
-      passThroughVectors.push_back(
-          std::make_shared<RowVector>(
-              pool(),
-              input[0]->type(),
-              nullptr,
-              vector->size(),
-              std::move(passThroughColumns)));
-
-      auto idColumn = vector->children().back();
-      auto idValues = idColumn->asFlatVector<int64_t>()->rawValues();
+      vector_size_t outputOffset = 0;
+      while (outputOffset < vector->size()) {
+        ASSERT_LT(inputBatch, input.size());
+        const auto count = std::min(
+            input[inputBatch]->size() - inputOffset,
+            vector->size() - outputOffset);
+        for (int i = 0; i < numColumns - 1; ++i) {
+          assertEqualVectors(
+              input[inputBatch]->childAt(i)->slice(inputOffset, count),
+              vector->childAt(i)->slice(outputOffset, count));
+        }
+        outputOffset += count;
+        inputOffset += count;
+        if (inputOffset == input[inputBatch]->size()) {
+          ++inputBatch;
+          inputOffset = 0;
+        }
+      }
+      auto column = vector->children().back();
+      auto idValues = column->asFlatVector<int64_t>()->rawValues();
       std::copy(
-          idValues, idValues + idColumn->size(), std::inserter(ids, ids.end()));
+          idValues, idValues + column->size(), std::inserter(ids, ids.end()));
     }
-    assertEqualResults(input, passThroughVectors);
 
     vector_size_t totalInputSize = 0;
     for (const auto& vector : input) {
@@ -154,7 +159,7 @@ TEST_F(AssignUniqueIdTest, multiThread) {
                     .planNode();
 
     std::shared_ptr<exec::Task> task;
-    auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
+    auto result = AssertQueryBuilder(plan)
                       .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, "1")
                       .maxDrivers(8)
                       .copyResults(pool(), task);
@@ -182,7 +187,7 @@ TEST_F(AssignUniqueIdTest, maxRowIdLimit) {
   auto plan = PlanBuilder().values(input).assignUniqueId().planNode();
 
   VELOX_ASSERT_THROW(
-      AssertQueryBuilder(rewriteToCudfPlan(plan))
+      AssertQueryBuilder(plan)
           .beforeTaskStart([](Task& task) {
             // Advance the pool to the end of the 40-bit row id space so the
             // next request overflows.
@@ -198,10 +203,8 @@ TEST_F(AssignUniqueIdTest, taskUniqueIdLimit) {
   auto plan = PlanBuilder().values(input).assignUniqueId().planNode();
 
   VELOX_ASSERT_THROW(
-      AssertQueryBuilder(rewriteToCudfPlan(plan))
-          .taskUniqueId(1L << 24)
-          .copyResults(pool()),
-      "Unique 24-bit ID specified for CudfAssignUniqueId exceeds the limit");
+      AssertQueryBuilder(plan).taskUniqueId(1L << 24).copyResults(pool()),
+      "Unique 24-bit ID specified for AssignUniqueId exceeds the limit");
 }
 
 // TODO: Add test for barrier execution, other operators does not support

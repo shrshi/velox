@@ -27,11 +27,6 @@ class CudfDistinct : public CudfOperatorBase {
       exec::DriverCtx* driverCtx,
       std::shared_ptr<const core::AggregationNode> const& aggregationNode);
 
-  CudfDistinct(
-      int32_t operatorId,
-      exec::DriverCtx* driverCtx,
-      std::shared_ptr<const CudfAggregationNode> aggregationNode);
-
   void initialize() override;
 
   bool needsInput() const override {
@@ -66,7 +61,7 @@ class CudfDistinct : public CudfOperatorBase {
   std::vector<column_index_t> groupingKeyInputChannels_;
   std::vector<column_index_t> groupingKeyOutputChannels_;
 
-  std::shared_ptr<const CudfAggregationNode> aggregationNode_;
+  std::shared_ptr<const core::AggregationNode> aggregationNode_;
 
   const bool isPartialOutput_;
   const int64_t maxPartialAggregationMemoryUsage_;

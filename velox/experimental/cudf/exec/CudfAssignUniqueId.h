@@ -16,7 +16,6 @@
 #pragma once
 
 #include "velox/experimental/cudf/exec/CudfOperator.h"
-#include "velox/experimental/cudf/exec/CudfPlanNodes.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/exec/Operator.h"
@@ -30,13 +29,6 @@ class CudfAssignUniqueId : public CudfOperatorBase {
       int32_t operatorId,
       exec::DriverCtx* driverCtx,
       const std::shared_ptr<const core::AssignUniqueIdNode>& planNode,
-      int32_t uniqueTaskId,
-      std::shared_ptr<std::atomic_int64_t> rowIdPool);
-
-  CudfAssignUniqueId(
-      int32_t operatorId,
-      exec::DriverCtx* driverCtx,
-      const std::shared_ptr<const CudfAssignUniqueIdNode>& planNode,
       int32_t uniqueTaskId,
       std::shared_ptr<std::atomic_int64_t> rowIdPool);
 

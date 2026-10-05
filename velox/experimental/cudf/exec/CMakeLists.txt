@@ -33,18 +33,15 @@ add_library(
   CudfMarkDistinct.cpp
   CudfNestedLoopJoin.cpp
   CudfOrderBy.cpp
-  CudfPlanRewriter.cpp
   CudfReduce.cpp
   CudfTopN.cpp
   CudfTopNRowNumber.cpp
   CudfWindow.cpp
   DebugUtil.cpp
-  CudfPlanNodeTranslator.cpp
   DecimalAggregationDevice.cu
   DecimalAggregationHostOps.cpp
   DecimalAggregationState.cpp
   GpuResources.cpp
-  NativeDecimalSumEligibility.cpp
   OperatorAdapters.cpp
   PrestoAggregateFunctions.cpp
   SparkAggregateFunctions.cpp

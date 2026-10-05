@@ -289,6 +289,10 @@ class AggregationAdapter : public OperatorAdapter {
 
     bool canEvaluate = canBeEvaluatedByCudf(
         *aggregationPlanNode, ctx->task->queryCtx().get(), op->pool());
+    VELOX_USER_CHECK(
+        canEvaluate || !hasCompactDecimalSum(*aggregationPlanNode),
+        "Compact Decimal64 SUM requires GPU aggregation; CPU fallback is not supported for node {}",
+        planNode->id());
     if (!canEvaluate) {
       LOG_FALLBACK(
           "Aggregation aggregation cannot be evaluated by cuDF, PlanNode id: {}",

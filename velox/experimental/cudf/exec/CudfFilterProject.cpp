@@ -17,7 +17,6 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
-#include "velox/experimental/cudf/exec/CudfPlanRewriter.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/Validation.h"
@@ -114,37 +113,27 @@ CudfFilterProject::CudfFilterProject(
     velox::exec::DriverCtx* driverCtx,
     const std::shared_ptr<const core::FilterNode>& filter,
     const std::shared_ptr<const core::ProjectNode>& project)
-    : CudfFilterProject(
-          operatorId,
-          driverCtx,
-          CudfPlanRewriter::translateForAdapterAs<CudfFilterProjectNode>(
-              project
-                  ? std::static_pointer_cast<const core::PlanNode>(project)
-                  : std::static_pointer_cast<const core::PlanNode>(filter))) {}
-
-CudfFilterProject::CudfFilterProject(
-    int32_t operatorId,
-    velox::exec::DriverCtx* driverCtx,
-    std::shared_ptr<const CudfFilterProjectNode> planNode)
     : CudfOperatorBase(
           operatorId,
           driverCtx,
-          planNode->outputType(),
-          planNode->id(),
+          project ? project->outputType() : filter->outputType(),
+          project ? project->id() : filter->id(),
           "CudfFilterProject",
           nvtx3::rgb{220, 20, 60}, // Crimson
           NvtxMethodFlag::kAll,
           std::nullopt,
-          planNode),
-      hasFilter_(planNode->hasFilter()),
-      planNode_(std::move(planNode)) {
-  if (planNode_->hasFilter() && planNode_->hasProject()) {
+          project ? std::static_pointer_cast<const core::PlanNode>(project)
+                  : std::static_pointer_cast<const core::PlanNode>(filter)),
+      hasFilter_(filter != nullptr),
+      project_(project),
+      filter_(filter) {
+  if (filter_ != nullptr && project_ != nullptr) {
     folly::Synchronized<exec::OperatorStats>& opStats = Operator::stats();
     opStats.withWLock([&](auto& stats) {
-      stats.setStatSplitter([filterId = planNode_->filterNodeId().value()](
-                                const auto& combinedStats) {
-        return splitStats(combinedStats, filterId);
-      });
+      stats.setStatSplitter(
+          [filterId = filter_->id()](const auto& combinedStats) {
+            return splitStats(combinedStats, filterId);
+          });
     });
   }
 }
@@ -154,14 +143,14 @@ void CudfFilterProject::initialize() {
 
   std::vector<core::TypedExprPtr> allExprs;
   if (hasFilter_) {
-    allExprs.push_back(planNode_->filter());
+    allExprs.push_back(filter_->filter());
   }
 
-  if (planNode_->hasProject()) {
-    const auto& inputType = planNode_->sources()[0]->outputType();
+  if (project_) {
+    const auto& inputType = project_->sources()[0]->outputType();
 
-    for (column_index_t i = 0; i < planNode_->projections().size(); i++) {
-      const auto& projection = planNode_->projections()[i];
+    for (column_index_t i = 0; i < project_->projections().size(); i++) {
+      const auto& projection = project_->projections()[i];
       bool identityProjection = checkAddIdentityProjection(
           projection, inputType, i, identityProjections_);
       if (!identityProjection) {
@@ -176,8 +165,11 @@ void CudfFilterProject::initialize() {
     isIdentityProjection_ = true;
   }
 
-  VELOX_CHECK(!(planNode_->isLazyDereference() && hasFilter_));
-  const auto inputType = planNode_->sources()[0]->outputType();
+  const auto lazyDereference =
+      dynamic_cast<const core::LazyDereferenceNode*>(project_.get()) != nullptr;
+  VELOX_CHECK(!(lazyDereference && hasFilter_));
+  const auto inputType = project_ ? project_->sources()[0]->outputType()
+                                  : filter_->sources()[0]->outputType();
 
   // convert to AST
   if (CudfConfig::getInstance().debugEnabled) {
@@ -214,7 +206,8 @@ void CudfFilterProject::initialize() {
         optimizeAndCompile);
   }
 
-  planNode_.reset();
+  filter_.reset();
+  project_.reset();
 }
 
 void CudfFilterProject::doAddInput(RowVectorPtr input) {

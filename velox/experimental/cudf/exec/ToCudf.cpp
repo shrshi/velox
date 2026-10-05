@@ -15,14 +15,11 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
-#include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
-#include "velox/experimental/cudf/connectors/hive/iceberg/CudfIcebergConnector.h"
+#include "velox/experimental/cudf/exec/CudfAggregation.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
-#include "velox/experimental/cudf/exec/CudfLocalPartition.h"
 #include "velox/experimental/cudf/exec/CudfNestedLoopJoin.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
-#include "velox/experimental/cudf/exec/CudfPlanNodeTranslator.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/PrestoAggregateFunctions.h"
@@ -32,18 +29,6 @@
 #include "velox/experimental/cudf/expression/JitExpression.h"
 
 #include "folly/Conv.h"
-#include "velox/connectors/ConnectorRegistry.h"
-#include "velox/exec/Driver.h"
-#include "velox/exec/FilterProject.h"
-#include "velox/exec/HashAggregation.h"
-#include "velox/exec/HashBuild.h"
-#include "velox/exec/HashProbe.h"
-#include "velox/exec/Limit.h"
-#include "velox/exec/LocalPartition.h"
-#include "velox/exec/Operator.h"
-#include "velox/exec/TableScan.h"
-#include "velox/exec/Task.h"
-#include "velox/exec/Values.h"
 
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -51,16 +36,10 @@
 #include <cuda.h>
 
 static const std::string kCudfAdapterName = "cuDF";
-static const std::string kCudfLocalPartitionAdapterName = "cuDF-LocalPartition";
-static const std::string kCudfDriverPrinterAdapterName = "cuDF-DriverPrinter";
 
 namespace facebook::velox::cudf_velox {
 
 namespace {
-
-static_assert(
-    sizeof(exec::Task) >= 0,
-    "Task definition required for cuDF adapter");
 
 template <class... Deriveds, class Base>
 bool isAnyOf(const Base* p) {
@@ -303,9 +282,18 @@ struct CudfDriverAdapter {
 
   // Call operator needed by DriverAdapter
   bool operator()(const exec::DriverFactory& factory, exec::Driver& driver) {
-    if (!driver.driverCtx()->queryConfig().get<bool>(
-            CudfConfig::kCudfEnabled, CudfConfig::getInstance().enabled) &&
-        allowCpuFallback_) {
+    const bool gpuEnabled = driver.driverCtx()->queryConfig().get<bool>(
+        CudfConfig::kCudfEnabled, CudfConfig::getInstance().enabled);
+    if (!gpuEnabled) {
+      for (const auto& node : factory.planNodes) {
+        auto aggregation =
+            std::dynamic_pointer_cast<const core::AggregationNode>(node);
+        VELOX_USER_CHECK(
+            !aggregation || !hasCompactDecimalSum(*aggregation),
+            "Compact Decimal64 SUM requires GPU aggregation; cudf.enabled is false");
+      }
+    }
+    if (!gpuEnabled && allowCpuFallback_) {
       return false;
     }
     auto state = CompileState(factory, driver);
@@ -315,88 +303,6 @@ struct CudfDriverAdapter {
 
  private:
   bool allowCpuFallback_;
-};
-
-struct CudfLocalPartitionAdapter {
-  bool producesGpuOutput(
-      const exec::Operator* op,
-      const exec::DriverFactory& factory) const {
-    // All built-in cuDF operators output CudfVectors except CudfToVelox.
-    if (dynamic_cast<const CudfOperatorBase*>(op) != nullptr) {
-      return dynamic_cast<const CudfToVelox*>(op) == nullptr;
-    }
-
-    if (dynamic_cast<const exec::TableScan*>(op) == nullptr) {
-      return false;
-    }
-
-    auto scanNode = std::dynamic_pointer_cast<const core::TableScanNode>(
-        findPlanNode(factory, op->planNodeId()));
-    if (!scanNode) {
-      return false;
-    }
-
-    const auto connector =
-        facebook::velox::connector::ConnectorRegistry::tryGet(
-            scanNode->tableHandle()->connectorId());
-    return dynamic_cast<connector::hive::CudfHiveConnector*>(connector.get()) !=
-        nullptr ||
-        dynamic_cast<connector::hive::iceberg::CudfIcebergConnector*>(
-            connector.get()) != nullptr;
-  }
-
-  std::shared_ptr<const core::PlanNode> findPlanNode(
-      const exec::DriverFactory& factory,
-      const core::PlanNodeId& id) const {
-    auto it = std::find_if(
-        factory.planNodes.begin(),
-        factory.planNodes.end(),
-        [&id](const auto& node) { return node->id() == id; });
-    if (it != factory.planNodes.end()) {
-      return *it;
-    }
-    if (factory.consumerNode && factory.consumerNode->id() == id) {
-      return factory.consumerNode;
-    }
-    return nullptr;
-  }
-
-  bool operator()(const exec::DriverFactory& factory, exec::Driver& driver)
-      const {
-    auto getPlanNode = [&](const core::PlanNodeId& id)
-        -> std::shared_ptr<const core::PlanNode> {
-      auto node = findPlanNode(factory, id);
-      VELOX_CHECK_NOT_NULL(node, "Plan node not found: {}", id);
-      return node;
-    };
-
-    auto operators = driver.operators();
-    for (int32_t i = 0; i < operators.size(); ++i) {
-      auto* op = operators[i];
-      auto* localPartition = dynamic_cast<exec::LocalPartition*>(op);
-      if (!localPartition) {
-        continue;
-      }
-      auto planNode = std::dynamic_pointer_cast<const core::LocalPartitionNode>(
-          getPlanNode(localPartition->planNodeId()));
-      if (!planNode || !CudfLocalPartition::shouldReplace(planNode)) {
-        continue;
-      }
-
-      if (i == 0 || !producesGpuOutput(operators[i - 1], factory)) {
-        continue;
-      }
-
-      std::vector<std::unique_ptr<exec::Operator>> replacements;
-      replacements.push_back(
-          std::make_unique<CudfLocalPartition>(
-              op->operatorId(), driver.driverCtx(), planNode));
-      factory.replaceOperators(driver, i, i + 1, std::move(replacements));
-    }
-
-    // Allow other adapters to run.
-    return false;
-  }
 };
 
 static bool isCudfRegistered = false;
@@ -410,12 +316,8 @@ void registerCudf() {
     return;
   }
 
-  // The physical-plan path does not depend on the legacy operator-adapter
-  // registry. Keep it entirely out of that path so missing plan-node coverage
-  // cannot be hidden by post-planning replacement.
-  if (CudfConfig::getInstance().enableDriverAdapter) {
-    registerAllOperatorAdapters();
-  }
+  // Register operator adapters
+  registerAllOperatorAdapters();
 
   auto prefix = CudfConfig::getInstance().functionNamePrefix;
   registerBuiltinFunctions(prefix);
@@ -447,49 +349,11 @@ void registerCudf() {
 
   exec::Operator::registerOperator(
       std::make_unique<CudfHashJoinBridgeTranslator>());
-
-  exec::Operator::registerOperator(std::make_unique<CudfPlanNodeTranslator>());
-
   exec::Operator::registerOperator(
       std::make_unique<CudfNestedLoopJoinBridgeTranslator>());
   CudfDriverAdapter cda{CudfConfig::getInstance().allowCpuFallback};
-  if (CudfConfig::getInstance().enableDriverAdapter) {
-    exec::DriverAdapter cudfAdapter{kCudfAdapterName, {}, cda};
-    exec::DriverFactory::registerAdapter(cudfAdapter);
-  }
-  if (CudfConfig::getInstance().enableLocalPartitionAdapter) {
-    exec::DriverAdapter cudfLocalPartitionAdapter{
-        kCudfLocalPartitionAdapterName, {}, CudfLocalPartitionAdapter()};
-    exec::DriverFactory::registerAdapter(cudfLocalPartitionAdapter);
-  }
-
-  if (CudfConfig::getInstance().debugEnabled) {
-    exec::DriverAdapter printer{
-        kCudfDriverPrinterAdapterName,
-        {},
-        [](const exec::DriverFactory& /*factory*/,
-           exec::Driver& driver) -> bool {
-          try {
-            auto* ctx = driver.driverCtx();
-            auto ops = driver.operators();
-            std::ostringstream oss;
-            oss << "DRIVER pipeline=" << ctx->pipelineId
-                << " driver=" << ctx->driverId << " operators=";
-            for (size_t i = 0; i < ops.size(); ++i) {
-              if (i) {
-                oss << " -> ";
-              }
-              oss << ops[i]->operatorType() << "[" << ops[i]->planNodeId()
-                  << "]";
-            }
-            std::cout << oss.str() << std::endl;
-          } catch (...) {
-          }
-          // Allow other adapters to run.
-          return false;
-        }};
-    exec::DriverFactory::registerAdapter(printer);
-  }
+  exec::DriverAdapter cudfAdapter{kCudfAdapterName, {}, cda};
+  exec::DriverFactory::registerAdapter(cudfAdapter);
 
   if (CudfConfig::getInstance().astExpressionEnabled) {
     registerAstEvaluator(CudfConfig::getInstance().astExpressionPriority);
@@ -512,9 +376,7 @@ void unregisterCudf() {
           exec::DriverFactory::adapters.begin(),
           exec::DriverFactory::adapters.end(),
           [](const exec::DriverAdapter& adapter) {
-            return adapter.label == kCudfAdapterName ||
-                adapter.label == kCudfLocalPartitionAdapterName ||
-                adapter.label == kCudfDriverPrinterAdapterName;
+            return adapter.label == kCudfAdapterName;
           }),
       exec::DriverFactory::adapters.end());
 

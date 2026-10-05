@@ -15,7 +15,6 @@
  */
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
-#include "velox/experimental/cudf/exec/CudfPlanRewriter.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
@@ -30,15 +29,6 @@ CudfTopN::CudfTopN(
     int32_t operatorId,
     exec::DriverCtx* driverCtx,
     const std::shared_ptr<const core::TopNNode>& topNNode)
-    : CudfTopN(
-          operatorId,
-          driverCtx,
-          CudfPlanRewriter::translateForAdapterAs<CudfTopNNode>(topNNode)) {}
-
-CudfTopN::CudfTopN(
-    int32_t operatorId,
-    exec::DriverCtx* driverCtx,
-    std::shared_ptr<const CudfTopNNode> topNNode)
     : CudfOperatorBase(
           operatorId,
           driverCtx,

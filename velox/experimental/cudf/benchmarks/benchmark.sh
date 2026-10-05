@@ -29,13 +29,9 @@ mkdir -p benchmark_results
 queries=${1:-$(seq 1 22)}
 devices=${2:-"cpu gpu"}
 profile=${3:-"false"}
-cudf_exec_mode=${CUDF_EXECUTION_MODE:-plan_rewriter}
 num_repeats=${NUM_REPEATS:-3}
 include_results=${INCLUDE_RESULTS:-true}
-# The physical-plan path supports either scan implementation. Keep CPU scan as
-# the default until cuDF connector remaining-filter capability participates in
-# plan rewriting; set VELOX_CUDF_TABLE_SCAN=true to exercise the cuDF reader.
-cudf_table_scan=${VELOX_CUDF_TABLE_SCAN:-false}
+cudf_table_scan=${VELOX_CUDF_TABLE_SCAN:-true}
 # Resolve script dir so binaries can be run from anywhere
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../../" && pwd)"
@@ -57,24 +53,14 @@ for query_number in ${queries}; do
       FILE_STRING="cpu_${num_drivers}_drivers"
       ;;
     "gpu")
-      num_drivers=${NUM_DRIVERS:-32}
+      num_drivers=${NUM_DRIVERS:-4}
       BENCHMARK_EXECUTABLE="${REPO_ROOT}/_build/release/velox/experimental/cudf/benchmarks/velox_cudf_tpch_benchmark"
-      plan_mode_flags=""
-      if [[ "${cudf_exec_mode}" == "plan_rewriter" ]]; then
-        plan_mode_flags="--velox_cudf_table_scan=${cudf_table_scan} --gpu_driver_count=1"
-        FILE_STRING="gpu_1_driver_plan"
-      else
-        # When using driver adapter, we want num cpu drivers to also be 1
-        num_drivers=${NUM_DRIVERS:-1}
-        plan_mode_flags="--velox_cudf_table_scan=true"
-        FILE_STRING="gpu_${num_drivers}"
-      fi
+      FILE_STRING="gpu_${num_drivers}"
       CUDF_FLAGS="\
         --cudf_chunk_read_limit=${cudf_chunk_read_limit} \
         --cudf_pass_read_limit=${cudf_pass_read_limit} \
         --cudf_gpu_batch_size_rows=1000000 \
-        --cudf_execution_mode=${cudf_exec_mode} \
-        ${plan_mode_flags}"
+        --velox_cudf_table_scan=${cudf_table_scan}"
       ;;
     *)
       echo "Unsupported device: ${device}. Expected cpu or gpu." >&2

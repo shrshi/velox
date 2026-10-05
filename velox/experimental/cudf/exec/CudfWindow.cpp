@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 #include "velox/experimental/cudf/CudfConfig.h"
-#include "velox/experimental/cudf/exec/CudfPlanRewriter.h"
 #include "velox/experimental/cudf/exec/CudfWindow.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationHostOps.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
@@ -704,16 +703,6 @@ CudfWindow::CudfWindow(
     int32_t operatorId,
     exec::DriverCtx* driverCtx,
     const std::shared_ptr<const core::WindowNode>& windowNode)
-    : CudfWindow(
-          operatorId,
-          driverCtx,
-          CudfPlanRewriter::translateForAdapterAs<CudfWindowNode>(
-              windowNode)) {}
-
-CudfWindow::CudfWindow(
-    int32_t operatorId,
-    exec::DriverCtx* driverCtx,
-    const std::shared_ptr<const CudfWindowNode>& windowNode)
     : CudfOperatorBase(
           operatorId,
           driverCtx,

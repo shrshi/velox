@@ -15,7 +15,6 @@
  */
 
 #include "velox/experimental/cudf/tests/iceberg/CudfIcebergTestBase.h"
-#include "velox/experimental/cudf/tests/utils/CudfPlanTestUtils.h"
 
 #include "velox/common/file/FileSystems.h"
 #include "velox/common/testutil/TempFilePath.h"
@@ -26,7 +25,6 @@
 #include <gtest/gtest.h>
 
 using namespace facebook::velox::exec::test;
-using facebook::velox::cudf_velox::test::rewriteToCudfPlan;
 using namespace facebook::velox::connector::hive::iceberg;
 using facebook::velox::common::testutil::TempFilePath;
 
@@ -72,9 +70,7 @@ TEST_P(CudfEqualityDeleteFileReaderTest, basicSingleColumnDelete) {
 
   auto splits = makeIcebergSplits(dataFile->getPath(), {icebergDeleteFile});
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(splits)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
 
   auto expected = makeRowVector(
       {"id", "value"},
@@ -123,9 +119,7 @@ TEST_P(CudfEqualityDeleteFileReaderTest, multiColumnDelete) {
 
   auto splits = makeIcebergSplits(dataFile->getPath(), {icebergDeleteFile});
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(splits)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
 
   // Rows 0, 2, 3 survive (rows 1 and 4 deleted).
   auto expected = makeRowVector(
@@ -170,9 +164,7 @@ TEST_P(CudfEqualityDeleteFileReaderTest, noMatchingDeletes) {
 
   auto splits = makeIcebergSplits(dataFile->getPath(), {icebergDeleteFile});
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(splits)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
 
   auto expected = makeRowVector(
       {"id"},
@@ -214,9 +206,7 @@ TEST_P(CudfEqualityDeleteFileReaderTest, allRowsDeleted) {
 
   auto splits = makeIcebergSplits(dataFile->getPath(), {icebergDeleteFile});
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(splits)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
 
   EXPECT_EQ(result->size(), 0);
 }
@@ -253,9 +243,7 @@ TEST_P(CudfEqualityDeleteFileReaderTest, stringColumnDelete) {
 
   auto splits = makeIcebergSplits(dataFile->getPath(), {icebergDeleteFile});
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(splits)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
 
   auto expected = makeRowVector(
       {"name", "age"},
@@ -300,9 +288,7 @@ TEST_P(CudfEqualityDeleteFileReaderTest, deleteOnSecondColumn) {
 
   auto splits = makeIcebergSplits(dataFile->getPath(), {icebergDeleteFile});
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(splits)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
 
   // Rows with category="B" (indices 1,4) deleted.
   auto expected = makeRowVector(
@@ -359,9 +345,7 @@ TEST_P(CudfEqualityDeleteFileReaderTest, sequenceNumberDeleteApplies) {
       /*splitCount=*/1,
       /*dataSequenceNumber=*/3);
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(splits)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
 
   // Rows with id=2 and id=4 are deleted.
   auto expected = makeRowVector(
@@ -417,9 +401,7 @@ TEST_P(CudfEqualityDeleteFileReaderTest, sequenceNumberDeleteSkipped) {
       /*splitCount=*/1,
       /*dataSequenceNumber=*/5);
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(splits)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
 
   // All rows survive because the delete file is skipped.
   auto expected = makeRowVector(
@@ -475,9 +457,7 @@ TEST_P(CudfEqualityDeleteFileReaderTest, sequenceNumberEqualSkipped) {
       /*splitCount=*/1,
       /*dataSequenceNumber=*/5);
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(splits)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
 
   // All rows survive because the delete file is skipped (equal seq#).
   auto expected = makeRowVector(
@@ -532,9 +512,7 @@ TEST_P(CudfEqualityDeleteFileReaderTest, sequenceNumberZeroAlwaysApplies) {
       /*splitCount=*/1,
       /*dataSequenceNumber=*/10);
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(splits)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
 
   // Row id=2 is deleted because sequence number filtering is disabled.
   auto expected = makeRowVector(
@@ -606,9 +584,7 @@ TEST_P(CudfEqualityDeleteFileReaderTest, mixedSequenceNumbers) {
       /*splitCount=*/1,
       /*dataSequenceNumber=*/5);
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(splits)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
 
   // Only id=2 is deleted (from delete file 1 with seqNum=10).
   // id=4 survives because delete file 2 (seqNum=3) is skipped.
@@ -652,7 +628,7 @@ TEST_P(CudfEqualityDeleteFileReaderTest, subfieldFilter) {
                   .planNode();
 
   auto expected = makeRowVector({makeFlatVector<int64_t>({10, 30})});
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
+  AssertQueryBuilder(plan)
       .splits(makeIcebergSplits(dataFile->getPath(), {icebergDeleteFile}))
       .assertResults({expected});
 }
@@ -715,9 +691,7 @@ TEST_F(CudfMixedFormatEqualityDeleteTest, mixedFormatDeleteFiles) {
   auto splits = makeIcebergSplits(
       dataFile->getPath(), {icebergDeleteFile1, icebergDeleteFile2});
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(splits)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
 
   auto expected = makeRowVector(
       {"id", "value"},

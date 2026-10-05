@@ -21,7 +21,6 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveTableHandle.h"
 #include "velox/experimental/cudf/expression/SubfieldFiltersToAst.h"
 #include "velox/experimental/cudf/tests/utils/CudfHiveConnectorTestBase.h"
-#include "velox/experimental/cudf/tests/utils/CudfPlanTestUtils.h"
 
 #include "velox/common/base/Fs.h"
 #include "velox/common/base/tests/GTestUtils.h"
@@ -64,7 +63,6 @@ using namespace facebook::velox::tests::utils;
 using namespace facebook::velox::cudf_velox;
 using namespace facebook::velox::cudf_velox::exec;
 using namespace facebook::velox::cudf_velox::exec::test;
-using facebook::velox::cudf_velox::test::rewriteToCudfPlan;
 
 namespace {
 struct StatsFilterMetrics {
@@ -126,16 +124,14 @@ class TableScanTest : public virtual CudfHiveConnectorTestBase {
       const std::shared_ptr<facebook::velox::connector::ConnectorSplit>&
           parquetSplit,
       const std::string& duckDbSql) {
-    return OperatorTestBase::assertQuery(
-        rewriteToCudfPlan(plan), {parquetSplit}, duckDbSql);
+    return OperatorTestBase::assertQuery(plan, {parquetSplit}, duckDbSql);
   }
 
   std::shared_ptr<Task> assertQuery(
       const PlanNodePtr& plan,
       const Split&& split,
       const std::string& duckDbSql) {
-    return OperatorTestBase::assertQuery(
-        rewriteToCudfPlan(plan), {split}, duckDbSql);
+    return OperatorTestBase::assertQuery(plan, {split}, duckDbSql);
   }
 
   std::shared_ptr<Task> assertQuery(
@@ -151,7 +147,7 @@ class TableScanTest : public virtual CudfHiveConnectorTestBase {
       const std::vector<std::shared_ptr<TempFilePath>>& filePaths,
       const std::string& spillDirectory,
       const std::string& duckDbSql) {
-    return AssertQueryBuilder(rewriteToCudfPlan(plan), duckDbQueryRunner_)
+    return AssertQueryBuilder(plan, duckDbQueryRunner_)
         .spillDirectory(spillDirectory)
         .config(core::QueryConfig::kSpillEnabled, false)
         .config(core::QueryConfig::kAggregationSpillEnabled, false)
@@ -245,7 +241,7 @@ class TableScanTest : public virtual CudfHiveConnectorTestBase {
                     .endTableScan()
                     .planNode();
 
-    AssertQueryBuilder(rewriteToCudfPlan(plan), duckDbQueryRunner_)
+    AssertQueryBuilder(plan, duckDbQueryRunner_)
         .splits(makeCudfHiveConnectorSplits({filePath}))
         .assertResults("SELECT * FROM tmp");
   }
@@ -279,7 +275,7 @@ TEST_P(TableScanTestParameterized, allColumns) {
       [&](const std::vector<std::shared_ptr<
               facebook::velox::connector::ConnectorSplit>>& splits) {
         auto task = AssertQueryBuilder(duckDbQueryRunner_)
-                        .plan(rewriteToCudfPlan(plan))
+                        .plan(plan)
                         .splits(splits)
                         .assertResults(duckDbSql);
 
@@ -336,14 +332,13 @@ TEST_F(TableScanTest, multipleDrivers) {
   }
 
   std::shared_ptr<Task> task;
-  auto resultCount =
-      AssertQueryBuilder(rewriteToCudfPlan(tableScanNode(), kNumDrivers))
-          .maxDrivers(kNumDrivers)
-          .splits(makeCudfHiveConnectorSplits(filePaths))
-          .countResults(task);
+  auto resultCount = AssertQueryBuilder(tableScanNode())
+                         .maxDrivers(kNumDrivers)
+                         .splits(makeCudfHiveConnectorSplits(filePaths))
+                         .countResults(task);
 
   EXPECT_EQ(resultCount, kNumDrivers * 1'000);
-  EXPECT_EQ(getTableScanStats(task).numDrivers, kNumDrivers);
+  EXPECT_EQ(task->taskStats().numTotalDrivers, kNumDrivers);
 }
 
 // Reads several splits of a multi-row-group file with chunk and pass read
@@ -381,7 +376,7 @@ TEST_P(TableScanTestParameterized, allColumnsWithRowGroupPasses) {
 
   auto plan = tableScanNode();
   auto task = AssertQueryBuilder(duckDbQueryRunner_)
-                  .plan(rewriteToCudfPlan(plan))
+                  .plan(plan)
                   .splits(splits)
                   .assertResults(duckDbSql);
 
@@ -412,7 +407,7 @@ TEST_F(TableScanTest, preloadSplits) {
   createDuckDbTable(vectors);
 
   auto plan = tableScanNode();
-  auto task = AssertQueryBuilder(rewriteToCudfPlan(plan), duckDbQueryRunner_)
+  auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
                   .config(core::QueryConfig::kMaxSplitPreloadPerDriver, "10")
                   .splits(makeCudfHiveConnectorSplits(filePaths))
                   .assertResults("SELECT * FROM tmp");
@@ -448,7 +443,7 @@ TEST_F(TableScanTest, preloadingSplitClose) {
 
   ASSERT_EQ(Task::numRunningTasks(), 0);
   auto plan = tableScanNode();
-  auto task = AssertQueryBuilder(rewriteToCudfPlan(plan), duckDbQueryRunner_)
+  auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
                   .config(core::QueryConfig::kMaxSplitPreloadPerDriver, "4")
                   .splits(makeCudfHiveConnectorSplits(filePaths))
                   .assertResults("SELECT * FROM tmp");
@@ -510,7 +505,7 @@ TEST_F(TableScanTest, abandonPreloadedSplits) {
                   .planNode();
 
   std::shared_ptr<Task> task;
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
+  auto result = AssertQueryBuilder(plan)
                     .config(core::QueryConfig::kMaxSplitPreloadPerDriver, "8")
                     // Enable column chunk fetch during preload
                     .connectorSessionProperty(
@@ -580,7 +575,7 @@ TEST_F(TableScanTest, filterPrunesAllRowGroups) {
 
   auto task =
       AssertQueryBuilder(duckDbQueryRunner_)
-          .plan(rewriteToCudfPlan(plan))
+          .plan(plan)
           .splits(makeCudfHiveConnectorSplits({filePath}))
           .assertResults(
               fmt::format("SELECT c0 FROM tmp WHERE c0 = {}", kUnmatchedValue));
@@ -626,7 +621,7 @@ TEST_F(TableScanTest, directBufferInputRawInputBytes) {
       nullptr);
 
   auto task = AssertQueryBuilder(duckDbQueryRunner_)
-                  .plan(rewriteToCudfPlan(plan, 32, queryCtx))
+                  .plan(plan)
                   .splits(makeCudfHiveConnectorSplits({filePath}))
                   .queryCtx(queryCtx)
                   .assertResults("SELECT c0, c2 FROM tmp");

@@ -16,7 +16,6 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
-#include "velox/experimental/cudf/tests/utils/CudfPlanTestUtils.h"
 
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
@@ -24,7 +23,6 @@
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
 using namespace facebook::velox::exec::test;
-using cudf_velox::test::rewriteToCudfPlan;
 
 class LimitTest : public HiveConnectorTestBase {
   void SetUp() override {
@@ -54,8 +52,7 @@ TEST_F(LimitTest, basic) {
   createDuckDbTable(vectors);
 
   auto makePlan = [&](int64_t offset, int64_t limit) {
-    return rewriteToCudfPlan(
-        PlanBuilder().values(vectors).limit(offset, limit, true).planNode());
+    return PlanBuilder().values(vectors).limit(offset, limit, true).planNode();
   };
 
   assertQuery(makePlan(0, 10), "SELECT * FROM tmp LIMIT 10");

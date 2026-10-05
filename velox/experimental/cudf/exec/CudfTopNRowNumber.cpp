@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 #include "velox/experimental/cudf/CudfNoDefaults.h"
-#include "velox/experimental/cudf/exec/CudfPlanRewriter.h"
 #include "velox/experimental/cudf/exec/CudfTopNRowNumber.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
@@ -94,16 +93,6 @@ CudfTopNRowNumber::CudfTopNRowNumber(
     int32_t operatorId,
     exec::DriverCtx* driverCtx,
     const std::shared_ptr<const core::TopNRowNumberNode>& node)
-    : CudfTopNRowNumber(
-          operatorId,
-          driverCtx,
-          CudfPlanRewriter::translateForAdapterAs<CudfTopNRowNumberNode>(
-              node)) {}
-
-CudfTopNRowNumber::CudfTopNRowNumber(
-    int32_t operatorId,
-    exec::DriverCtx* driverCtx,
-    std::shared_ptr<const CudfTopNRowNumberNode> node)
     : CudfOperatorBase(
           operatorId,
           driverCtx,
@@ -118,6 +107,11 @@ CudfTopNRowNumber::CudfTopNRowNumber(
       generateRowNumber_(node->generateRowNumber()),
       inputType_(node->sources()[0]->outputType()),
       cudaEvent_(std::make_unique<CudaEvent>(cudaEventDisableTiming)) {
+  VELOX_CHECK_EQ(
+      node->rankFunction(),
+      core::TopNRowNumberNode::RankFunction::kRowNumber,
+      "CudfTopNRowNumber only supports row_number");
+
   partitionKeyIndices_.reserve(node->partitionKeys().size());
   for (const auto& key : node->partitionKeys()) {
     partitionKeyIndices_.push_back(exec::exprToChannel(key.get(), inputType_));

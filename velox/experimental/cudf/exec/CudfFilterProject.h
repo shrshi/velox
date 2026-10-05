@@ -17,7 +17,6 @@
 #pragma once
 
 #include "velox/experimental/cudf/exec/CudfOperator.h"
-#include "velox/experimental/cudf/exec/CudfPlanNodes.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
 #include "velox/core/PlanNode.h"
@@ -35,11 +34,6 @@ class CudfFilterProject : public CudfOperatorBase {
       velox::exec::DriverCtx* driverCtx,
       const std::shared_ptr<const core::FilterNode>& filter,
       const std::shared_ptr<const core::ProjectNode>& project);
-
-  CudfFilterProject(
-      int32_t operatorId,
-      velox::exec::DriverCtx* driverCtx,
-      std::shared_ptr<const CudfFilterProjectNode> planNode);
 
   void initialize() override;
 
@@ -77,8 +71,9 @@ class CudfFilterProject : public CudfOperatorBase {
   // If true exprs_[0] is a filter and the other expressions are projections
   const bool hasFilter_{false};
 
-  // Cached physical plan metadata for lazy initialization.
-  std::shared_ptr<const CudfFilterProjectNode> planNode_;
+  // Cached plan nodes for lazy initialization. Released after initialization.
+  std::shared_ptr<const core::ProjectNode> project_;
+  std::shared_ptr<const core::FilterNode> filter_;
 
   std::vector<CudfExpressionPtr> projectEvaluators_;
   CudfExpressionPtr filterEvaluator_;

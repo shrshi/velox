@@ -18,7 +18,6 @@
 
 #include "velox/experimental/cudf/tests/iceberg/CudfDeletionVectorTestUtils.h"
 #include "velox/experimental/cudf/tests/iceberg/CudfIcebergTestBase.h"
-#include "velox/experimental/cudf/tests/utils/CudfPlanTestUtils.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/encode/Base64.h"
@@ -47,7 +46,6 @@
 #include <atomic>
 
 using namespace facebook::velox::exec::test;
-using facebook::velox::cudf_velox::test::rewriteToCudfPlan;
 using namespace facebook::velox::exec;
 using namespace facebook::velox::connector::hive::iceberg;
 using namespace facebook::velox::cudf_velox::iceberg::test;
@@ -508,9 +506,7 @@ TEST_F(CudfIcebergReadTest, basicRead) {
                   .planNode();
 
   auto expected = makeRowVector({makeFlatVector<int64_t>({0, 1, 2, 3, 4})});
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
-      .splits(splits)
-      .assertResults({expected});
+  AssertQueryBuilder(plan).splits(splits).assertResults({expected});
 }
 
 TEST_F(CudfIcebergReadTest, reusesFooterMetadataDuringReaderSetup) {
@@ -530,7 +526,7 @@ TEST_F(CudfIcebergReadTest, reusesFooterMetadataDuringReaderSetup) {
         originalBuilder);
   };
 
-  AssertQueryBuilder(rewriteToCudfPlan(makeTableScanPlan(rowType)))
+  AssertQueryBuilder(makeTableScanPlan(rowType))
       .connectorSessionProperty(
           kCudfIcebergConnectorId,
           cudf_velox::connector::hive::CudfHiveConfig::kUseBufferedInputSession,
@@ -565,9 +561,7 @@ TEST_F(CudfIcebergReadTest, multiColumn) {
       makeFlatVector<int64_t>({10, 20, 30}),
       makeFlatVector<double>({1.1, 2.2, 3.3}),
   });
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
-      .splits(splits)
-      .assertResults({expected});
+  AssertQueryBuilder(plan).splits(splits).assertResults({expected});
 }
 
 /// Read a larger file to verify chunked reading works.
@@ -677,7 +671,7 @@ TEST_F(CudfIcebergReadTest, allSchemaEvolutionColumns) {
                   .endTableScan()
                   .planNode();
 
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
+  AssertQueryBuilder(plan)
       .splits(makeIcebergSplits(dataFilePath->getPath()))
       .assertResults({expected});
 
@@ -698,7 +692,7 @@ TEST_F(CudfIcebergReadTest, allSchemaEvolutionColumns) {
           makeFlatVector<int64_t>(std::vector<int64_t>{}),
       });
 
-  AssertQueryBuilder(rewriteToCudfPlan(filteredPlan))
+  AssertQueryBuilder(filteredPlan)
       .splits(makeIcebergSplits(dataFilePath->getPath()))
       .assertResults({filteredEmptyExpected});
 
@@ -714,7 +708,7 @@ TEST_F(CudfIcebergReadTest, allSchemaEvolutionColumns) {
                             .endTableScan()
                             .planNode();
 
-  AssertQueryBuilder(rewriteToCudfPlan(filterOnlyPlan))
+  AssertQueryBuilder(filterOnlyPlan)
       .splits(makeIcebergSplits(dataFilePath->getPath()))
       .assertResults({makeRowVector(
           {"old_col"}, {makeFlatVector<int64_t>(std::vector<int64_t>{})})});
@@ -749,7 +743,7 @@ TEST_F(CudfIcebergReadTest, columnAliasUsesPhysicalFileName) {
           makeFlatVector<int64_t>({10, 20, 30}),
       });
 
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
+  AssertQueryBuilder(plan)
       .splits(makeIcebergSplits(dataFile->getPath()))
       .assertResults({expected});
 }
@@ -801,7 +795,7 @@ TEST_F(CudfIcebergReadTest, nullPartitionColumn) {
           makeNullConstant(TypeKind::VARCHAR, 3),
       });
 
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
+  AssertQueryBuilder(plan)
       .splits(makeIcebergSplits(dataFile->getPath(), {}, partitionKeys))
       .assertResults({expected});
 }
@@ -848,7 +842,7 @@ TEST_F(CudfIcebergReadTest, partitionOnlyProjection) {
           makeFlatVector<std::string>({"US", "US", "US"}),
       });
 
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
+  AssertQueryBuilder(plan)
       .splits(makeIcebergSplits(dataFile->getPath(), {}, partitionKeys))
       .assertResults({expected});
 
@@ -867,7 +861,7 @@ TEST_F(CudfIcebergReadTest, partitionOnlyProjection) {
   auto emptyExpected =
       makeRowVector({"country"}, {makeFlatVector<std::string>({})});
 
-  AssertQueryBuilder(rewriteToCudfPlan(filteredNoMatchPlan))
+  AssertQueryBuilder(filteredNoMatchPlan)
       .splits(makeIcebergSplits(dataFile->getPath(), {}, partitionKeys))
       .assertResults({emptyExpected});
 
@@ -882,7 +876,7 @@ TEST_F(CudfIcebergReadTest, partitionOnlyProjection) {
                                .endTableScan()
                                .planNode();
 
-  AssertQueryBuilder(rewriteToCudfPlan(filteredMatchPlan))
+  AssertQueryBuilder(filteredMatchPlan)
       .splits(makeIcebergSplits(dataFile->getPath(), {}, partitionKeys))
       .assertResults({expected});
 
@@ -914,7 +908,7 @@ TEST_F(CudfIcebergReadTest, partitionOnlyProjection) {
           makeFlatVector<std::string>(std::vector<std::string>{}),
       });
 
-  AssertQueryBuilder(rewriteToCudfPlan(mixedPlan))
+  AssertQueryBuilder(mixedPlan)
       .splits(makeIcebergSplits(dataFile->getPath(), {}, partitionKeys))
       .assertResults({mixedEmptyExpected});
 
@@ -936,7 +930,7 @@ TEST_F(CudfIcebergReadTest, partitionOnlyProjection) {
           makeFlatVector<std::string>({"US", "US", "US"}),
       });
 
-  AssertQueryBuilder(rewriteToCudfPlan(mixedMatchPlan))
+  AssertQueryBuilder(mixedMatchPlan)
       .splits(makeIcebergSplits(dataFile->getPath(), {}, partitionKeys))
       .assertResults({mixedMatchExpected});
 
@@ -955,7 +949,7 @@ TEST_F(CudfIcebergReadTest, partitionOnlyProjection) {
                                  .endTableScan()
                                  .planNode();
 
-  AssertQueryBuilder(rewriteToCudfPlan(filterOnlyMatchPlan))
+  AssertQueryBuilder(filterOnlyMatchPlan)
       .splits(makeIcebergSplits(dataFile->getPath(), {}, partitionKeys))
       .assertResults({makeRowVector({"c0"}, {data->childAt(0)})});
 
@@ -969,7 +963,7 @@ TEST_F(CudfIcebergReadTest, partitionOnlyProjection) {
                                    .endTableScan()
                                    .planNode();
 
-  AssertQueryBuilder(rewriteToCudfPlan(filterOnlyNoMatchPlan))
+  AssertQueryBuilder(filterOnlyNoMatchPlan)
       .splits(makeIcebergSplits(dataFile->getPath(), {}, partitionKeys))
       .assertResults({makeRowVector(
           {"c0"}, {makeFlatVector<int64_t>(std::vector<int64_t>{})})});
@@ -1027,7 +1021,7 @@ TEST_F(CudfIcebergReadTest, allInjectedProjectionWithPositionalDeletes) {
                   .planNode();
   auto expected = makeRowVector(
       {"country"}, {makeFlatVector<std::string>({"US", "US", "US"})});
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
+  AssertQueryBuilder(plan)
       .splits(
           makeIcebergSplits(dataFile->getPath(), {deleteFile}, partitionKeys))
       .assertResults({expected});
@@ -1054,7 +1048,7 @@ TEST_F(CudfIcebergReadTest, allInjectedProjectionWithPositionalDeletes) {
           makeFlatVector<std::string>({"US", "US"}),
           makeFlatVector<int64_t>({40, 50}),
       });
-  AssertQueryBuilder(rewriteToCudfPlan(mixedPlan))
+  AssertQueryBuilder(mixedPlan)
       .splits(
           makeIcebergSplits(dataFile->getPath(), {deleteFile}, partitionKeys))
       .assertResults({mixedExpected});
@@ -1069,7 +1063,7 @@ TEST_F(CudfIcebergReadTest, allInjectedProjectionWithPositionalDeletes) {
           makeFlatVector<std::string>({}),
           makeFlatVector<int64_t>({}),
       });
-  AssertQueryBuilder(rewriteToCudfPlan(mixedPlan))
+  AssertQueryBuilder(mixedPlan)
       .splits(makeIcebergSplits(dataFile->getPath(), {deleteFile}, caPartition))
       .assertResults({emptyExpected});
 }
@@ -1126,7 +1120,7 @@ TEST_F(CudfIcebergReadTest, physicalFilterRebasedPastInjectedColumn) {
           makeFlatVector<int64_t>({3, 4, 5}),
           makeFlatVector<int64_t>({30, 40, 50}),
       });
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
+  AssertQueryBuilder(plan)
       .splits(makeIcebergSplits(dataFile->getPath(), {}, partitionKeys))
       .assertResults({expected});
 
@@ -1158,7 +1152,7 @@ TEST_F(CudfIcebergReadTest, physicalFilterRebasedPastInjectedColumn) {
           makeFlatVector<int64_t>({3, 5}),
           makeFlatVector<int64_t>({30, 50}),
       });
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
+  AssertQueryBuilder(plan)
       .splits(
           makeIcebergSplits(dataFile->getPath(), {deleteFile}, partitionKeys))
       .assertResults({deletedExpected});
@@ -1250,7 +1244,7 @@ TEST_F(CudfIcebergReadTest, normalizeDecimalsWithInjectedColumn) {
           columns.push_back(makeFlatVector<int64_t>(prices, DECIMAL(5, 2)));
         }
         auto expected = makeRowVector(outputType->names(), columns);
-        AssertQueryBuilder(rewriteToCudfPlan(plan))
+        AssertQueryBuilder(plan)
             .splits(makeIcebergSplits(
                 dataFile->getPath(),
                 withDeletes ? std::vector<IcebergDeleteFile>{deleteFile}
@@ -1326,7 +1320,7 @@ TEST_F(CudfIcebergReadTest, injectedColumnPredicateFolds) {
   // The partition value fails the filter, so the split holds no matching row
   // and none of its data pages are read.
   auto rejectedPlan = scan({"country = 'CA'", "c1 > 20"});
-  auto task = AssertQueryBuilder(rewriteToCudfPlan(rejectedPlan))
+  auto task = AssertQueryBuilder(rejectedPlan)
                   .splits(makeSplits())
                   .assertEmptyResults();
   auto planStats = toPlanStats(task->taskStats());
@@ -1341,7 +1335,7 @@ TEST_F(CudfIcebergReadTest, injectedColumnPredicateFolds) {
   EXPECT_EQ(rejectedStats.count("processedSplits"), 0);
 
   // A column missing from the file is NULL for every row of the split.
-  AssertQueryBuilder(rewriteToCudfPlan(scan({"added IS NULL", "c1 > 20"})))
+  AssertQueryBuilder(scan({"added IS NULL", "c1 > 20"}))
       .splits(makeSplits())
       .assertResults({expected});
 
@@ -1369,7 +1363,7 @@ TEST_F(CudfIcebergReadTest, injectedColumnPredicateFolds) {
           makeFlatVector<int64_t>({10, 20, 30, 40, 50}),
           makeNullConstant(TypeKind::BIGINT, 5),
       });
-  auto nullAllowedTask = AssertQueryBuilder(rewriteToCudfPlan(nullAllowedPlan))
+  auto nullAllowedTask = AssertQueryBuilder(nullAllowedPlan)
                              .splits(makeSplits())
                              .assertResults({allRows});
   auto nullAllowedStats = toPlanStats(nullAllowedTask->taskStats());
@@ -1382,12 +1376,10 @@ TEST_F(CudfIcebergReadTest, injectedColumnPredicateFolds) {
 
   // An IN-list folds as well, though it reaches the filter as a disjunction
   // over several references to the same column.
-  AssertQueryBuilder(
-      rewriteToCudfPlan(scan({"country IN ('CA', 'MX')", "c1 > 20"})))
+  AssertQueryBuilder(scan({"country IN ('CA', 'MX')", "c1 > 20"}))
       .splits(makeSplits())
       .assertEmptyResults();
-  AssertQueryBuilder(
-      rewriteToCudfPlan(scan({"country IN ('US', 'MX')", "c1 > 20"})))
+  AssertQueryBuilder(scan({"country IN ('US', 'MX')", "c1 > 20"}))
       .splits(makeSplits())
       .assertResults({expected});
 }
@@ -1432,12 +1424,12 @@ TEST_F(CudfIcebergReadTest, rejectedSplitReadsNoDeleteFile) {
   // the metadata it validates, and a rejected split has to reach neither.
   const auto assertRejectedSplitSucceeds =
       [&](const IcebergDeleteFile& deleteFile, const std::string& error) {
-        AssertQueryBuilder(rewriteToCudfPlan(scan("country = 'CA'")))
+        AssertQueryBuilder(scan("country = 'CA'"))
             .splits(makeIcebergSplits(
                 dataFile->getPath(), {deleteFile}, partitionKeys))
             .assertEmptyResults();
         VELOX_ASSERT_THROW(
-            AssertQueryBuilder(rewriteToCudfPlan(scan("country = 'US'")))
+            AssertQueryBuilder(scan("country = 'US'"))
                 .splits(makeIcebergSplits(
                     dataFile->getPath(), {deleteFile}, partitionKeys))
                 .copyResults(pool()),
@@ -1527,7 +1519,7 @@ TEST_F(CudfIcebergReadTest, injectedColumnFoldsAgainstExtractedFilter) {
 
   std::unordered_map<std::string, std::optional<std::string>> rejected = {
       {"country", "US"}};
-  auto task = AssertQueryBuilder(rewriteToCudfPlan(plan))
+  auto task = AssertQueryBuilder(plan)
                   .splits(makeIcebergSplits(dataFile->getPath(), {}, rejected))
                   .assertEmptyResults();
   auto planStats = toPlanStats(task->taskStats());
@@ -1547,7 +1539,7 @@ TEST_F(CudfIcebergReadTest, injectedColumnFoldsAgainstExtractedFilter) {
           makeFlatVector<int64_t>({1, 2, 3, 4, 5}),
           makeFlatVector<int64_t>({10, 20, 30, 40, 50}),
       });
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
+  AssertQueryBuilder(plan)
       .splits(makeIcebergSplits(dataFile->getPath(), {}, accepted))
       .assertResults({expected});
 }
@@ -1585,7 +1577,7 @@ TEST_F(CudfIcebergReadTest, deletionVectorWithInjectedOnlyProjection) {
                   .planNode();
   auto expected = makeRowVector(
       {"country"}, {makeFlatVector<std::string>({"US", "US", "US"})});
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
+  AssertQueryBuilder(plan)
       .splits(makeIcebergSplits(dataFile->getPath(), {dvDelete}, partitionKeys))
       .assertResults({expected});
 }
@@ -1629,7 +1621,7 @@ TEST_F(CudfIcebergReadTest, subSplitAllInjectedProjection) {
       {"country"}, {makeFlatVector<std::string>(10'001, [](vector_size_t) {
         return "US";
       })});
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
+  AssertQueryBuilder(plan)
       .splits(makeIcebergSplits(
           dataFile->getPath(), {}, partitionKeys, /*splitCount=*/2))
       .assertResults({expected});
@@ -1658,7 +1650,7 @@ TEST_F(CudfIcebergReadTest, subSplitAllInjectedProjection) {
   auto expectedWithDeletes = makeRowVector(
       {"country"},
       {makeFlatVector<std::string>(9'999, [](vector_size_t) { return "US"; })});
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
+  AssertQueryBuilder(plan)
       .splits(makeIcebergSplits(
           dataFile->getPath(),
           {deleteFile},
@@ -1698,7 +1690,7 @@ TEST_F(CudfIcebergReadTest, unprojectedRemainingFilterColumn) {
           makeFlatVector<int64_t>({20, 40}),
       });
 
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
+  AssertQueryBuilder(plan)
       .splits(makeIcebergSplits(dataFile->getPath()))
       .assertResults({expected});
 }
@@ -1754,7 +1746,7 @@ TEST_F(CudfIcebergReadTest, remainingFilterOnInjectedColumn) {
   // `c1 % 2 = 0`, keeping c1={2,4} -> c0={20,40}.
   std::unordered_map<std::string, std::optional<std::string>> usPartition = {
       {"country", "US"}};
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
+  AssertQueryBuilder(plan)
       .splits(makeIcebergSplits(dataFile->getPath(), {}, usPartition))
       .assertResults(
           {makeRowVector({"c0"}, {makeFlatVector<int64_t>({20, 40})})});
@@ -1762,7 +1754,7 @@ TEST_F(CudfIcebergReadTest, remainingFilterOnInjectedColumn) {
   // Partition 'CA': `country = 'CA'` is true for every row, so all rows pass.
   std::unordered_map<std::string, std::optional<std::string>> caPartition = {
       {"country", "CA"}};
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
+  AssertQueryBuilder(plan)
       .splits(makeIcebergSplits(dataFile->getPath(), {}, caPartition))
       .assertResults(
           {makeRowVector({"c0"}, {makeFlatVector<int64_t>({10, 20, 30, 40})})});
@@ -1827,7 +1819,7 @@ TEST_F(CudfIcebergReadTest, timestampPartitionHonorsLocalTimeSetting) {
                 {expectedTimestamp, expectedTimestamp, expectedTimestamp}),
         });
 
-    AssertQueryBuilder(rewriteToCudfPlan(plan))
+    AssertQueryBuilder(plan)
         .connectorSessionProperty(
             kCudfIcebergConnectorId,
             facebook::velox::connector::hive::HiveConfig::
@@ -1897,7 +1889,7 @@ TEST_F(CudfIcebergReadTest, remainingFilterAndPositionalDeletes) {
           makeFlatVector<int64_t>({40}),
       });
 
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
+  AssertQueryBuilder(plan)
       .splits(makeIcebergSplits(dataFile->getPath(), {deleteFile}))
       .assertResults({expected});
 }
@@ -1944,7 +1936,7 @@ TEST_F(CudfIcebergReadTest, subfieldFilterWithPositionalDeletes) {
 
   auto expected = makeRowVector({makeFlatVector<int64_t>({40})});
 
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
+  AssertQueryBuilder(plan)
       .splits(makeIcebergSplits(dataFile->getPath(), {deleteFile}))
       .assertResults({expected});
 }
@@ -2163,9 +2155,7 @@ TEST_F(CudfIcebergReadTest, subSplitPositionalDeletes) {
                   .planNode();
   auto expected = makeRowVector(
       {makeFlatVector<int64_t>({90, 91, 92, 93, 94, 96, 97, 98, 99})});
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
-      .splits(secondSplit)
-      .assertResults({expected});
+  AssertQueryBuilder(plan).splits(secondSplit).assertResults({expected});
 }
 
 // Applies a deletion vector to filtered rows in a nonzero sub-split.
@@ -2200,9 +2190,7 @@ TEST_F(CudfIcebergReadTest, deletionVectorWithFilteredSubSplit) {
                   .planNode();
   auto expected = makeRowVector(
       {makeFlatVector<int64_t>({90, 91, 93, 94, 96, 97, 98, 99})});
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
-      .splits(secondSplit)
-      .assertResults({expected});
+  AssertQueryBuilder(plan).splits(secondSplit).assertResults({expected});
 }
 
 // Verifies positional deletes with a row-group filter.
@@ -2313,9 +2301,7 @@ TEST_F(CudfIcebergReadTest, positionalDeleteSequenceNumberApplied) {
                   .planNode();
 
   auto expected = makeRowVector({makeFlatVector<int64_t>({0, 2, 4})});
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
-      .splits(splits)
-      .assertResults({expected});
+  AssertQueryBuilder(plan).splits(splits).assertResults({expected});
 }
 
 TEST_F(CudfIcebergReadTest, positionalDeleteSequenceNumberSkipped) {
@@ -2367,9 +2353,7 @@ TEST_F(CudfIcebergReadTest, positionalDeleteSequenceNumberSkipped) {
                   .planNode();
 
   auto expected = makeRowVector({makeFlatVector<int64_t>({0, 1, 2, 3, 4})});
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
-      .splits(splits)
-      .assertResults({expected});
+  AssertQueryBuilder(plan).splits(splits).assertResults({expected});
 }
 
 // Subfield filter + positional delete skipped by sequence-number resolution:
@@ -2428,9 +2412,7 @@ TEST_F(CudfIcebergReadTest, subfieldFilterWithSkippedPositionalDelete) {
 
   // The delete is skipped, so `c0 < 4` simply keeps {0, 1, 2, 3}.
   auto expected = makeRowVector({makeFlatVector<int64_t>({0, 1, 2, 3})});
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
-      .splits(splits)
-      .assertResults({expected});
+  AssertQueryBuilder(plan).splits(splits).assertResults({expected});
 }
 
 // Subfield filter + positional delete for a different data file.
@@ -2497,9 +2479,7 @@ TEST_F(
   // The positional delete file contains no entries for this data file, so
   // `c0 < 4` simply keeps {0, 1, 2, 3}.
   auto expected = makeRowVector({makeFlatVector<int64_t>({0, 1, 2, 3})});
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
-      .splits(splits)
-      .assertResults({expected});
+  AssertQueryBuilder(plan).splits(splits).assertResults({expected});
 }
 
 TEST_F(CudfIcebergReadTest, positionalDeleteSequenceNumberEqualApplied) {
@@ -2551,9 +2531,7 @@ TEST_F(CudfIcebergReadTest, positionalDeleteSequenceNumberEqualApplied) {
                   .planNode();
 
   auto expected = makeRowVector({makeFlatVector<int64_t>({0, 2, 4})});
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
-      .splits(splits)
-      .assertResults({expected});
+  AssertQueryBuilder(plan).splits(splits).assertResults({expected});
 }
 
 TEST_F(CudfIcebergReadTest, positionalDeleteSequenceNumberZeroDisablesFilter) {
@@ -2605,9 +2583,7 @@ TEST_F(CudfIcebergReadTest, positionalDeleteSequenceNumberZeroDisablesFilter) {
                   .planNode();
 
   auto expected = makeRowVector({makeFlatVector<int64_t>({0, 2, 4})});
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
-      .splits(splits)
-      .assertResults({expected});
+  AssertQueryBuilder(plan).splits(splits).assertResults({expected});
 }
 
 /// Edge-case tests from Sirius project
@@ -2665,9 +2641,7 @@ TEST_F(CudfIcebergReadTest, combinedPositionalAndEqualityDeletes) {
   auto splits = makeIcebergSplits(
       dataFile->getPath(), {posIcebergDelete, eqIcebergDelete});
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(splits)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
 
   // Positional removes pos 1,3 (c0=1,3). Equality removes c0=5,7.
   // Surviving: 0, 2, 4, 6, 8, 9
@@ -2719,9 +2693,7 @@ TEST_F(CudfIcebergReadTest, nonProjectedDeleteKeyColumn) {
                   .endTableScan()
                   .planNode();
 
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(splits)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
 
   // c0=2,4 deleted -> c1=20,40 removed
   auto expected = makeRowVector({
@@ -2759,7 +2731,7 @@ TEST_F(CudfIcebergReadTest, normalizeHiddenDecimalEqualityKey) {
                   .endTableScan()
                   .planNode();
   auto expected = makeRowVector({"id"}, {makeFlatVector<int64_t>({1, 4})});
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
+  AssertQueryBuilder(plan)
       .splits(makeIcebergSplits(dataFile->getPath(), {deleteFile}))
       .assertResults({expected});
 }
@@ -2817,9 +2789,7 @@ TEST_F(CudfIcebergReadTest, insertDeleteInsertInterleaving) {
   allSplits.insert(allSplits.end(), splits2.begin(), splits2.end());
 
   auto plan = makeTableScanPlan(rowType);
-  auto result = AssertQueryBuilder(rewriteToCudfPlan(plan))
-                    .splits(allSplits)
-                    .copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(allSplits).copyResults(pool());
 
   // File1 loses c0=2 (delete applies), file2 keeps c0=2 (delete skipped)
   auto expected = makeRowVector({
@@ -2863,9 +2833,7 @@ TEST_F(CudfIcebergReadTest, schemaEvolutionRemoveColumn) {
                   .outputType(newRowType)
                   .endTableScan()
                   .planNode();
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
-      .splits(icebergSplits)
-      .assertResults({expected});
+  AssertQueryBuilder(plan).splits(icebergSplits).assertResults({expected});
 }
 
 TEST_F(CudfIcebergReadTest, schemaEvolutionAddColumns) {
@@ -2895,9 +2863,7 @@ TEST_F(CudfIcebergReadTest, schemaEvolutionAddColumns) {
                   .dataColumns(newRowType)
                   .endTableScan()
                   .planNode();
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
-      .splits(icebergSplits)
-      .assertResults({expected});
+  AssertQueryBuilder(plan).splits(icebergSplits).assertResults({expected});
 }
 
 // Hive-migrated partition columns: values come from the partitionKeys map,
@@ -2958,9 +2924,7 @@ TEST_F(CudfIcebergReadTest, partitionColumnsFromHive) {
                   .assignments(assignments)
                   .endTableScan()
                   .planNode();
-  AssertQueryBuilder(rewriteToCudfPlan(plan))
-      .splits(icebergSplits)
-      .assertResults({expected});
+  AssertQueryBuilder(plan).splits(icebergSplits).assertResults({expected});
 }
 
 // Test reading a DATE identity partition column. DATE partition values arrive
@@ -3017,9 +2981,7 @@ TEST_F(CudfIcebergReadTest, partitionColumnsDate) {
     std::unordered_map<std::string, std::optional<std::string>> partitionKeys;
     partitionKeys["partitiondate"] = "2025-06-05";
     auto splits = makeIcebergSplits(dataFilePath->getPath(), {}, partitionKeys);
-    AssertQueryBuilder(rewriteToCudfPlan(plan))
-        .splits(splits)
-        .assertResults({expected});
+    AssertQueryBuilder(plan).splits(splits).assertResults({expected});
   }
 
   // Encoding 2: Iceberg-native days-since-epoch.
@@ -3027,9 +2989,7 @@ TEST_F(CudfIcebergReadTest, partitionColumnsDate) {
     std::unordered_map<std::string, std::optional<std::string>> partitionKeys;
     partitionKeys["partitiondate"] = folly::to<std::string>(kDays);
     auto splits = makeIcebergSplits(dataFilePath->getPath(), {}, partitionKeys);
-    AssertQueryBuilder(rewriteToCudfPlan(plan))
-        .splits(splits)
-        .assertResults({expected});
+    AssertQueryBuilder(plan).splits(splits).assertResults({expected});
   }
 }
 
