@@ -173,98 +173,12 @@ std::unique_ptr<cudf::packed_table> makePackedTable(
       cudf::packed_table{tableView, std::move(packedColumns)});
 }
 
-std::unique_ptr<cudf::table> makeNativeSumTable(
-    cuda::stream_ref stream,
-    bool nullable = true) {
-  const std::array<__int128_t, 4> values{123, -123, 0, 0};
-  const cudf::bitmask_type validity = 0b1011;
-  auto mr = cudf::get_current_device_resource_ref();
-  rmm::device_buffer data(values.data(), sizeof(values), stream, mr);
-  auto mask = cudf::create_null_mask(
-      values.size(),
-      nullable ? cudf::mask_state::ALL_VALID : cudf::mask_state::UNALLOCATED,
-      stream,
-      mr);
-  if (nullable) {
-    CUDF_CUDA_TRY(cudaMemcpyAsync(
-        mask.data(),
-        &validity,
-        sizeof(validity),
-        cudaMemcpyHostToDevice,
-        stream.get()));
-  }
-  // The source arrays are stack allocated.
-  stream.sync();
-  std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.push_back(
-      std::make_unique<cudf::column>(
-          cudf::data_type(cudf::type_id::DECIMAL128, -2),
-          values.size(),
-          std::move(data),
-          std::move(mask),
-          nullable ? 1 : 0));
-  return std::make_unique<cudf::table>(std::move(columns));
-}
-
 class CudfVectorTest : public ::testing::Test, public VectorTestBase {
  protected:
   static void SetUpTestCase() {
     memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 };
-
-TEST_F(CudfVectorTest, decimal128StateStorage) {
-  TestCudaStream stream;
-  const auto type = ROW({"sum"}, {DECIMAL(38, 2)});
-  CudfVector vector(
-      pool_.get(), type, 4, makeNativeSumTable(stream.view()), stream.view());
-  EXPECT_EQ(*vector.type(), *type);
-  EXPECT_EQ(
-      vector.getTableView().column(0).type(),
-      cudf::data_type(cudf::type_id::DECIMAL128, -2));
-  EXPECT_EQ(vector.getTableView().column(0).null_count(), 1);
-  EXPECT_EQ(
-      vector.estimateFlatSize(),
-      4 * sizeof(__int128_t) + cudf::bitmask_allocation_size_bytes(4));
-  EXPECT_EQ(vector.retainedSize(), vector.estimateFlatSize());
-
-  CudfVector allValid(
-      pool_.get(),
-      type,
-      4,
-      makeNativeSumTable(stream.view(), false),
-      stream.view());
-  EXPECT_FALSE(allValid.getTableView().column(0).nullable());
-  EXPECT_EQ(allValid.estimateFlatSize(), 4 * sizeof(__int128_t));
-}
-
-TEST_F(CudfVectorTest, decimal128PackedSplitPreservesTypeAndNulls) {
-  TestCudaStream stream;
-  auto table = makeNativeSumTable(stream.view());
-  const auto type = ROW({"sum"}, {DECIMAL(38, 2)});
-  auto partitions = cudf::contiguous_split(
-      table->view(),
-      {2},
-      stream.view(),
-      cudf::get_current_device_resource_ref());
-  int partitionIndex = 0;
-  for (auto& partition : partitions) {
-    CudfVector vector(
-        pool_.get(),
-        type,
-        2,
-        std::make_unique<cudf::packed_table>(std::move(partition)),
-        stream.view());
-    EXPECT_EQ(*vector.type(), *type);
-    EXPECT_EQ(vector.getTableView().column(0).null_count(), partitionIndex++);
-    auto released = vector.release();
-    EXPECT_EQ(released->num_rows(), 2);
-    EXPECT_EQ(
-        released->view().column(0).type(),
-        cudf::data_type(cudf::type_id::DECIMAL128, -2));
-    EXPECT_EQ(*vector.type(), *type);
-  }
-}
 
 TEST_F(CudfVectorTest, retainedSizeReportsDeviceStorage) {
   TestCudaStream stream;

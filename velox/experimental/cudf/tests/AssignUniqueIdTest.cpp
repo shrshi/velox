@@ -73,31 +73,19 @@ class AssignUniqueIdTest : public HiveConnectorTestBase {
     ASSERT_EQ(numColumns, input[0]->childrenSize() + 1);
 
     std::set<int64_t> ids;
-    size_t inputBatch = 0;
-    vector_size_t inputOffset = 0;
-    for (const auto& vector : vectors) {
-      vector_size_t outputOffset = 0;
-      while (outputOffset < vector->size()) {
-        ASSERT_LT(inputBatch, input.size());
-        const auto count = std::min(
-            input[inputBatch]->size() - inputOffset,
-            vector->size() - outputOffset);
-        for (int i = 0; i < numColumns - 1; ++i) {
-          assertEqualVectors(
-              input[inputBatch]->childAt(i)->slice(inputOffset, count),
-              vector->childAt(i)->slice(outputOffset, count));
-        }
-        outputOffset += count;
-        inputOffset += count;
-        if (inputOffset == input[inputBatch]->size()) {
-          ++inputBatch;
-          inputOffset = 0;
+    for (int i = 0; i < numColumns; i++) {
+      for (auto batch = 0; batch < vectors.size(); ++batch) {
+        auto column = vectors[batch]->childAt(i);
+        if (i < numColumns - 1) {
+          assertEqualVectors(input[batch]->childAt(i), column);
+        } else {
+          auto idValues = column->asFlatVector<int64_t>()->rawValues();
+          std::copy(
+              idValues,
+              idValues + column->size(),
+              std::inserter(ids, ids.end()));
         }
       }
-      auto column = vector->children().back();
-      auto idValues = column->asFlatVector<int64_t>()->rawValues();
-      std::copy(
-          idValues, idValues + column->size(), std::inserter(ids, ids.end()));
     }
 
     vector_size_t totalInputSize = 0;

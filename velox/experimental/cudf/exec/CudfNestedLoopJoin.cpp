@@ -1179,11 +1179,8 @@ std::unique_ptr<exec::Operator> CudfNestedLoopJoinBridgeTranslator::toOperator(
 
 std::unique_ptr<exec::JoinBridge>
 CudfNestedLoopJoinBridgeTranslator::toJoinBridge(
-    const core::PlanNodePtr& node) {
-  if (std::dynamic_pointer_cast<const core::NestedLoopJoinNode>(node)) {
-    return std::make_unique<CudfNestedLoopJoinBridge>();
-  }
-  return nullptr;
+    const core::PlanNodePtr& /* node */) {
+  return std::make_unique<CudfNestedLoopJoinBridge>();
 }
 
 exec::OperatorSupplier CudfNestedLoopJoinBridgeTranslator::toOperatorSupplier(

@@ -20,7 +20,6 @@
 #include "velox/experimental/cudf/exec/CudfGroupby.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationState.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
-#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/tests/utils/ExpressionTestUtil.h"
@@ -681,7 +680,8 @@ TEST_F(CudfDecimalTest, decimalAvgDecimalInput) {
   auto expected = makeRowVector(
       {"avg_d"}, {makeFlatVector<int64_t>({250}, DECIMAL(12, 2))}); // 2.50
 
-  auto result = AssertQueryBuilder(plan).copyResults(pool());
+  auto result =
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool());
   facebook::velox::test::assertEqualVectors(expected, result);
 }
 
@@ -706,7 +706,8 @@ TEST_F(CudfDecimalTest, decimalAvgDecimalInputRounds) {
       {"avg_d"},
       {makeFlatVector<int64_t>({computeAvgRaw(rawValues)}, DECIMAL(12, 2))});
 
-  auto result = AssertQueryBuilder(plan).copyResults(pool());
+  auto result =
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool());
   facebook::velox::test::assertEqualVectors(expected, result);
 }
 
@@ -752,7 +753,8 @@ TEST_F(CudfDecimalTest, decimalAvgPartialFinalVarbinaryRounds) {
               DECIMAL(12, 2)),
       });
 
-  auto result = AssertQueryBuilder(plan).copyResults(pool());
+  auto result =
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool());
   facebook::velox::test::assertEqualVectors(expected, result);
 }
 
@@ -802,7 +804,8 @@ TEST_F(CudfDecimalTest, decimalAvgIntermediateVarbinaryRounds) {
               DECIMAL(12, 2)),
       });
 
-  auto result = AssertQueryBuilder(plan).copyResults(pool());
+  auto result =
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool());
   facebook::velox::test::assertEqualVectors(expected, result);
 }
 
@@ -829,7 +832,8 @@ TEST_F(CudfDecimalTest, decimalAvgGlobalPartialFinalVarbinaryRounds) {
       {"a"},
       {makeFlatVector<int64_t>({computeAvgRaw(allValues)}, DECIMAL(12, 2))});
 
-  auto result = AssertQueryBuilder(plan).copyResults(pool());
+  auto result =
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool());
   facebook::velox::test::assertEqualVectors(expected, result);
 }
 
@@ -857,7 +861,8 @@ TEST_F(CudfDecimalTest, decimalAvgGlobalIntermediateVarbinaryRounds) {
       {"a"},
       {makeFlatVector<int64_t>({computeAvgRaw(allValues)}, DECIMAL(12, 2))});
 
-  auto result = AssertQueryBuilder(plan).copyResults(pool());
+  auto result =
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool());
   facebook::velox::test::assertEqualVectors(expected, result);
 }
 
@@ -882,7 +887,8 @@ TEST_F(CudfDecimalTest, decimalAvgGlobalSingleRounds) {
       {"a"},
       {makeFlatVector<int64_t>({computeAvgRaw(allValues)}, DECIMAL(12, 2))});
 
-  auto result = AssertQueryBuilder(plan).copyResults(pool());
+  auto result =
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool());
   facebook::velox::test::assertEqualVectors(expected, result);
 }
 
@@ -906,7 +912,8 @@ TEST_F(CudfDecimalTest, decimalAvgGlobalSingleDecimal64Overflow) {
   auto expected =
       makeRowVector({"a"}, {makeFlatVector<int64_t>({kBig}, DECIMAL(18, 0))});
 
-  auto result = AssertQueryBuilder(plan).copyResults(pool());
+  auto result =
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool());
   facebook::velox::test::assertEqualVectors(expected, result);
 }
 
@@ -938,7 +945,8 @@ TEST_F(CudfDecimalTest, decimalAvgGroupbySingleDecimal64Overflow) {
           makeFlatVector<int64_t>({kBig}, DECIMAL(18, 0)),
       });
 
-  auto result = AssertQueryBuilder(plan).copyResults(pool());
+  auto result =
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool());
   facebook::velox::test::assertEqualVectors(expected, result);
 }
 
@@ -962,7 +970,8 @@ TEST_F(CudfDecimalTest, decimalAvgGlobalSingleAllNulls) {
   auto expected = makeRowVector(
       {"a"}, {makeNullableFlatVector<int64_t>({std::nullopt}, DECIMAL(12, 2))});
 
-  auto result = AssertQueryBuilder(plan).copyResults(pool());
+  auto result =
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool());
   facebook::velox::test::assertEqualVectors(expected, result);
 }
 
@@ -987,7 +996,8 @@ TEST_F(CudfDecimalTest, decimalAvgGlobalPartialFinalVarbinaryAllNulls) {
   auto expected = makeRowVector(
       {"a"}, {makeNullableFlatVector<int64_t>({std::nullopt}, DECIMAL(12, 2))});
 
-  auto result = AssertQueryBuilder(plan).copyResults(pool());
+  auto result =
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool());
   facebook::velox::test::assertEqualVectors(expected, result);
 }
 
@@ -1013,7 +1023,8 @@ TEST_F(CudfDecimalTest, decimalAvgGlobalIntermediateVarbinaryAllNulls) {
   auto expected = makeRowVector(
       {"a"}, {makeNullableFlatVector<int64_t>({std::nullopt}, DECIMAL(12, 2))});
 
-  auto result = AssertQueryBuilder(plan).copyResults(pool());
+  auto result =
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool());
   facebook::velox::test::assertEqualVectors(expected, result);
 }
 
@@ -1049,7 +1060,8 @@ TEST_F(CudfDecimalTest, decimalAvgPartialFinalVarbinaryNullGroup) {
               {150, std::nullopt, 400}, DECIMAL(12, 2)),
       });
 
-  auto result = AssertQueryBuilder(plan).copyResults(pool());
+  auto result =
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool());
   facebook::velox::test::assertEqualVectors(expected, result);
 }
 
@@ -1092,7 +1104,8 @@ TEST_F(CudfDecimalTest, decimalAvgIntermediateVarbinaryNullGroup) {
               {150, std::nullopt, 400}, DECIMAL(12, 2)),
       });
 
-  auto result = AssertQueryBuilder(plan).copyResults(pool());
+  auto result =
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool());
   facebook::velox::test::assertEqualVectors(expected, result);
 }
 
@@ -1362,37 +1375,17 @@ TEST_F(CudfDecimalTest, decimalSumFinalUsesStreamingGroupby) {
 }
 
 TEST_F(CudfDecimalTest, serializedDecimalSumStateToCpu) {
-  RowVectorPtr states;
-  {
-    const auto stream = cudf::get_default_stream();
-    const auto mr = cudf::get_current_device_resource_ref();
-    const auto stateType = ROW({{"k", BIGINT()}, {"s", VARBINARY()}});
-    const std::vector<bool> valid{true, true, false, false, true, true};
-    std::vector<std::unique_ptr<cudf::column>> columns;
-    columns.push_back(makeInt64Column({0, 0, 1, 1, 2, 2}, nullptr, stream));
-    auto sums = makeDecimalColumn<int128_t>(
-        {300, -300, 123, 456, -500, 200}, 2, &valid, stream);
-    auto inputCounts = makeInt64Column({1, 1, 0, 0, 1, 1}, nullptr, stream);
-    columns.push_back(serializeDecimalSumState(
-        sums->view(), inputCounts->view(), stream, mr));
-    auto state = std::make_shared<CudfVector>(
-        pool(),
-        stateType,
-        6,
-        std::make_unique<cudf::table>(std::move(columns)),
-        stream);
-    auto decoded =
-        deserializeDecimalSumState(state->getTableView().column(1), 2, stream);
-    const auto counts = copyColumnData<int64_t>(decoded.count->view(), stream);
-    for (size_t i = 0; i < valid.size(); ++i) {
-      if (valid[i]) {
-        EXPECT_EQ(counts[i], 1);
-      }
-    }
-    states = with_arrow::toVeloxColumn(
-        state->getTableView(), pool(), stateType, stream, mr);
-    stream.sync();
-  }
+  auto input = makeRowVector(
+      {"k", "d"},
+      {makeFlatVector<int64_t>({0, 0, 1, 1, 2, 2}),
+       makeNullableFlatVector<int64_t>(
+           {300, -300, std::nullopt, std::nullopt, -500, 200},
+           DECIMAL(18, 2))});
+  auto partial = exec::test::PlanBuilder()
+                     .values({input})
+                     .partialAggregation({"k"}, {"sum(d) AS s"})
+                     .planNode();
+  auto states = AssertQueryBuilder(partial).copyResults(pool());
   auto expected = makeRowVector(
       {"k", "s"},
       {makeFlatVector<int64_t>({0, 1, 2}),
@@ -1413,26 +1406,12 @@ TEST_F(CudfDecimalTest, serializedDecimalSumStateToCpu) {
       const auto& call = aggregates[0].call;
       aggregates[0].call = std::make_shared<core::CallTypedExpr>(
           VARBINARY(), call->inputs(), call->name());
-      auto merge = std::make_shared<core::AggregationNode>(
-          "merge",
-          core::AggregationNode::Step::kIntermediate,
-          final->groupingKeys(),
-          final->preGroupedKeys(),
-          final->aggregateNames(),
-          aggregates,
-          false,
-          false,
-          final->sources()[0]);
-      plan = std::make_shared<core::AggregationNode>(
-          final->id(),
-          core::AggregationNode::Step::kFinal,
-          final->groupingKeys(),
-          final->preGroupedKeys(),
-          final->aggregateNames(),
-          final->aggregates(),
-          false,
-          false,
-          merge);
+      auto merge = core::AggregationNode::Builder(*final)
+                       .id("merge")
+                       .step(core::AggregationNode::Step::kIntermediate)
+                       .aggregates(std::move(aggregates))
+                       .build();
+      plan = core::AggregationNode::Builder(*final).source(merge).build();
     }
     exec::test::AssertQueryBuilder(plan).assertResults(expected);
   }
@@ -1463,36 +1442,6 @@ TEST_F(CudfDecimalTest, nativeDecimalSumResultRange) {
   EXPECT_NO_THROW(validateDecimalSumResult(empty->view(), stream));
 }
 
-TEST_F(CudfDecimalTest, nativeDecimalSumTypedConcat) {
-  const auto stream = cudf::get_default_stream();
-  const auto mr = cudf::get_current_device_resource_ref();
-  const auto type = ROW({{"s", DECIMAL(38, 2)}});
-  const std::vector<bool> valid{true, false};
-  std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.push_back(makeDecimalColumn<int128_t>({123, 456}, 2, &valid, stream));
-  auto native = std::make_shared<CudfVector>(
-      pool(),
-      type,
-      2,
-      std::make_unique<cudf::table>(std::move(columns)),
-      stream);
-  auto concatenated = getConcatenatedCudfVectorsBatched(
-      pool(), {native, native}, type, stream, mr);
-  ASSERT_EQ(concatenated.size(), 1);
-  EXPECT_EQ(*concatenated[0]->type(), *type);
-  auto column = concatenated[0]->getTableView().column(0);
-  const auto sums = copyColumnData<int128_t>(column, stream);
-  ASSERT_EQ(sums.size(), 4);
-  EXPECT_EQ(sums[0], 123);
-  EXPECT_EQ(sums[2], 123);
-  const auto mask = copyNullMask(column, stream);
-  EXPECT_TRUE(isValidAt(mask, 0));
-  EXPECT_FALSE(isValidAt(mask, 1));
-  EXPECT_TRUE(isValidAt(mask, 2));
-  EXPECT_FALSE(isValidAt(mask, 3));
-  EXPECT_EQ(column.type(), cudf::data_type(cudf::type_id::DECIMAL128, -2));
-}
-
 TEST_F(CudfDecimalTest, decimalPartialSumVarbinaryToVeloxRoundTrip) {
   auto rowType = ROW({
       {"d", DECIMAL(12, 2)},
@@ -1508,7 +1457,8 @@ TEST_F(CudfDecimalTest, decimalPartialSumVarbinaryToVeloxRoundTrip) {
                   .partialAggregation({}, {"sum(d) AS s"})
                   .planNode();
 
-  auto result = AssertQueryBuilder(plan).copyResults(pool());
+  auto result =
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool());
   VELOX_CHECK_NOT_NULL(result);
   ASSERT_GT(result->size(), 0);
   ASSERT_EQ(result->childAt(0)->type()->kind(), TypeKind::VARBINARY);
@@ -1537,7 +1487,7 @@ TEST_F(CudfDecimalTest, decimalSumPartialFinalEmptyInput) {
                   .finalAggregation()
                   .planNode();
 
-  AssertQueryBuilder(plan, duckDbQueryRunner_)
+  facebook::velox::exec::test::AssertQueryBuilder(plan, duckDbQueryRunner_)
       .assertResults("SELECT k, sum(d) AS s FROM tmp WHERE k < 0 GROUP BY k");
 }
 
@@ -1570,7 +1520,7 @@ TEST_F(CudfDecimalTest, decimalSumIntermediateVarbinary) {
                   .finalAggregation()
                   .planNode();
 
-  AssertQueryBuilder(plan, duckDbQueryRunner_)
+  facebook::velox::exec::test::AssertQueryBuilder(plan, duckDbQueryRunner_)
       .assertResults("SELECT k, sum(d) AS s FROM tmp GROUP BY k");
 }
 
@@ -1593,7 +1543,7 @@ TEST_F(CudfDecimalTest, decimalSumGlobalPartialFinalVarbinary) {
                   .finalAggregation()
                   .planNode();
 
-  AssertQueryBuilder(plan, duckDbQueryRunner_)
+  facebook::velox::exec::test::AssertQueryBuilder(plan, duckDbQueryRunner_)
       .assertResults("SELECT sum(d) AS s FROM tmp");
 }
 
@@ -1617,7 +1567,7 @@ TEST_F(CudfDecimalTest, decimalSumGlobalIntermediateVarbinary) {
                   .finalAggregation()
                   .planNode();
 
-  AssertQueryBuilder(plan, duckDbQueryRunner_)
+  facebook::velox::exec::test::AssertQueryBuilder(plan, duckDbQueryRunner_)
       .assertResults("SELECT sum(d) AS s FROM tmp");
 }
 
@@ -1639,7 +1589,7 @@ TEST_F(CudfDecimalTest, decimalSumGlobalSingle) {
                   .singleAggregation({}, {"sum(d) AS s"})
                   .planNode();
 
-  AssertQueryBuilder(plan, duckDbQueryRunner_)
+  facebook::velox::exec::test::AssertQueryBuilder(plan, duckDbQueryRunner_)
       .assertResults("SELECT sum(d) AS s FROM tmp");
 }
 
@@ -1663,7 +1613,7 @@ TEST_F(CudfDecimalTest, decimalSumMaskedGroupbySingle) {
                   .singleAggregation({"k"}, {"sum(d) AS s"}, {"m"})
                   .planNode();
 
-  AssertQueryBuilder(plan, duckDbQueryRunner_)
+  facebook::velox::exec::test::AssertQueryBuilder(plan, duckDbQueryRunner_)
       .assertResults(
           "SELECT k, sum(d) FILTER (WHERE m) AS s FROM tmp GROUP BY k");
 }
@@ -1689,7 +1639,7 @@ TEST_F(CudfDecimalTest, decimalSumMaskedPartialFinal) {
                   .finalAggregation()
                   .planNode();
 
-  AssertQueryBuilder(plan, duckDbQueryRunner_)
+  facebook::velox::exec::test::AssertQueryBuilder(plan, duckDbQueryRunner_)
       .assertResults(
           "SELECT k, sum(d) FILTER (WHERE m) AS s FROM tmp GROUP BY k");
 }
@@ -1712,7 +1662,7 @@ TEST_F(CudfDecimalTest, decimalSumMaskedGlobalSingle) {
                   .singleAggregation({}, {"sum(d) AS s"}, {"m"})
                   .planNode();
 
-  AssertQueryBuilder(plan, duckDbQueryRunner_)
+  facebook::velox::exec::test::AssertQueryBuilder(plan, duckDbQueryRunner_)
       .assertResults("SELECT sum(d) FILTER (WHERE m) AS s FROM tmp");
 }
 
@@ -1735,7 +1685,7 @@ TEST_F(CudfDecimalTest, decimalSumMaskedGlobalAllMasked) {
                   .singleAggregation({}, {"sum(d) AS s"}, {"m"})
                   .planNode();
 
-  AssertQueryBuilder(plan, duckDbQueryRunner_)
+  facebook::velox::exec::test::AssertQueryBuilder(plan, duckDbQueryRunner_)
       .assertResults("SELECT sum(d) FILTER (WHERE m) AS s FROM tmp");
 }
 
@@ -1769,7 +1719,8 @@ TEST_F(CudfDecimalTest, decimalSumGroupbySingleDecimal64Overflow) {
           makeFlatVector<int128_t>({expectedSum}, DECIMAL(38, 0)),
       });
 
-  auto result = AssertQueryBuilder(plan).copyResults(pool());
+  auto result =
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool());
   facebook::velox::test::assertEqualVectors(expected, result);
 }
 
@@ -1795,7 +1746,8 @@ TEST_F(CudfDecimalTest, decimalSumGlobalPartialFinalDecimal64Overflow) {
   auto expected = makeRowVector(
       {"s"}, {makeFlatVector<int128_t>({expectedSum}, DECIMAL(38, 0))});
 
-  auto result = AssertQueryBuilder(plan).copyResults(pool());
+  auto result =
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool());
   facebook::velox::test::assertEqualVectors(expected, result);
 }
 
@@ -1834,7 +1786,8 @@ TEST_F(CudfDecimalTest, decimalSumPartialFinalVarbinaryNullGroup) {
               DECIMAL(38, 2)),
       });
 
-  auto result = AssertQueryBuilder(plan).copyResults(pool());
+  auto result =
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool());
   facebook::velox::test::assertEqualVectors(expected, result);
 }
 
@@ -1880,7 +1833,8 @@ TEST_F(CudfDecimalTest, decimalSumIntermediateVarbinaryNullGroup) {
               DECIMAL(38, 2)),
       });
 
-  auto result = AssertQueryBuilder(plan).copyResults(pool());
+  auto result =
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool());
   facebook::velox::test::assertEqualVectors(expected, result);
 }
 
@@ -1906,7 +1860,8 @@ TEST_F(CudfDecimalTest, decimalSumGlobalPartialFinalVarbinaryAllNulls) {
       {"s"},
       {makeNullableFlatVector<int128_t>({std::nullopt}, DECIMAL(38, 2))});
 
-  auto result = AssertQueryBuilder(plan).copyResults(pool());
+  auto result =
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool());
   facebook::velox::test::assertEqualVectors(expected, result);
 }
 
@@ -1933,7 +1888,8 @@ TEST_F(CudfDecimalTest, decimalSumGlobalIntermediateVarbinaryAllNulls) {
       {"s"},
       {makeNullableFlatVector<int128_t>({std::nullopt}, DECIMAL(38, 2))});
 
-  auto result = AssertQueryBuilder(plan).copyResults(pool());
+  auto result =
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool());
   facebook::velox::test::assertEqualVectors(expected, result);
 }
 

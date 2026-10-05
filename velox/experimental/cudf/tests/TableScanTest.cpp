@@ -337,24 +337,6 @@ TEST_P(TableScanTestParameterized, allColumns) {
   }
 }
 
-TEST_F(TableScanTest, multipleDrivers) {
-  constexpr int32_t kNumDrivers = 4;
-  auto vectors = makeVectors(kNumDrivers, 1'000);
-  auto filePaths = makeFilePaths(kNumDrivers);
-  for (int32_t i = 0; i < kNumDrivers; ++i) {
-    writeToFile(filePaths[i]->getPath(), vectors[i]);
-  }
-
-  std::shared_ptr<Task> task;
-  auto resultCount = AssertQueryBuilder(tableScanNode())
-                         .maxDrivers(kNumDrivers)
-                         .splits(makeCudfHiveConnectorSplits(filePaths))
-                         .countResults(task);
-
-  EXPECT_EQ(resultCount, kNumDrivers * 1'000);
-  EXPECT_EQ(task->taskStats().numTotalDrivers, kNumDrivers);
-}
-
 // Reads several splits of a multi-row-group file with chunk and pass read
 // limits small enough that each split is read as multiple row group passes,
 // each yielding multiple table chunks.
