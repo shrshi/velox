@@ -693,6 +693,7 @@ void TabletReader::initStripes(
       stripes->group_indices()->size(),
       "Unexpected stripe count");
   stripeOffsets_ = stripes->offsets()->data();
+  stripeSizes_ = stripes->sizes()->data();
 
   // Build prefix sum for O(log n) rowToStripe lookup.
   const auto* rowCounts = stripes->row_counts()->data();
@@ -1184,6 +1185,14 @@ bool TabletReader::hasOptionalSection(const std::string& name) const {
   return it != optionalSections_.end();
 }
 
+std::optional<Checkpoint> TabletReader::checkpoint() const {
+  auto section = loadOptionalSection(std::string{kCheckpointSection});
+  if (!section.has_value()) {
+    return std::nullopt;
+  }
+  return Checkpoint::deserialize(section->content());
+}
+
 std::optional<Section> TabletReader::loadOptionalSection(
     const std::string& name,
     bool keepCache) const {
@@ -1388,7 +1397,8 @@ void TabletReader::initChunkStats(
   auto section = loadOptionalSection(sectionName, /*keepCache=*/false);
   NIMBLE_CHECK(section.has_value(), "Failed to load chunk stats section.");
 
-  auto chunkStats = ChunkStats::create(std::move(section.value()));
+  auto chunkStats =
+      ChunkStats::create(chunkStatsVersion_, std::move(section.value()));
   if (chunkStats->numGroups() > 0) {
     chunkStats_ = std::move(chunkStats);
   }

@@ -40,12 +40,12 @@ set(
 set(VELOX_rmm_SOURCE_URL "https://github.com/rapidsai/rmm/archive/${VELOX_rmm_COMMIT}.tar.gz")
 velox_resolve_dependency_url(rmm)
 
-# kvikio commit 4393256 from 2026-09-29 (main branch)
+# kvikio commit e7c6c8c from 2026-09-30 (main branch)
 set(VELOX_kvikio_VERSION 26.12)
-set(VELOX_kvikio_COMMIT 439325642fe13e63366a01d00b0c2451d8dad6f9)
+set(VELOX_kvikio_COMMIT e7c6c8c4e24dff2cd641407f2dc18f16c2a7b212)
 set(
   VELOX_kvikio_BUILD_SHA256_CHECKSUM
-  472239cbc69d94544036e159fd710eae38515a5ceff29c5882e80a6c8d892619
+  0d17856f1645e9dd9ebffe1aeae5db81f4acb9e0e28626d04bc9cbe2642e587c
 )
 set(
   VELOX_kvikio_SOURCE_URL
@@ -74,12 +74,12 @@ else()
 endif()
 if(UCX_FOUND)
   message(STATUS "Found UCX: ${UCX_LIBRARY} (headers: ${UCX_INCLUDE_DIR}) -- ucxx will be fetched")
-  # ucxx commit 22d9c90 from 2026-09-09 (release/0.52 branch)
-  set(VELOX_ucxx_VERSION 0.52)
-  set(VELOX_ucxx_COMMIT 22d9c90a40055d439c3ec58f2606f2af620c5d71)
+  # ucxx commit 7ecd4f5 from 2026-09-29 (main branch)
+  set(VELOX_ucxx_VERSION 0.53)
+  set(VELOX_ucxx_COMMIT 7ecd4f55ce9a833b3f23c85a574d07db8f98e0b8)
   set(
     VELOX_ucxx_BUILD_SHA256_CHECKSUM
-    cfb042ede89913744033aadacbe6768700a8ee8fe357cb80cbf47f14c9d4df5c
+    8e3ab889d8a4610b2859d3b36d981eac8b0eb68034ebf4ec9fdba645c255159c
   )
   set(VELOX_ucxx_SOURCE_URL "https://github.com/rapidsai/ucxx/archive/${VELOX_ucxx_COMMIT}.tar.gz")
   velox_resolve_dependency_url(ucxx)

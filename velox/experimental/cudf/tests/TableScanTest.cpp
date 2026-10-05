@@ -27,6 +27,7 @@
 #include "velox/common/file/FileSystems.h"
 #include "velox/common/file/tests/FaultyFile.h"
 #include "velox/common/file/tests/FaultyFileSystem.h"
+#include "velox/common/io/IoStatisticsRuntimeStats.h"
 #include "velox/common/memory/MemoryArbitrator.h"
 #include "velox/common/testutil/TempDirectoryPath.h"
 #include "velox/common/testutil/TestValue.h"
@@ -176,9 +177,22 @@ class TableScanTest : public virtual CudfHiveConnectorTestBase {
 
   static std::unordered_map<std::string, RuntimeMetric>
   getTableScanRuntimeStats(const std::shared_ptr<Task>& task) {
-    VELOX_NYI(
-        "RuntimeStats not yet implemented for the cudf CudfHiveConnector");
-    // return task->taskStats().pipelineStats[0].operatorStats[0].runtimeStats;
+    return task->taskStats().pipelineStats[0].operatorStats[0].runtimeStats;
+  }
+
+  // Verifies I/O is bounded by one footer and one data read of the unique file.
+  static void assertStorageReadStats(
+      const std::unordered_map<std::string, RuntimeMetric>& runtimeStats,
+      int64_t fileSize) {
+    for (const auto key : {
+             io::kStorageReadBytes,
+             cudf_velox::connector::hive::CudfHiveDataSource::
+                 kDwioStorageReadBytes,
+         }) {
+      const auto& metric = runtimeStats.at(std::string(key));
+      EXPECT_GT(metric.sum, 0);
+      EXPECT_LE(metric.sum, 2 * fileSize);
+    }
   }
 
   static int64_t getSkippedStridesStat(const std::shared_ptr<Task>& task) {
@@ -584,6 +598,55 @@ TEST_F(TableScanTest, filterPrunesAllRowGroups) {
   EXPECT_EQ(planStats.at(plan->id()).outputRows, 0);
 }
 
+// Table schemas use lowercase names while the file keeps mixed-case names. The
+// filter-only column must still be read so the pushed-down filter can find it.
+TEST_F(TableScanTest, mixedCaseFileColumnNames) {
+  auto vector = makeRowVector(
+      {"Filter_Col", "Value_Col"},
+      {makeFlatVector<std::string>({"a", "b", "c", "d"}),
+       makeFlatVector<int64_t>({1, 2, 3, 4})});
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), {vector});
+  createDuckDbTable({vector});
+
+  auto rowType = ROW({"filter_col", "value_col"}, {VARCHAR(), BIGINT()});
+  auto outputType = ROW({"value_col"}, {BIGINT()});
+  common::SubfieldFilters subfieldFilters =
+      common::test::SubfieldFiltersBuilder()
+          .add(
+              "filter_col",
+              std::make_unique<common::BytesRange>(
+                  "b",
+                  /*lowerUnbounded*/ false,
+                  /*lowerExclusive*/ false,
+                  "",
+                  /*upperUnbounded*/ true,
+                  /*upperExclusive*/ false,
+                  /*nullAllowed*/ false))
+          .build();
+  auto plan =
+      PlanBuilder()
+          .startTableScan()
+          .outputType(outputType)
+          .tableHandle(makeTableHandle(
+              "parquet_table", rowType, std::move(subfieldFilters), nullptr))
+          .assignments(
+              facebook::velox::exec::test::HiveConnectorTestBase::
+                  allRegularColumns(outputType))
+          .endTableScan()
+          .planNode();
+
+  AssertQueryBuilder(duckDbQueryRunner_)
+      .plan(plan)
+      .connectorSessionProperty(
+          kCudfHiveConnectorId,
+          facebook::velox::connector::hive::HiveConfig::
+              kFileColumnNamesReadAsLowerCaseSession,
+          "true")
+      .splits(makeCudfHiveConnectorSplits({filePath}))
+      .assertResults("SELECT Value_Col FROM tmp WHERE Filter_Col >= 'b'");
+}
+
 INSTANTIATE_TEST_SUITE_P(
     ,
     TableScanTestParameterized,
@@ -595,9 +658,9 @@ INSTANTIATE_TEST_SUITE_P(
 TEST_F(TableScanTest, directBufferInputRawInputBytes) {
   constexpr int kSize = 10;
   auto vector = makeRowVector({
-      makeFlatVector<int64_t>(kSize, folly::identity),
-      makeFlatVector<int64_t>(kSize, folly::identity),
-      makeFlatVector<int64_t>(kSize, folly::identity),
+      makeFlatIdentityVector<int64_t>(kSize),
+      makeFlatIdentityVector<int64_t>(kSize),
+      makeFlatIdentityVector<int64_t>(kSize),
   });
   auto filePath = TempFilePath::create();
   createDuckDbTable({vector});
@@ -637,17 +700,10 @@ TEST_F(TableScanTest, directBufferInputRawInputBytes) {
   // files.
   ASSERT_GE(rawInputBytes, 400);
 
-  // TableScan runtime stats not available with CudfHive connector yet
-#if 0
-  auto overreadBytes =
-  getTableScanRuntimeStats(task).at("overreadBytes").sum;
-  ASSERT_EQ(overreadBytes, 13);
-  ASSERT_EQ(
-      getTableScanRuntimeStats(task).at("storageReadBytes").sum,
-      rawInputBytes + overreadBytes);
-  ASSERT_GT(getTableScanRuntimeStats(task)["totalScanTime"].sum, 0);
-  ASSERT_GT(getTableScanRuntimeStats(task)["ioWaitWallNanos"].sum, 0);
-#endif
+  const auto runtimeStats = getTableScanRuntimeStats(task);
+  assertStorageReadStats(runtimeStats, filePath->fileSize());
+  ASSERT_GT(runtimeStats.at("totalScanTime").sum, 0);
+  ASSERT_GT(runtimeStats.at("ioWaitWallNanos").sum, 0);
 }
 
 TEST_F(TableScanTest, columnAliases) {

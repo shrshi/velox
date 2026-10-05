@@ -26,6 +26,7 @@
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <cuda_runtime_api.h>
@@ -105,18 +106,20 @@ std::unique_ptr<cudf::table> concatenateTables(
   return cudf::concatenate(tableViews, stream, mr);
 }
 
-std::unique_ptr<cudf::table> makeEmptyTable(TypePtr const& inputType) {
+std::unique_ptr<cudf::table> makeEmptyTable(
+    TypePtr const& inputType,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
   std::vector<std::unique_ptr<cudf::column>> emptyColumns;
   for (size_t i = 0; i < inputType->size(); ++i) {
     if (auto const& childType = inputType->childAt(i);
         childType->kind() == TypeKind::ROW) {
-      auto tbl = makeEmptyTable(childType);
+      auto tbl = makeEmptyTable(childType, stream, mr);
       auto structColumn = std::make_unique<cudf::column>(
           cudf::data_type(cudf::type_id::STRUCT),
           0,
           rmm::device_buffer(),
-          cuda::device_buffer<std::byte>{
-              getDefaultStreamForCurrentThread(), get_output_mr()},
+          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
           0,
           tbl->release());
       emptyColumns.push_back(std::move(structColumn));
@@ -136,7 +139,7 @@ std::unique_ptr<cudf::table> getConcatenatedTable(
     rmm::device_async_resource_ref mr) {
   // Check for empty vector
   if (tables.size() == 0) {
-    return makeEmptyTable(tableType);
+    return makeEmptyTable(tableType, stream, mr);
   }
 
   auto inputStreams = std::vector<cuda::stream_ref>();
@@ -172,7 +175,7 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
   std::vector<std::unique_ptr<cudf::table>> concatTables;
   // Check for empty vector
   if (tables.size() == 0) {
-    concatTables.push_back(makeEmptyTable(tableType));
+    concatTables.push_back(makeEmptyTable(tableType, stream, mr));
     return concatTables;
   }
 
@@ -271,7 +274,7 @@ std::vector<CudfVectorPtr> getConcatenatedCudfVectorsBatched(
             pool,
             tableType,
             checkedVectorSize(chunkRows),
-            makeEmptyTable(tableType),
+            makeEmptyTable(tableType, stream, mr),
             stream));
     remainingRows -= chunkRows;
   } while (remainingRows > 0);

@@ -152,7 +152,7 @@ std::unique_ptr<cudf::table> makeTable(
           cudf::data_type{cudf::type_id::INT32},
           static_cast<cudf::size_type>(values.size()),
           std::move(data),
-          cuda::device_buffer<std::byte>{stream, mr},
+          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
           0));
   return std::make_unique<cudf::table>(std::move(columns));
 }
