@@ -287,12 +287,6 @@ class HashJoinBuilder {
     return *this;
   }
 
-  HashJoinBuilder& planNodeRewriter(
-      std::function<core::PlanNodePtr(const core::PlanNodePtr&)> rewriter) {
-    planNodeRewriter_ = std::move(rewriter);
-    return *this;
-  }
-
   HashJoinBuilder& keyTypes(const std::vector<TypePtr>& keyTypes) {
     VELOX_CHECK_NULL(probeType_);
     VELOX_CHECK_NULL(buildType_);
@@ -675,9 +669,7 @@ class HashJoinBuilder {
       bool injectSpill,
       int32_t maxSpillLevel = -1,
       uint32_t maxDriverYieldTimeMs = 0) {
-    auto executionPlan =
-        planNodeRewriter_ ? planNodeRewriter_(planNode) : planNode;
-    AssertQueryBuilder builder(executionPlan, duckDbQueryRunner_);
+    AssertQueryBuilder builder(planNode, duckDbQueryRunner_);
     builder.maxDrivers(numDrivers_);
     if (makeInputSplits_) {
       for (const auto& splitEntry : makeInputSplits_()) {
@@ -854,7 +846,6 @@ class HashJoinBuilder {
 
   std::function<SplitInput()> makeInputSplits_;
   core::PlanNodePtr planNode_;
-  std::function<core::PlanNodePtr(const core::PlanNodePtr&)> planNodeRewriter_;
   std::unordered_map<std::string, std::string> configs_;
 
   JoinResultsVerifier testVerifier_{};
