@@ -163,13 +163,6 @@ RowVectorPtr CudfFromVelox::doGetOutput() {
   // Get a stream from the global stream pool
   auto stream = cudfGlobalStreamPool().get_stream();
 
-  // Conversion preserves the input schema. The Driver adapter currently
-  // supplies the downstream operator's output schema as outputType_, which
-  // can differ from this input (e.g. before an aggregation). Use input->type()
-  // for both CudfVector construction paths below.
-  // TODO: Have the Driver adapter pass the actual CPU->GPU boundary schema
-  // so outputType_ agrees with the input schema.
-
   // cuDF tables with zero columns cannot represent a row count, so we
   // create a CudfVector directly with an empty table, preserving the
   // logical row count. This mirrors the zero-column handling in
@@ -178,7 +171,7 @@ RowVectorPtr CudfFromVelox::doGetOutput() {
     auto emptyTable = std::make_unique<cudf::table>();
     return std::make_shared<CudfVector>(
         input->pool(),
-        input->type(),
+        outputType_,
         input->size(),
         std::move(emptyTable),
         stream);
@@ -196,7 +189,7 @@ RowVectorPtr CudfFromVelox::doGetOutput() {
   const auto size = tbl->num_rows();
 
   return std::make_shared<CudfVector>(
-      input->pool(), input->type(), size, std::move(tbl), stream);
+      input->pool(), outputType_, size, std::move(tbl), stream);
 }
 
 void CudfFromVelox::doClose() {

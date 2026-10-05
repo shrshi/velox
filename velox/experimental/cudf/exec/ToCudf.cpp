@@ -127,6 +127,7 @@ bool CompileState::compile(bool allowCpuFallback) {
       getOperatorProperties);
 
   int32_t operatorsOffset = 0;
+  RowTypePtr previousOutputType;
   for (int32_t operatorIndex = 0; operatorIndex < operators.size();
        ++operatorIndex) {
     std::vector<std::unique_ptr<exec::Operator>> replaceOp;
@@ -149,9 +150,12 @@ bool CompileState::compile(bool allowCpuFallback) {
     auto planNode = resolveOperatorPlanNode(oper);
 
     if (previousOperatorIsNotGpu and thisOpProps.acceptsGpuInput and planNode) {
+      // Use the producer's schema, not the consumer's output or first source:
+      // the consumer may be a fused FilterProject or a join build operator.
+      VELOX_CHECK_NOT_NULL(previousOutputType);
       replaceOp.push_back(
           std::make_unique<CudfFromVelox>(
-              id, planNode->outputType(), ctx, planNode->id() + "-from-velox"));
+              id, previousOutputType, ctx, planNode->id() + "-from-velox"));
     }
     if (not replaceOp.empty()) {
       // from-velox only, because need to inserted before current operator.
@@ -255,6 +259,7 @@ bool CompileState::compile(bool allowCpuFallback) {
           std::move(replaceOp));
       replacementsMade = true;
     }
+    previousOutputType = planNode ? planNode->outputType() : nullptr;
   }
 
   if (debugEnabled) {

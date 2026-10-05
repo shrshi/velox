@@ -347,6 +347,73 @@ TEST_F(AdapterOperatorTest, keptOperatorGetsAppendedOperators) {
   EXPECT_EQ(projStats.operatorStats.count("CudfToVelox"), 1);
 }
 
+TEST_F(AdapterOperatorTest, fromVeloxUsesProducerSchema) {
+  auto data = makeRowVector(
+      {"k", "v"},
+      {makeFlatVector<int32_t>({1, 1, 2}),
+       makeFlatVector<int64_t>({10, 20, 30})});
+
+  // The converter precedes a fused filter/project, whose output drops and
+  // renames columns. The filter's output is not the fused operator's output.
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .filter("k = 1")
+                  .project({"v AS renamed"})
+                  .planNode();
+  AssertQueryBuilder(plan).assertResults(
+      makeRowVector({"renamed"}, {makeFlatVector<int64_t>({10, 20})}));
+
+  // Aggregation changes both the number of columns and their types.
+  plan = PlanBuilder()
+             .values({data})
+             .singleAggregation({}, {"sum(k) AS s"})
+             .planNode();
+  AssertQueryBuilder(plan).assertResults(
+      makeRowVector({"s"}, {makeFlatVector<int64_t>({4})}));
+
+  // A zero-column CPU batch must remain zero-column before count(*).
+  plan = PlanBuilder()
+             .values({makeRowVector(ROW({}, {}), 3)})
+             .singleAggregation({}, {"count(*) AS n"})
+             .planNode();
+  AssertQueryBuilder(plan).assertResults(
+      makeRowVector({"n"}, {makeFlatVector<int64_t>({3})}));
+}
+
+TEST_F(AdapterOperatorTest, fromVeloxUsesFusedCpuProducerSchema) {
+  enableCpuFallback();
+  registerAdapterFirst(std::make_unique<DecliningAdapter>());
+  auto data = makeRowVector(
+      {"k", "v"},
+      {makeFlatVector<int32_t>({1, 1, 2}),
+       makeFlatVector<int64_t>({10, 20, 30})});
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .filter("k = 1")
+                  .project({"v AS renamed"})
+                  .singleAggregation({}, {"sum(renamed) AS s"})
+                  .planNode();
+  AssertQueryBuilder(plan).assertResults(
+      makeRowVector({"s"}, {makeFlatVector<int64_t>({30})}));
+}
+
+TEST_F(AdapterOperatorTest, fromVeloxUsesJoinBuildSchema) {
+  auto probe = makeRowVector(
+      {"k", "v"},
+      {makeFlatVector<int32_t>({1, 2}), makeFlatVector<int64_t>({10, 20})});
+  auto build = makeRowVector({"b"}, {makeFlatVector<int32_t>({2})});
+  auto ids = std::make_shared<core::PlanNodeIdGenerator>();
+  auto buildPlan = PlanBuilder(ids).values({build}).planNode();
+  // The build-side converter needs ROW<b INTEGER>, not the join's output
+  // schema or its first (probe) source's schema.
+  auto plan = PlanBuilder(ids)
+                  .values({probe})
+                  .hashJoin({"k"}, {"b"}, buildPlan, "", {"v"})
+                  .planNode();
+  AssertQueryBuilder(plan).assertResults(
+      makeRowVector({"v"}, {makeFlatVector<int64_t>({20})}));
+}
+
 TEST_F(AdapterOperatorTest, fromVeloxRejectsDeviceInput) {
   // Values is classified as a CPU operator, so compile() places CudfFromVelox
   // after it. A device-resident batch arriving there means the upstream
