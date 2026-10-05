@@ -53,12 +53,12 @@ set(
 )
 velox_resolve_dependency_url(kvikio)
 
-# cuDF terminal streaming finalization from shrshi/cudf, based on main a3cc679.
+# cuDF terminal streaming finalization from shrshi/cudf, main merged 2026-10-05.
 set(VELOX_cudf_VERSION 26.12 CACHE STRING "cudf version")
-set(VELOX_cudf_COMMIT e1b65c99f102dd5460eb5217e384427769914e7d)
+set(VELOX_cudf_COMMIT 0c95367629e9d2e84116204b3860ae1104496bf1)
 set(
   VELOX_cudf_BUILD_SHA256_CHECKSUM
-  257da23b4c2ff0e5a0d9c63915cc0d7a4491d669abc0990d38ddca1bd32904d9
+  6494ed86bc9183cc61efc0ea0f0d93652d6343930b99023eed659c19428669b1
 )
 set(VELOX_cudf_SOURCE_URL "https://github.com/shrshi/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
 velox_resolve_dependency_url(cudf)
