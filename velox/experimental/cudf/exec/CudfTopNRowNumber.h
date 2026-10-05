@@ -74,6 +74,7 @@ class CudfTopNRowNumber : public CudfOperatorBase {
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr);
 
+  const std::shared_ptr<const core::TopNRowNumberNode> node_;
   const int32_t limit_;
   const bool generateRowNumber_;
   const TypePtr inputType_;

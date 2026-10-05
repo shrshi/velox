@@ -710,9 +710,7 @@ CudfWindow::CudfWindow(
           windowNode->id(),
           "CudfWindow",
           nvtx3::rgb{255, 165, 0},
-          NvtxMethodFlag::kAddInput | NvtxMethodFlag::kGetOutput,
-          std::nullopt,
-          windowNode),
+          NvtxMethodFlag::kAddInput | NvtxMethodFlag::kGetOutput),
       windowNode_(windowNode),
       inputRowType_(asRowType(windowNode->inputType())) {
   const auto& inputType = windowNode->inputType();

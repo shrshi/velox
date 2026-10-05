@@ -103,6 +103,7 @@ CudfTopNRowNumber::CudfTopNRowNumber(
           NvtxMethodFlag::kAll,
           std::nullopt,
           node),
+      node_(node),
       limit_(node->limit()),
       generateRowNumber_(node->generateRowNumber()),
       inputType_(node->sources()[0]->outputType()),
