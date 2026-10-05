@@ -1336,7 +1336,7 @@ cudf::column_view GroupbyAggregator::materializeMaskedInput(
 }
 
 std::vector<std::unique_ptr<GroupbyAggregator>> toGroupbyAggregators(
-    const core::AggregationNode& aggregationNode,
+    core::AggregationNode const& aggregationNode,
     core::AggregationNode::Step step,
     TypePtr const& outputType,
     std::vector<VectorPtr> const& constants,

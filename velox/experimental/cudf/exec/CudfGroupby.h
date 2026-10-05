@@ -151,7 +151,7 @@ struct GroupbyAggregator {
 // pass the raw-input mask channels for raw base/partial steps and an empty
 // vector for intermediate/final steps.
 std::vector<std::unique_ptr<GroupbyAggregator>> toGroupbyAggregators(
-    const core::AggregationNode& aggregationNode,
+    core::AggregationNode const& aggregationNode,
     core::AggregationNode::Step step,
     TypePtr const& outputType,
     std::vector<VectorPtr> const& constants,
