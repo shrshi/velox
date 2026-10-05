@@ -192,9 +192,9 @@ void CudfLocalPartition::enqueuePartition(
 
 void CudfLocalPartition::doAddInput(RowVectorPtr input) {
   flushVectorPool();
+  recordOutputStats(input);
   auto cudfVector = std::dynamic_pointer_cast<CudfVector>(input);
   VELOX_CHECK(cudfVector, "Input must be a CudfVector");
-  recordOutputStats(input);
   auto stream = cudfVector->stream();
 
   if (numPartitions_ > 1) {

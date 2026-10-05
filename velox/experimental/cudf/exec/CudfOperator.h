@@ -19,7 +19,6 @@
 #include "velox/experimental/cudf/exec/DebugUtil.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
-#include "velox/experimental/cudf/exec/Utilities.h"
 
 #include "velox/common/base/SpillConfig.h"
 #include "velox/core/PlanNode.h"
