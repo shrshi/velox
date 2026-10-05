@@ -17,14 +17,12 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
-#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
 #include "velox/common/testutil/TestValue.h"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
-#include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/utilities/memory_resource.hpp>

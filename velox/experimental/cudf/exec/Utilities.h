@@ -50,12 +50,6 @@ namespace facebook::velox::cudf_velox {
  * needed
  * @param stream CUDA stream for concatenation and memory management
  * @param mr Memory resource for output allocation
- * Columns with differing encodings across inputs are materialized before
- * concatenation; matching native columns remain native. The returned table has
- * no metadata. Use getConcatenatedCudfVectorsBatched when the output must
- * retain physical encodings; input metadata captured before this call may be
- * stale.
- *
  * @return Single concatenated table
  */
 [[nodiscard]] std::unique_ptr<cudf::table> getConcatenatedTable(
@@ -91,8 +85,7 @@ namespace facebook::velox::cudf_velox {
  * needed
  * @param stream CUDA stream for asynchronous operations and memory management
  * @return Vector of concatenated tables (multiple if input exceeded size
- * limits). Like getConcatenatedTable, mismatched encodings are materialized;
- * use getConcatenatedCudfVectorsBatched to retain the resulting metadata.
+ * limits)
  */
 [[nodiscard]] std::vector<std::unique_ptr<cudf::table>>
 getConcatenatedTableBatched(
