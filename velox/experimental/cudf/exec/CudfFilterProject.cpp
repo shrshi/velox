@@ -18,7 +18,6 @@
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
-#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/Validation.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
@@ -143,6 +142,7 @@ void CudfFilterProject::initialize() {
 
   std::vector<core::TypedExprPtr> allExprs;
   if (hasFilter_) {
+    VELOX_CHECK_NOT_NULL(filter_);
     allExprs.push_back(filter_->filter());
   }
 
@@ -150,7 +150,7 @@ void CudfFilterProject::initialize() {
     const auto& inputType = project_->sources()[0]->outputType();
 
     for (column_index_t i = 0; i < project_->projections().size(); i++) {
-      const auto& projection = project_->projections()[i];
+      auto& projection = project_->projections()[i];
       bool identityProjection = checkAddIdentityProjection(
           projection, inputType, i, identityProjections_);
       if (!identityProjection) {
@@ -165,9 +165,11 @@ void CudfFilterProject::initialize() {
     isIdentityProjection_ = true;
   }
 
-  const auto lazyDereference =
-      dynamic_cast<const core::LazyDereferenceNode*>(project_.get()) != nullptr;
-  VELOX_CHECK(!(lazyDereference && hasFilter_));
+  auto lazyDereference =
+      (dynamic_cast<const core::LazyDereferenceNode*>(project_.get()) !=
+       nullptr);
+  VELOX_CHECK(!(lazyDereference && filter_));
+
   const auto inputType = project_ ? project_->sources()[0]->outputType()
                                   : filter_->sources()[0]->outputType();
 
@@ -211,9 +213,7 @@ void CudfFilterProject::initialize() {
 }
 
 void CudfFilterProject::doAddInput(RowVectorPtr input) {
-  auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
-  VELOX_CHECK_NOT_NULL(cudfInput);
-  input_ = std::move(cudfInput);
+  input_ = std::move(input);
 }
 
 RowVectorPtr CudfFilterProject::doGetOutput() {

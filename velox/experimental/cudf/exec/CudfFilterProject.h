@@ -71,7 +71,8 @@ class CudfFilterProject : public CudfOperatorBase {
   // If true exprs_[0] is a filter and the other expressions are projections
   const bool hasFilter_{false};
 
-  // Cached plan nodes for lazy initialization. Released after initialization.
+  // Cached filter and project node for lazy initialization. After
+  // initialization, they will be reset, and initialized_ will be set to true.
   std::shared_ptr<const core::ProjectNode> project_;
   std::shared_ptr<const core::FilterNode> filter_;
 
