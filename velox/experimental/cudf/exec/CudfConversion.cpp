@@ -58,7 +58,7 @@ RowVectorPtr mergeRowVectors(
 
 cudf::size_type preferredGpuBatchSizeRows(
     const facebook::velox::core::QueryConfig& queryConfig) {
-  constexpr cudf::size_type kDefaultGpuBatchSizeRows = 1000000000;
+  constexpr cudf::size_type kDefaultGpuBatchSizeRows = 100000;
   const auto batchSize = queryConfig.get<int32_t>(
       CudfFromVelox::kGpuBatchSizeRows, kDefaultGpuBatchSizeRows);
   VELOX_CHECK_GT(batchSize, 0, "velox.cudf.gpu_batch_size_rows must be > 0");
@@ -153,6 +153,13 @@ RowVectorPtr CudfFromVelox::doGetOutput() {
   // Get a stream from the global stream pool
   auto stream = cudfGlobalStreamPool().get_stream();
 
+  // Conversion preserves the input schema. The Driver adapter currently
+  // supplies the downstream operator's output schema as outputType_, which
+  // can differ from this input (e.g. before an aggregation). Use input->type()
+  // for both CudfVector construction paths below.
+  // TODO: Have the Driver adapter pass the actual CPU->GPU boundary schema
+  // so outputType_ agrees with the input schema.
+
   // cuDF tables with zero columns cannot represent a row count, so we
   // create a CudfVector directly with an empty table, preserving the
   // logical row count. This mirrors the zero-column handling in
@@ -217,7 +224,7 @@ CudfToVelox::CudfToVelox(
 
 bool CudfToVelox::isPassthroughMode() const {
   return operatorCtx_->driverCtx()->queryConfig().get<bool>(
-      kPassthroughMode, false);
+      kPassthroughMode, true);
 }
 
 void CudfToVelox::doAddInput(RowVectorPtr input) {
