@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/CudfAggregationNode.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfNestedLoopJoin.h"
@@ -95,27 +96,49 @@ bool CompileState::compile(bool allowCpuFallback) {
     const OperatorAdapter* adapter = nullptr;
   };
 
-  auto getOperatorProperties =
-      [&registry, this, ctx](const exec::Operator* op) {
-        OperatorProperties props;
-        auto adapter = registry.findAdapter(op);
-        props.adapter = adapter;
-        if (adapter) {
-          auto planNode = resolveOperatorPlanNode(op);
-          if (planNode) {
-            static_cast<OperatorAdapter::Properties&>(props) =
-                adapter->properties(op, planNode, ctx);
-          }
-        }
-        if (isAnyOf<CudfOperator>(op)) {
-          // CudfOperator is always fully GPU compatible
-          // (runs on GPU, accepts GPU input, produces GPU output).
-          props.canRunOnGPU = true;
-          props.acceptsGpuInput = true;
-          props.producesGpuOutput = true;
-        }
-        return props;
-      };
+  auto getOperatorProperties = [&registry, this, ctx](
+                                   const exec::Operator* op) {
+    OperatorProperties props;
+    auto adapter = registry.findAdapter(op);
+    props.adapter = adapter;
+    auto planNode = resolveOperatorPlanNode(op);
+    if (adapter) {
+      if (planNode) {
+        static_cast<OperatorAdapter::Properties&>(props) =
+            adapter->properties(op, planNode, ctx);
+      }
+    }
+    if (isAnyOf<CudfOperator>(op)) {
+      // CudfOperator is always fully GPU compatible
+      // (runs on GPU, accepts GPU input, produces GPU output).
+      props.canRunOnGPU = true;
+      props.acceptsGpuInput = true;
+      props.producesGpuOutput = true;
+    }
+    // UCX operators live outside cuDF: use their operator names and verify
+    // the explicit transport contract without linking to the UCX library.
+    if (op->operatorType() == "UcxExchange") {
+      auto exchange = dynamic_cast<const core::ExchangeNode*>(planNode.get());
+      VELOX_CHECK(
+          exchange && exchange->transportKind() == core::TransportKind::kUcx);
+      props.canRunOnGPU = true;
+      props.acceptsGpuInput = false;
+      props.producesGpuOutput = true;
+    } else if (op->operatorType() == "cudfPartitionedOutput") {
+      auto output =
+          dynamic_cast<const core::PartitionedOutputNode*>(planNode.get());
+      VELOX_CHECK(
+          output && output->transportKind() == core::TransportKind::kUcx);
+      props.canRunOnGPU = true;
+      props.acceptsGpuInput = true;
+      props.producesGpuOutput = false;
+    }
+    VELOX_USER_CHECK(
+        !dynamic_cast<const CudfAggregationNode*>(planNode.get()) ||
+            props.canRunOnGPU,
+        "Compact aggregation state requires GPU execution; CPU fallback is not supported");
+    return props;
+  };
 
   // caching operator properties
   std::vector<OperatorProperties> opProps(operators.size());
@@ -126,6 +149,7 @@ bool CompileState::compile(bool allowCpuFallback) {
       getOperatorProperties);
 
   int32_t operatorsOffset = 0;
+  RowTypePtr previousOutputType;
   for (int32_t operatorIndex = 0; operatorIndex < operators.size();
        ++operatorIndex) {
     std::vector<std::unique_ptr<exec::Operator>> replaceOp;
@@ -148,9 +172,11 @@ bool CompileState::compile(bool allowCpuFallback) {
     auto planNode = resolveOperatorPlanNode(oper);
 
     if (previousOperatorIsNotGpu and thisOpProps.acceptsGpuInput and planNode) {
+      // The producer schema also handles fused consumers and join build inputs.
+      VELOX_CHECK_NOT_NULL(previousOutputType);
       replaceOp.push_back(
           std::make_unique<CudfFromVelox>(
-              id, planNode->outputType(), ctx, planNode->id() + "-from-velox"));
+              id, previousOutputType, ctx, planNode->id() + "-from-velox"));
     }
     if (not replaceOp.empty()) {
       // from-velox only, because need to inserted before current operator.
@@ -198,8 +224,8 @@ bool CompileState::compile(bool allowCpuFallback) {
         isPureCpuOperator = false;
       }
     } else {
-      // special case for CudfOperator
-      if (isAnyOf<CudfOperator>(oper)) {
+      // Already-GPU operators (including UCX) are kept, not replaced.
+      if (thisOpProps.canRunOnGPU) {
         isPureCpuOperator = false;
       } else {
         // CPU operator without adapter
@@ -244,6 +270,8 @@ bool CompileState::compile(bool allowCpuFallback) {
       VELOX_CHECK(!isPureCpuOperator, "Replacement with cuDF operator failed");
     }
 
+    // Save the schema before replacing operators; earlier pointers can expire.
+    previousOutputType = planNode ? planNode->outputType() : nullptr;
     if (not replaceOp.empty()) {
       // ReplaceOp, to-velox.
       operatorsOffset += replaceOp.size() - 1 + keepOperator;
@@ -284,9 +312,20 @@ struct CudfDriverAdapter {
   // Call operator needed by DriverAdapter
   bool operator()(const exec::DriverFactory& factory, exec::Driver& driver) {
     if (!driver.driverCtx()->queryConfig().get<bool>(
-            CudfConfig::kCudfEnabled, CudfConfig::getInstance().enabled) &&
-        allowCpuFallback_) {
-      return false;
+            CudfConfig::kCudfEnabled, CudfConfig::getInstance().enabled)) {
+      const auto isCompactAggregation = [](const core::PlanNodePtr& node) {
+        return dynamic_cast<const CudfAggregationNode*>(node.get()) != nullptr;
+      };
+      VELOX_USER_CHECK(
+          !std::any_of(
+              factory.planNodes.begin(),
+              factory.planNodes.end(),
+              isCompactAggregation) &&
+              !isCompactAggregation(factory.consumerNode),
+          "Compact aggregation state requires cuDF to be enabled");
+      if (allowCpuFallback_) {
+        return false;
+      }
     }
     auto state = CompileState(factory, driver);
     auto res = state.compile(allowCpuFallback_);
@@ -307,6 +346,8 @@ void registerCudf() {
   if (cudfIsRegistered()) {
     return;
   }
+
+  CudfAggregationNode::registerSerDe();
 
   // Register operator adapters
   registerAllOperatorAdapters();
