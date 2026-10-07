@@ -53,12 +53,12 @@ set(
 )
 velox_resolve_dependency_url(kvikio)
 
-# cudf commit e45d601 from 2026-09-30 (main branch)
+# cudf PR #24494: terminal finalization for streaming groupby
 set(VELOX_cudf_VERSION 26.12 CACHE STRING "cudf version")
-set(VELOX_cudf_COMMIT e45d60141dbe7a5790ee28feb8d9d10c9e0186fc)
+set(VELOX_cudf_COMMIT 0a1a52d8dcb990ffe4af2ac3037777967ae43e08)
 set(
   VELOX_cudf_BUILD_SHA256_CHECKSUM
-  64021c9dbcb307df35dc81409b7a3557da47c8bf1ca151369b4b05a4733424ec
+  bf50134a4a88b98b399308b19a0a6debe98f86faa0bf5ac083dfc5a3bb6d8a3c
 )
 set(VELOX_cudf_SOURCE_URL "https://github.com/rapidsai/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
 velox_resolve_dependency_url(cudf)
