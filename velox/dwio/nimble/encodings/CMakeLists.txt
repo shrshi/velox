@@ -45,6 +45,7 @@ add_library(
   TrivialEncoding.cpp
   subintsplit/CostModel.cpp
   subintsplit/CostModel.h
+  subintsplit/EncodingConfig.h
   subintsplit/BitSection.h
   subintsplit/DeltaTransform.h
   subintsplit/Format.h
@@ -66,11 +67,13 @@ add_library(
   common/EncodingUtils.cpp
   common/EncodingTypeDispatch.h
   selection/EncodingSelectionPolicy.cpp
+  selection/NestedAlpSizeEstimation.cpp
   selection/Statistics.cpp
   views/EncodingView.cpp
   views/DeltaBlockEncodingView.h
   views/EliasFanoEncodingView.h
   views/EncodingViewFactory.cpp
+  views/FsstEncodingView.cpp
   views/HuffmanEncodingView.h
   views/TrivialEncodingView.h
   views/SparseBoolEncodingView.h
@@ -81,6 +84,7 @@ add_library(
   views/MainlyConstantEncodingView.h
   views/NullableEncodingView.h
   views/FixedBitWidthEncodingView.h
+  views/FsstEncodingView.h
   views/FOREncodingView.h
   views/EncodingViewFactory.h
   views/EncodingViewUtils.h
