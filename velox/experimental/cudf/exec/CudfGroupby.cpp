@@ -1347,7 +1347,7 @@ CudfVectorPtr CudfGroupby::finalizeStreamingGroupby() {
   VELOX_CHECK(streamingGroupbyStream_.has_value());
   const auto stream = *streamingGroupbyStream_;
   auto [groupKeys, results] =
-      streamingGroupby_->finalize(stream, get_output_mr());
+      std::move(*streamingGroupby_).finalize_and_release(stream, get_output_mr());
 
   std::vector<std::unique_ptr<cudf::column>> outputColumns;
   auto keyColumns = groupKeys->release();
@@ -1370,10 +1370,6 @@ CudfVectorPtr CudfGroupby::finalizeStreamingGroupby() {
       : std::make_shared<cudf_velox::CudfVector>(
             pool(), outputType_, numRows, std::move(resultTable), stream);
 
-  // The current groupby path synchronizes before dropping its buffered state.
-  // Do the same here so libcudf's persistent allocations cannot be released
-  // while finalization kernels still reference them.
-  stream.synchronize();
   streamingGroupby_.reset();
   streamingGroupbyStream_.reset();
   streamingGroupbyEvent_.reset();
