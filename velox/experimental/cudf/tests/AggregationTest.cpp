@@ -20,12 +20,15 @@
 #include "velox/experimental/cudf/exec/PrestoAggregateFunctions.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 
+#include "velox/common/testutil/TestValue.h"
 #include "velox/dwio/common/tests/utils/BatchMaker.h"
 #include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/type/Timestamp.h"
+
+#include <folly/ScopeGuard.h>
 
 #include <cmath>
 
@@ -1059,6 +1062,64 @@ TEST_F(AggregationTest, finalAggregationStreamsOnAddInput) {
   const auto planStats = toPlanStats(task->taskStats());
   EXPECT_GT(planStats.at(partialAggId).customStats.at("flushRowCount").sum, 0);
   EXPECT_GT(planStats.at(finalAggId).outputRows, 0);
+}
+
+DEBUG_ONLY_TEST_F(
+    AggregationTest,
+    finalAggregationReleasesInputsBeforeAggregate) {
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const bool savedConcat = config.concatOptimizationEnabled;
+  SCOPE_EXIT {
+    config.concatOptimizationEnabled = savedConcat;
+  };
+  // Exercise multiple FINAL inputs even with WXD's large rebatching default.
+  config.concatOptimizationEnabled = false;
+  auto vectors = {
+      makeRowVector({makeFlatVector<int64_t>({1, 2, 1, 3})}),
+      makeRowVector({makeFlatVector<int64_t>({2, 3, 4, 2})}),
+      makeRowVector({makeFlatVector<int64_t>({1, 4, 5, 5})}),
+  };
+  createDuckDbTable(vectors);
+
+  std::weak_ptr<cudf_velox::CudfVector> previousResult;
+  std::weak_ptr<cudf_velox::CudfVector> incomingBatch;
+  size_t concatenations = 0;
+  size_t replacements = 0;
+  SCOPED_TESTVALUE_SET(
+      "CudfGroupby::computeFinalGroupbyStreaming::beforeConcatenate",
+      std::function<void(cudf_velox::CudfVectorPtr*)>([&](auto* result) {
+        ASSERT_NE(*result, nullptr);
+        previousResult = *result;
+        ++concatenations;
+      }));
+  SCOPED_TESTVALUE_SET(
+      "CudfGroupby::computeFinalGroupbyStreaming::beforeReleaseInput",
+      std::function<void(cudf_velox::CudfVectorPtr*)>([&](auto* input) {
+        ASSERT_NE(*input, nullptr);
+        incomingBatch = *input;
+      }));
+  SCOPED_TESTVALUE_SET(
+      "CudfGroupby::computeFinalGroupbyStreaming::beforeAggregate",
+      std::function<void(cudf_velox::CudfVectorPtr*)>([&](auto*) {
+        EXPECT_TRUE(previousResult.expired());
+        EXPECT_TRUE(incomingBatch.expired());
+        ++replacements;
+      }));
+
+  AssertQueryBuilder(duckDbQueryRunner_)
+      .maxDrivers(1)
+      .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, "4")
+      .config(QueryConfig::kMaxPartialAggregationMemory, 1)
+      .plan(
+          PlanBuilder()
+              .values(vectors)
+              .partialAggregation({"c0"}, {"sum(c0)", "count(*)"})
+              .finalAggregation()
+              .planNode())
+      .assertResults("SELECT c0, sum(c0), count(*) FROM tmp GROUP BY 1");
+
+  EXPECT_GE(concatenations, 2);
+  EXPECT_EQ(replacements, concatenations);
 }
 
 TEST_F(AggregationTest, finalAggregationStreamingMixedAggs) {
