@@ -370,7 +370,7 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
             input.type() == cudf_velox::veloxToCudfDataType(resultType));
       }
       addDecimalRawPartialSingleSumRequest(
-          input, requests, false, stream, sumIdx_, castedInput_);
+          tbl, inputIndex, requests, false, stream, sumIdx_, castedInput_);
     } else if (step == core::AggregationNode::Step::kIntermediate) {
       addDecimalDecodedSumCountRequests(
           tbl,
@@ -1347,7 +1347,8 @@ CudfVectorPtr CudfGroupby::finalizeStreamingGroupby() {
   VELOX_CHECK(streamingGroupbyStream_.has_value());
   const auto stream = *streamingGroupbyStream_;
   auto [groupKeys, results] =
-      std::move(*streamingGroupby_).finalize_and_release(stream, get_output_mr());
+      std::move(*streamingGroupby_)
+          .finalize_and_release(stream, {get_output_mr(), get_temp_mr()});
 
   std::vector<std::unique_ptr<cudf::column>> outputColumns;
   auto keyColumns = groupKeys->release();
