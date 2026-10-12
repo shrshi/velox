@@ -226,6 +226,11 @@ block(SCOPE_FOR VARIABLES)
     PRIVATE -Wno-non-virtual-dtor -Wno-missing-field-initializers -Wno-deprecated-copy -Wno-restrict
   )
 
+  # KvikIO's plugin uses partial designated initializers with its own -Werror.
+  if(TARGET kvikio_nic_nsys_plugin)
+    target_compile_options(kvikio_nic_nsys_plugin PRIVATE -Wno-missing-field-initializers)
+  endif()
+
   unset(BUILD_SHARED_LIBS)
   unset(BUILD_TESTING CACHE)
 endblock()
