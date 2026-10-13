@@ -35,7 +35,11 @@ struct StreamingGroupbyAggregator {
 
   virtual void prepareInput(
       cudf::table_view input,
-      std::vector<cudf::column_view>& preparedColumns) = 0;
+      std::vector<cudf::column_view>& preparedColumns,
+      rmm::cuda_stream_view stream) = 0;
+
+  // Release prepared temporaries after their last use has been enqueued.
+  virtual void releaseInput() {}
 
   virtual void addStreamingRequest(
       std::vector<cudf::groupby::streaming_aggregation_request>& requests) = 0;
@@ -85,6 +89,12 @@ struct GroupbyAggregator {
 
   // Release request temporaries after aggregate() has enqueued their last use.
   virtual void releaseInput() {}
+
+  // Finalize one already-merged intermediate state per grouping key.
+  virtual std::unique_ptr<cudf::column> finalize(
+      std::unique_ptr<cudf::column> state,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) = 0;
 
   virtual ~GroupbyAggregator() = default;
 
@@ -164,13 +174,18 @@ class CudfGroupby : public CudfOperatorBase {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr);
 
+  CudfVectorPtr finalizeGroupedStates(
+      std::vector<std::unique_ptr<GroupbyAggregator>>& aggregators);
+
   CudfVectorPtr releaseAndResetBufferedResult();
 
   bool initializeStreamingGroupbyApi(
       const RowTypePtr& inputRowSchema,
       const std::vector<VectorPtr>& constants);
 
-  cudf::table_view makeStreamingGroupbyInputView(cudf::table_view input);
+  cudf::table_view makeStreamingGroupbyInputView(
+      cudf::table_view input,
+      rmm::cuda_stream_view stream);
 
   std::unique_ptr<cudf::groupby::streaming_groupby> createStreamingGroupby(
       size_t capacity);
