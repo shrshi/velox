@@ -13,6 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <algorithm>
+
 #include "velox/experimental/cudf/exec/CudfAggregationNode.h"
 #include "velox/experimental/cudf/exec/CudfPlanRewriter.h"
 
@@ -86,7 +88,8 @@ bool hasCompactOutput(const PlanNodePtr& node) {
     return aggregation->step() == AggregationNode::Step::kPartial ||
         aggregation->step() == AggregationNode::Step::kIntermediate;
   }
-  if (dynamic_cast<const core::LocalPartitionNode*>(node.get())) {
+  if (dynamic_cast<const core::LocalPartitionNode*>(node.get()) ||
+      dynamic_cast<const core::ProjectNode*>(node.get())) {
     for (const auto& source : node->sources()) {
       if (hasCompactOutput(source)) {
         return true;
@@ -106,7 +109,8 @@ PlanNodePtr rewriteNode(
     VELOX_USER_CHECK(
         dynamic_cast<const AggregationNode*>(node.get()) ||
             dynamic_cast<const core::LocalPartitionNode*>(node.get()) ||
-            dynamic_cast<const core::ExchangeNode*>(node.get()),
+            dynamic_cast<const core::ExchangeNode*>(node.get()) ||
+            dynamic_cast<const core::ProjectNode*>(node.get()),
         "Unsupported compact aggregation state source: {} ({})",
         node->name(),
         node->id());
@@ -308,20 +312,81 @@ PlanNodePtr rewriteNode(
     return finish(builder.build());
   }
 
-  // These wrappers may enclose a completed FINAL, but are not state bridges.
   if (const auto* project = dynamic_cast<const core::ProjectNode*>(node.get());
       project && node->name() == "Project") {
-    auto source =
-        rewriteNode(project->sources()[0], project->sources()[0]->outputType());
+    const auto& inputType = project->sources()[0]->outputType();
+    const bool directFields = std::all_of(
+        project->projections().begin(),
+        project->projections().end(),
+        [](const auto& expr) {
+          const auto* field =
+              dynamic_cast<const core::FieldAccessTypedExpr*>(expr.get());
+          return field && field->isInputColumn();
+        });
     VELOX_USER_CHECK(
-        !hasCompactOutput(source),
-        "Unsupported compact aggregation state source: Project ({})",
+        !compactInput || directFields,
+        "Compact aggregation state requires a direct-field Project ({})",
         node->id());
+    RowTypePtr sourceExpected;
+    if (!directFields) {
+      sourceExpected = inputType;
+    } else if (expected) {
+      auto types = inputType->children();
+      std::vector<TypePtr> requiredTypes(types.size());
+      for (size_t i = 0; i < project->projections().size(); ++i) {
+        const auto& field = static_cast<const core::FieldAccessTypedExpr&>(
+            *project->projections()[i]);
+        const auto channel = inputType->getChildIdx(field.name());
+        const auto& required = expected->findChild(project->names()[i]);
+        VELOX_USER_CHECK(
+            !requiredTypes[channel] || *requiredTypes[channel] == *required,
+            "Conflicting compact state requirements for {}",
+            field.name());
+        requiredTypes[channel] = required;
+        types[channel] = required;
+      }
+      sourceExpected = ROW(inputType->names(), std::move(types));
+    }
+    auto source =
+        rewriteNode(project->sources()[0], sourceExpected, compactInput);
+    VELOX_USER_CHECK(
+        directFields || !hasCompactOutput(source),
+        "Compact aggregation state requires a direct-field Project ({})",
+        node->id());
+    if (compactInput || hasCompactOutput(source)) {
+      // Every exchange column must retain its producer-declared state type,
+      // including columns that a consumer would otherwise discard.
+      for (const auto& name : inputType->names()) {
+        VELOX_USER_CHECK(
+            std::any_of(
+                project->projections().begin(),
+                project->projections().end(),
+                [&](const auto& expr) {
+                  return static_cast<const core::FieldAccessTypedExpr&>(*expr)
+                             .name() == name;
+                }),
+            "Compact aggregation Project cannot drop input column: {}",
+            name);
+      }
+    }
     if (source == project->sources()[0]) {
       return finish(node);
     }
-    return finish(core::ProjectNode::Builder(*project).source(source).build());
+    auto projections = project->projections();
+    if (directFields) {
+      for (auto& expr : projections) {
+        const auto& field =
+            static_cast<const core::FieldAccessTypedExpr&>(*expr);
+        expr = std::make_shared<core::FieldAccessTypedExpr>(
+            source->outputType()->findChild(field.name()), field.name());
+      }
+    }
+    return finish(core::ProjectNode::Builder(*project)
+                      .projections(std::move(projections))
+                      .source(source)
+                      .build());
   }
+  // Filters may enclose a completed FINAL, but are not state bridges.
   if (const auto* filter = dynamic_cast<const core::FilterNode*>(node.get())) {
     auto source =
         rewriteNode(filter->sources()[0], filter->sources()[0]->outputType());

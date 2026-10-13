@@ -1189,6 +1189,49 @@ TEST_F(CudfDecimalTest, compactSumGroupedMixedAggregates) {
   }
 }
 
+TEST_F(CudfDecimalTest, compactSumProjectedLocalPartition) {
+  auto input = makeRowVector(
+      {"k", "d"},
+      {makeFlatVector<int32_t>({1, 1, 2, 2, 3, 3}),
+       makeNullableFlatVector<int64_t>(
+           {100, -100, std::nullopt, std::nullopt, 400, std::nullopt},
+           DECIMAL(12, 2))});
+  auto expected = makeRowVector(
+      {"key", "s", "a", "s2"},
+      {makeFlatVector<int32_t>({1, 2, 3}),
+       makeNullableFlatVector<int128_t>({0, std::nullopt, 800}, DECIMAL(38, 2)),
+       makeNullableFlatVector<int64_t>({0, std::nullopt, 400}, DECIMAL(12, 2)),
+       makeNullableFlatVector<int128_t>(
+           {0, std::nullopt, 800}, DECIMAL(38, 2))});
+  auto original =
+      exec::test::PlanBuilder()
+          .values({input, input})
+          .partialAggregation({"k"}, {"sum(d) AS s", "avg(d) AS a"})
+          .project(
+              {"a AS avg_state", "s AS sum_state", "k AS key", "s AS sum_copy"})
+          .localPartition({"key"})
+          .finalAggregation(
+              {"key"},
+              {"sum(sum_state) AS s",
+               "avg(avg_state) AS a",
+               "sum(sum_copy) AS s2"},
+              {{DECIMAL(12, 2)}, {DECIMAL(12, 2)}, {DECIMAL(12, 2)}})
+          .planNode();
+  auto rewritten = CudfPlanRewriter::rewrite(original);
+  const auto& project = rewritten->sources()[0]->sources()[0];
+  ASSERT_NE(dynamic_cast<const core::ProjectNode*>(project.get()), nullptr);
+  EXPECT_EQ(project->id(), original->sources()[0]->sources()[0]->id());
+  EXPECT_EQ(
+      *project->outputType(),
+      *ROW(
+          {"avg_state", "sum_state", "key", "sum_copy"},
+          {VARBINARY(), DECIMAL(38, 2), INTEGER(), DECIMAL(38, 2)}));
+  EXPECT_EQ(*rewritten->outputType(), *original->outputType());
+  EXPECT_EQ(CudfPlanRewriter::rewrite(rewritten), rewritten);
+  exec::test::AssertQueryBuilder(rewritten).maxDrivers(2).assertResults(
+      expected);
+}
+
 TEST_F(CudfDecimalTest, compactSumGlobalNullZeroAndEmpty) {
   const std::vector<std::vector<std::optional<int64_t>>> cases = {
       {100, -100, std::nullopt},
@@ -1451,6 +1494,7 @@ TEST_F(CudfDecimalTest, compactSumUcxFragmentSchemasAndSerde) {
   auto producer = exec::test::PlanBuilder()
                       .values({input})
                       .partialAggregation({"k"}, {"sum(d) AS s", "avg(d) AS a"})
+                      .project({"a AS avg_state", "k", "s AS sum_state"})
                       .partitionedOutput(
                           {"k"},
                           2,
@@ -1464,6 +1508,7 @@ TEST_F(CudfDecimalTest, compactSumUcxFragmentSchemasAndSerde) {
                           producer->outputType(),
                           "Presto",
                           std::string{core::TransportKind::kUcx})
+                      .project({"sum_state AS s", "k", "avg_state AS a"})
                       .finalAggregation(
                           {"k"},
                           {"sum(s) AS s", "avg(a) AS a"},
@@ -1473,19 +1518,29 @@ TEST_F(CudfDecimalTest, compactSumUcxFragmentSchemasAndSerde) {
   auto gpuConsumer = CudfPlanRewriter::rewrite(consumer);
   auto* output =
       dynamic_cast<const core::PartitionedOutputNode*>(gpuProducer.get());
-  auto* exchange =
-      dynamic_cast<const core::ExchangeNode*>(gpuConsumer->sources()[0].get());
+  auto* exchange = dynamic_cast<const core::ExchangeNode*>(
+      gpuConsumer->sources()[0]->sources()[0].get());
   ASSERT_NE(output, nullptr);
   ASSERT_NE(exchange, nullptr);
   EXPECT_EQ(output->name(), producer->name());
-  EXPECT_EQ(exchange->name(), consumer->sources()[0]->name());
+  EXPECT_EQ(exchange->name(), consumer->sources()[0]->sources()[0]->name());
   EXPECT_EQ(output->transportKind(), core::TransportKind::kUcx);
   EXPECT_EQ(exchange->transportKind(), core::TransportKind::kUcx);
   EXPECT_EQ(*output->outputType(), *exchange->outputType());
-  EXPECT_EQ(*output->outputType()->childAt(1), *DECIMAL(38, 2));
-  EXPECT_EQ(*output->outputType()->childAt(2), *VARBINARY());
-  EXPECT_EQ(*producer->outputType()->childAt(1), *VARBINARY());
+  EXPECT_EQ(*output->outputType()->childAt(0), *VARBINARY());
+  EXPECT_EQ(*output->outputType()->childAt(2), *DECIMAL(38, 2));
+  EXPECT_EQ(*producer->outputType()->childAt(2), *VARBINARY());
   EXPECT_EQ(*gpuConsumer->outputType(), *consumer->outputType());
+  EXPECT_EQ(CudfPlanRewriter::rewrite(gpuProducer), gpuProducer);
+  EXPECT_EQ(CudfPlanRewriter::rewrite(gpuConsumer), gpuConsumer);
+  ASSERT_NE(
+      dynamic_cast<const core::ProjectNode*>(gpuProducer->sources()[0].get()),
+      nullptr);
+  ASSERT_NE(
+      dynamic_cast<const core::ProjectNode*>(gpuConsumer->sources()[0].get()),
+      nullptr);
+  EXPECT_EQ(
+      *gpuConsumer->sources()[0]->outputType()->childAt(0), *DECIMAL(38, 2));
 
   Type::registerSerDe();
   core::ITypedExpr::registerSerDe();
@@ -1499,6 +1554,13 @@ TEST_F(CudfDecimalTest, compactSumUcxFragmentSchemasAndSerde) {
   EXPECT_FALSE(aggregation->usesCompactDecimalSum(1));
   EXPECT_EQ(*aggregation->intermediateType(0), *DECIMAL(38, 2));
   EXPECT_EQ(copy->serialize(), gpuConsumer->serialize());
+  auto producerCopy = ISerializable::deserialize<core::PlanNode>(
+      gpuProducer->serialize(), pool());
+  EXPECT_EQ(producerCopy->serialize(), gpuProducer->serialize());
+  EXPECT_EQ(CudfPlanRewriter::rewrite(copy)->serialize(), copy->serialize());
+  EXPECT_EQ(
+      CudfPlanRewriter::rewrite(producerCopy)->serialize(),
+      producerCopy->serialize());
 }
 
 TEST_F(CudfDecimalTest, compactSumRejectsGpuDisabledWithCpuFallback) {
@@ -1578,12 +1640,47 @@ TEST_F(CudfDecimalTest, compactSumRejectsUnsupportedBoundariesAndModifiers) {
       "Compact Decimal64 SUM does not support DISTINCT, ordering or masks");
   auto projected =
       exec::test::PlanBuilder(partial, ids)
-          .project({"s"})
+          .project({"coalesce(s, s) AS s"})
           .finalAggregation({}, {"sum(s) AS s"}, {{DECIMAL(12, 2)}})
           .planNode();
   VELOX_ASSERT_THROW(
       CudfPlanRewriter::rewrite(projected),
-      "Unsupported compact aggregation state source");
+      "Compact aggregation state requires a direct-field Project");
+
+  auto projectedState =
+      exec::test::PlanBuilder(partial, ids).project({"s AS state"}).planNode();
+  VELOX_ASSERT_THROW(
+      CudfPlanRewriter::rewrite(projectedState),
+      "Compact aggregation state requires UCX partitioned output");
+  auto projectedOutput = exec::test::PlanBuilder(projectedState, ids)
+                             .partitionedOutput({}, 1)
+                             .planNode();
+  VELOX_ASSERT_THROW(
+      CudfPlanRewriter::rewrite(projectedOutput),
+      "Compact aggregation state cannot leave a task over non-UCX output");
+  auto droppedInput = exec::test::PlanBuilder()
+                          .exchange(
+                              ROW({"s", "unused"}, {VARBINARY(), VARBINARY()}),
+                              "Presto",
+                              std::string{core::TransportKind::kUcx})
+                          .project({"s"})
+                          .finalAggregation(
+                              {}, {"sum(s) AS s"}, {{DECIMAL(12, 2)}})
+                          .planNode();
+  VELOX_ASSERT_THROW(
+      CudfPlanRewriter::rewrite(droppedInput),
+      "Compact aggregation Project cannot drop input column: unused");
+  auto conflictingAliases =
+      exec::test::PlanBuilder(partial, ids)
+          .project({"s AS sum_state", "s AS avg_state"})
+          .finalAggregation(
+              {},
+              {"sum(sum_state) AS s", "avg(avg_state) AS a"},
+              {{DECIMAL(12, 2)}, {DECIMAL(12, 2)}})
+          .planNode();
+  VELOX_ASSERT_THROW(
+      CudfPlanRewriter::rewrite(conflictingAliases),
+      "Conflicting compact state requirements for s");
 }
 
 TEST_F(CudfDecimalTest, reduceDecimal64SumCountSlicesAndNulls) {
