@@ -74,11 +74,11 @@ set(VELOX_cudf_VERSION 26.08 CACHE STRING "cudf version")
 # GPU input uses cuDF's lifetime-safe asynchronous reads and batched datasource
 # interface, including its exported host worker pool, regardless of the selected
 # S3 reader mode. Keep one pin so both build modes expose the same datasource ABI.
-# Includes terminal streaming groupby finalization backported onto the WXD pin.
-set(VELOX_cudf_COMMIT 8a35901bfce35a32a1a873668d94e350d9bebcb4)
+# Includes terminal finalization and Decimal128 streaming SUM/null-handling fixes.
+set(VELOX_cudf_COMMIT d430dd39f68a4042f5c33c63cceff5c02ab7376e)
 set(
   VELOX_cudf_BUILD_SHA256_CHECKSUM
-  22c22b795f9aa3580b4b5afb44af87a7907a1b01b9217cb086ffcfc347793798
+  5cd32adff0e7cffb325af8a2df090e2546726d5aacb19bb14721a3bcd66021a2
 )
 set(VELOX_cudf_SOURCE_URL "https://github.com/shrshi/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
 velox_resolve_dependency_url(cudf)
