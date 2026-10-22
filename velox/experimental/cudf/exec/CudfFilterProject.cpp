@@ -26,6 +26,7 @@
 #include "velox/common/memory/Memory.h"
 #include "velox/common/testutil/TestValue.h"
 #include "velox/core/Expressions.h"
+#include "velox/exec/Task.h"
 #include "velox/expression/ExprOptimizer.h"
 
 #include <cudf/aggregation.hpp>

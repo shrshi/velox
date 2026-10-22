@@ -883,14 +883,6 @@ RowVectorPtr CudfHashJoinProbe::gatherPendingBatch(cuda::stream_ref stream) {
   while (!pendingIndices_.empty() && rows < maxRows) {
     auto& entry = pendingIndices_.front();
     const auto chunkSize = std::min(maxRows - rows, entry.remaining());
-    LOG(INFO) << "[CUDF_JOIN_GATHER] begin node=" << planNodeId()
-              << " probe=" << this << " buildChunk=" << entry.buildChunkIndex
-              << " maxRows=" << maxRows
-              << " leftIndices=" << entry.leftIndices->size()
-              << " rightIndices=" << entry.rightIndices->size()
-              << " offset=" << entry.offset
-              << " remaining=" << entry.remaining()
-              << " chunkSize=" << chunkSize << " batchRows=" << rows;
     auto leftIndicesCol =
         cudf::column_view{cudf::device_span<const cudf::size_type>{
             entry.leftIndices->data() + entry.offset, chunkSize}};
@@ -903,10 +895,6 @@ RowVectorPtr CudfHashJoinProbe::gatherPendingBatch(cuda::stream_ref stream) {
         rightTables[entry.buildChunkIndex]->view(),
         rightIndicesCol,
         stream);
-    LOG(INFO) << "[CUDF_JOIN_GATHER] end node=" << planNodeId()
-              << " probe=" << this << " buildChunk=" << entry.buildChunkIndex
-              << " offset=" << entry.offset << " chunkSize=" << chunkSize
-              << " outputRows=" << output.numRows;
     tables.push_back(std::move(output.table));
     rows += chunkSize;
     entry.offset += chunkSize;
@@ -974,12 +962,6 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::innerJoin(
         get_temp_mr());
 
     if (!joinNode_->filter()) {
-      LOG(INFO) << "[CUDF_JOIN_INDICES] node=" << planNodeId()
-                << " probe=" << this << " buildChunk=" << i
-                << " probeRows=" << leftTableView.num_rows()
-                << " buildRows=" << rightTableView.num_rows()
-                << " leftIndices=" << leftJoinIndices->size()
-                << " rightIndices=" << rightJoinIndices->size();
       enqueuePendingIndices(
           std::move(leftJoinIndices), std::move(rightJoinIndices), i);
       continue;
