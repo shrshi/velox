@@ -879,8 +879,8 @@ class LogicalFunction : public CudfFunction {
             input->type()->kind(),
             TypeKind::BOOLEAN,
             "Logical function only supports boolean literals");
-        auto boolConst =
-            toConstantVector(input, pool)->as<ConstantVector<bool>>();
+        auto constant = toConstantVector(input, pool);
+        auto* boolConst = constant->as<ConstantVector<bool>>();
         VELOX_CHECK_NOT_NULL(boolConst);
         if (!shortCircuitScalar_ && !boolConst->isNullAt(0)) {
           const bool v = boolConst->valueAt(0);

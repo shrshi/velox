@@ -29,9 +29,13 @@
 #include "velox/functions/prestosql/registration/RegistrationFunctions.h"
 #include "velox/type/Type.h"
 
+#include <cudf/copying.hpp>
+#include <cudf/scalar/scalar.hpp>
+
 #include <folly/ScopeGuard.h>
 #include <gtest/gtest.h>
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -80,6 +84,54 @@ class CudfExpressionSelectionTest : public ::testing::Test {
   std::unique_ptr<core::ExecCtx> execCtx_;
   RowTypePtr rowType_;
 };
+
+TEST_F(CudfExpressionSelectionTest, logicalFunctionVariantConstants) {
+  const std::vector<Variant> values{
+      Variant(false), Variant(true), Variant::null(TypeKind::BOOLEAN)};
+  const std::optional<bool> andResults[3][3] = {
+      {false, false, false},
+      {false, true, std::nullopt},
+      {false, std::nullopt, std::nullopt}};
+  const std::optional<bool> orResults[3][3] = {
+      {false, true, std::nullopt},
+      {true, true, true},
+      {std::nullopt, true, std::nullopt}};
+  const auto stream = cudf::get_default_stream();
+  const auto mr = cudf::get_current_device_resource_ref();
+
+  for (const std::string name : {"and", "or"}) {
+    const auto& expected = name == "and" ? andResults : orResults;
+    for (size_t left = 0; left < values.size(); ++left) {
+      for (size_t right = 0; right < values.size(); ++right) {
+        std::vector<core::TypedExprPtr> inputs;
+        for (auto index : {left, right}) {
+          auto constant = std::make_shared<core::ConstantTypedExpr>(
+              BOOLEAN(), values[index]);
+          ASSERT_FALSE(constant->hasValueVector());
+          inputs.push_back(std::move(constant));
+        }
+        auto expr = std::make_shared<core::CallTypedExpr>(
+            BOOLEAN(), std::move(inputs), name);
+        SCOPED_TRACE(expr->toString());
+        // Bypass constant folding and AST/JIT selection to exercise the
+        // LogicalFunction constructor's temporary-vector ownership.
+        auto function = createCudfFunction(name, expr, pool_.get());
+        ASSERT_NE(function, nullptr);
+        std::vector<ColumnOrView> columns;
+        auto result = function->eval(columns, stream, mr);
+        ASSERT_EQ(asView(result).size(), 1);
+        auto scalar = cudf::get_element(asView(result), 0, stream, mr);
+        ASSERT_EQ(scalar->is_valid(stream), expected[left][right].has_value());
+        if (expected[left][right].has_value()) {
+          EXPECT_EQ(
+              static_cast<cudf::fixed_width_scalar<bool>&>(*scalar).value(
+                  stream),
+              *expected[left][right]);
+        }
+      }
+    }
+  }
+}
 
 TEST_F(CudfExpressionSelectionTest, astRoot) {
   auto prevAst = CudfConfig::getInstance().astExpressionEnabled;
