@@ -17,12 +17,15 @@
 #pragma once
 
 #include "velox/experimental/cudf/exec/CudfOperator.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
 #include "velox/core/PlanNode.h"
 #include "velox/exec/FilterProject.h"
 #include "velox/exec/Operator.h"
 #include "velox/vector/ComplexVector.h"
+
+#include <unordered_map>
 
 namespace facebook::velox::cudf_velox {
 
@@ -59,11 +62,7 @@ class CudfFilterProject : public CudfOperatorBase {
   void doAddInput(RowVectorPtr input) override;
   RowVectorPtr doGetOutput() override;
 
-  void doClose() override {
-    Operator::close();
-    projectEvaluators_.clear();
-    filterEvaluator_.reset();
-  }
+  void doClose() override;
 
  private:
   bool allInputProcessed();
@@ -78,6 +77,9 @@ class CudfFilterProject : public CudfOperatorBase {
 
   std::vector<CudfExpressionPtr> projectEvaluators_;
   CudfExpressionPtr filterEvaluator_;
+
+  // A null event requires a stream wait if recording completion failed.
+  std::unordered_map<cudaStream_t, std::unique_ptr<CudaEvent>> readCompletions_;
 
   std::vector<velox::exec::IdentityProjection> resultProjections_;
   std::vector<velox::exec::IdentityProjection> identityProjections_;

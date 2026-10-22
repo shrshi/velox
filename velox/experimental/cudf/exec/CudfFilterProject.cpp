@@ -24,6 +24,7 @@
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/common/memory/Memory.h"
+#include "velox/common/testutil/TestValue.h"
 #include "velox/core/Expressions.h"
 #include "velox/expression/ExprOptimizer.h"
 
@@ -31,6 +32,9 @@
 #include <cudf/reduction.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/error.hpp>
+
+#include <folly/ScopeGuard.h>
 
 #include <algorithm>
 #include <iostream>
@@ -231,6 +235,22 @@ RowVectorPtr CudfFilterProject::doGetOutput() {
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
   VELOX_CHECK_NOT_NULL(cudfInput);
   auto stream = cudfInput->stream();
+  auto& completion = readCompletions_[stream.get()];
+  if (!completion) {
+    completion = std::make_unique<CudaEvent>(cudaEventDisableTiming);
+  }
+  // Evaluators own constants that may still be read after output is handed off.
+  // Record on exceptional exits too, since evaluation may have submitted work.
+  SCOPE_EXIT {
+    try {
+      completion->recordFrom(stream);
+    } catch (const std::exception& e) {
+      completion.reset();
+      LOG(WARNING) << "Failed to record expression read completion; "
+                   << "cleanup will synchronize the stream instead: "
+                   << e.what();
+    }
+  };
   auto inputTableColumns = cudfInput->release()->release();
   auto outputSize = input_->size();
 
@@ -351,6 +371,33 @@ std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
   }
 
   return outputColumns;
+}
+
+void CudfFilterProject::doClose() {
+  for (const auto& [stream, completion] : readCompletions_) {
+    try {
+      common::testutil::TestValue::adjust(
+          "facebook::velox::cudf_velox::CudfFilterProject::waitForReadCompletion",
+          this);
+      if (completion) {
+        completion->synchronize();
+      } else {
+        CUDF_CUDA_TRY(cudaStreamSynchronize(stream));
+      }
+    } catch (const cudf::fatal_cuda_error& e) {
+      if (!operatorCtx_->task()->error()) {
+        throw;
+      }
+      // A fatal CUDA error has stopped device execution. Preserve the task's
+      // original failure instead of throwing from Driver::CancelGuard cleanup.
+      LOG(WARNING) << "Expression cleanup encountered a fatal CUDA error on "
+                   << "an already failed task: " << e.what();
+    }
+  }
+  readCompletions_.clear();
+  Operator::close();
+  projectEvaluators_.clear();
+  filterEvaluator_.reset();
 }
 
 bool CudfFilterProject::allInputProcessed() {

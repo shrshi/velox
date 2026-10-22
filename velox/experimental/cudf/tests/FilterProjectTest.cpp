@@ -14,12 +14,16 @@
  * limitations under the License.
  */
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/CudfFilterProject.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
+#include "velox/experimental/cudf/expression/AstExpression.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluatorRegistry.h"
 #include "velox/experimental/cudf/expression/PrestoFunctions.h"
 #include "velox/experimental/cudf/tests/CudfFunctionBaseTest.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/common/testutil/TestValue.h"
 #include "velox/core/Expressions.h"
 #include "velox/dwio/common/tests/utils/BatchMaker.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
@@ -30,9 +34,15 @@
 #include "velox/parse/TypeResolver.h"
 #include "velox/type/Time.h"
 
+#include <cudf/utilities/error.hpp>
+
+#include <cuda/stream>
+
 #include <folly/ScopeGuard.h>
 
 #include <atomic>
+#include <chrono>
+#include <future>
 #include <limits>
 
 using namespace facebook::velox;
@@ -41,6 +51,58 @@ using namespace facebook::velox::exec::test;
 using namespace facebook::velox::common::testutil;
 
 namespace {
+
+struct PendingExpressionRead {
+  std::promise<void> entered;
+  std::promise<void> release;
+  std::atomic<bool> destroyed{false};
+  bool submitted{false};
+  bool throwAfterSubmit{false};
+};
+
+// Append deliberately pending work to a real AST evaluation so the lifetime
+// check does not depend on kernel duration or allocator reuse.
+class PendingAstExpression : public cudf_velox::ASTExpression {
+ public:
+  PendingAstExpression(
+      const core::TypedExprPtr& expr,
+      const RowTypePtr& rowType,
+      memory::MemoryPool* pool,
+      const core::QueryConfig& config,
+      PendingExpressionRead& read)
+      : ASTExpression(expr, rowType, pool, config), read_(read) {}
+
+  ~PendingAstExpression() override {
+    read_.destroyed = true;
+  }
+
+  cudf_velox::ColumnOrView eval(
+      std::vector<cudf::column_view> inputs,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr,
+      bool finalize) override {
+    auto output = ASTExpression::eval(std::move(inputs), stream, mr, finalize);
+    if (!read_.submitted) {
+      read_.submitted = true;
+      CUDF_CUDA_TRY(cudaLaunchHostFunc(
+          stream.get(),
+          [](void* data) {
+            auto& read = *static_cast<PendingExpressionRead*>(data);
+            auto released = read.release.get_future();
+            read.entered.set_value();
+            released.wait_for(std::chrono::seconds(10));
+          },
+          &read_));
+      if (read_.throwAfterSubmit) {
+        VELOX_FAIL("Failure after expression submission");
+      }
+    }
+    return output;
+  }
+
+ private:
+  PendingExpressionRead& read_;
+};
 
 template <typename T>
 T getColValue(const std::vector<RowVectorPtr>& input, int col, int32_t index) {
@@ -1792,6 +1854,167 @@ TEST_F(CudfFilterProjectTest, emptyInList) {
   VELOX_ASSERT_THROW(
       AssertQueryBuilder(plan).copyResults(pool()),
       "IN list must not be empty");
+}
+
+TEST_F(CudfFilterProjectTest, closeWaitsForExpressionReads) {
+  using namespace cudf_velox;
+  using namespace std::chrono_literals;
+
+  for (bool throwAfterSubmit : {false, true}) {
+    SCOPED_TRACE(throwAfterSubmit);
+    PendingExpressionRead read;
+    read.throwAfterSubmit = throwAfterSubmit;
+    const std::string evaluatorName = "pending_ast_read";
+    registerCudfExpressionEvaluator(
+        evaluatorName,
+        std::numeric_limits<int>::max(),
+        [](const core::TypedExprPtr&) { return true; },
+        [&](const core::TypedExprPtr& expr,
+            const RowTypePtr& rowType,
+            memory::MemoryPool* pool,
+            const core::QueryConfig& config) {
+          return std::make_shared<PendingAstExpression>(
+              expr, rowType, pool, config, read);
+        });
+    SCOPE_EXIT {
+      getCudfExpressionEvaluatorRegistry().erase(evaluatorName);
+    };
+
+    auto input = makeRowVector({makeFlatVector<int64_t>({1, 2, 3})});
+    auto plan = PlanBuilder().values({input}).project({"c0 + 1"}).planNode();
+    core::PlanFragment fragment;
+    fragment.planNode = plan->sources().front();
+    auto task = Task::create(
+        "expressionReadLifetime",
+        std::move(fragment),
+        0,
+        core::QueryCtx::create(driverExecutor_.get()),
+        Task::ExecutionMode::kParallel);
+    DriverCtx driverCtx(task, 0, 0, 0, 0);
+    CudfFilterProject op(
+        0,
+        &driverCtx,
+        nullptr,
+        std::dynamic_pointer_cast<const core::ProjectNode>(plan));
+    op.initialize();
+
+    int device;
+    CUDF_CUDA_TRY(cudaGetDevice(&device));
+    cuda::stream stream{cuda::device_ref{device}};
+    auto cudfInput = std::make_shared<CudfVector>(
+        pool_.get(),
+        input->type(),
+        input->size(),
+        with_arrow::toCudfTable(input, pool_.get(), stream, get_output_mr()),
+        stream);
+    stream.sync();
+
+    std::future<void> closed;
+    bool released = false;
+    // Release the callback before joining close(), including on assertion
+    // failure.
+    SCOPE_EXIT {
+      if (!released) {
+        read.release.set_value();
+      }
+      if (closed.valid()) {
+        closed.wait();
+      }
+      EXPECT_EQ(cudaStreamSynchronize(stream.get()), cudaSuccess);
+    };
+    op.addInput(cudfInput);
+    RowVectorPtr output;
+    if (throwAfterSubmit) {
+      VELOX_ASSERT_THROW(op.getOutput(), "Failure after expression submission");
+    } else {
+      output = op.getOutput();
+      ASSERT_NE(output, nullptr);
+      op.noMoreInput();
+      EXPECT_TRUE(op.isFinished());
+    }
+    ASSERT_EQ(
+        read.entered.get_future().wait_for(5s), std::future_status::ready);
+    std::promise<void> closing;
+    auto started = closing.get_future();
+    closed = std::async(std::launch::async, [&] {
+      closing.set_value();
+      op.close();
+    });
+    started.wait();
+    EXPECT_EQ(closed.wait_for(50ms), std::future_status::timeout);
+    EXPECT_FALSE(read.destroyed.load());
+    // Output stays owned here, as it would in a local exchange queue.
+    read.release.set_value();
+    released = true;
+    closed.get();
+    EXPECT_TRUE(read.destroyed.load());
+    op.close();
+  }
+}
+
+DEBUG_ONLY_TEST_F(CudfFilterProjectTest, closePreservesOriginalCudaFailure) {
+  using namespace cudf_velox;
+
+  auto input = makeRowVector({makeFlatVector<int64_t>({1, 2, 3})});
+  auto plan = PlanBuilder().values({input}).project({"c0 + 1"}).planNode();
+  core::PlanFragment fragment;
+  fragment.planNode = plan->sources().front();
+  auto task = Task::create(
+      "expressionCleanupFailure",
+      std::move(fragment),
+      0,
+      core::QueryCtx::create(driverExecutor_.get()),
+      Task::ExecutionMode::kParallel);
+  DriverCtx driverCtx(task, 0, 0, 0, 0);
+  CudfFilterProject op(
+      0,
+      &driverCtx,
+      nullptr,
+      std::dynamic_pointer_cast<const core::ProjectNode>(plan));
+  op.initialize();
+
+  int device;
+  CUDF_CUDA_TRY(cudaGetDevice(&device));
+  cuda::stream stream{cuda::device_ref{device}};
+  op.addInput(
+      std::make_shared<CudfVector>(
+          pool_.get(),
+          input->type(),
+          input->size(),
+          with_arrow::toCudfTable(input, pool_.get(), stream, get_output_mr()),
+          stream));
+  auto output = op.getOutput();
+  ASSERT_NE(output, nullptr);
+  // The injected fatal error must not leave real device work outstanding.
+  stream.sync();
+
+  bool fatal = true;
+  int waits = 0;
+  ScopedTestValue hook(
+      "facebook::velox::cudf_velox::CudfFilterProject::waitForReadCompletion",
+      std::function<void(CudfFilterProject*)>([&](CudfFilterProject*) {
+        ++waits;
+        if (fatal) {
+          throw cudf::fatal_cuda_error(
+              "Injected fatal CUDA error", cudaErrorIllegalAddress);
+        }
+        throw cudf::cuda_error(
+            "Injected nonfatal CUDA error", cudaErrorInvalidValue);
+      }));
+
+  // A failure first discovered in close must not turn into query success.
+  EXPECT_THROW(op.close(), cudf::fatal_cuda_error);
+  auto original =
+      std::make_exception_ptr(std::runtime_error("Original failure"));
+  task->setError(original);
+  fatal = false;
+  EXPECT_THROW(op.close(), cudf::cuda_error);
+  fatal = true;
+  EXPECT_NO_THROW(op.close());
+  EXPECT_EQ(task->error(), original);
+  EXPECT_EQ(waits, 3);
+  EXPECT_NO_THROW(op.close());
+  EXPECT_EQ(waits, 3);
 }
 
 TEST_F(CudfFilterProjectTest, round) {
