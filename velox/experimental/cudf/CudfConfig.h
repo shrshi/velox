@@ -199,8 +199,9 @@ struct CudfConfig {
   /// character data overflows 32-bit offsets.
   std::optional<uint64_t> batchSizeMinBytes;
 
-  /// Maximum rows allowed in a concatenated batch (user configurable).
-  /// When not set, cuDF's own `size_type::max()` is used.
+  /// Maximum rows in concatenated batches and lazy inner-join output batches.
+  /// Defaults to and is capped at cuDF's `size_type::max() - 1` to leave room
+  /// for the extra element in string offsets columns.
   std::optional<int32_t> batchSizeMaxThreshold;
   // Query config key for the TopN batch size in the cuDF TopN operator.
   int32_t topNBatchSize{5};

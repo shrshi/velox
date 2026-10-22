@@ -67,15 +67,20 @@ CudaEvent& eventForThread() {
 } // namespace
 
 size_t maxBatchRows() {
+  // String offsets require one more element than the number of rows.
+  constexpr size_t kMaxRows =
+      static_cast<size_t>(std::numeric_limits<cudf::size_type>::max()) - 1;
   const auto& cudfConfig = CudfConfig::getInstance();
   if (cudfConfig.batchSizeMaxThreshold) {
     VELOX_CHECK_GT(
         cudfConfig.batchSizeMaxThreshold.value(),
         0,
         "cuDF max batch size must be positive");
-    return static_cast<size_t>(cudfConfig.batchSizeMaxThreshold.value());
+    return std::min(
+        static_cast<size_t>(cudfConfig.batchSizeMaxThreshold.value()),
+        kMaxRows);
   }
-  return static_cast<size_t>(std::numeric_limits<cudf::size_type>::max());
+  return kMaxRows;
 }
 
 vector_size_t checkedVectorSize(size_t rowCount) {

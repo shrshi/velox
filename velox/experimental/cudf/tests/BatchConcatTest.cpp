@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/exec/CudfBatchConcat.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
 #include "velox/common/base/Exceptions.h"
@@ -28,6 +29,10 @@
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+
+#include <folly/ScopeGuard.h>
+
+#include <limits>
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
@@ -170,6 +175,31 @@ class CudfBatchConcatTest : public OperatorTestBase {
 };
 
 } // namespace
+
+TEST(CudfBatchRowsTest, leavesRoomForStringOffsets) {
+  auto& config = CudfConfig::getInstance();
+  const auto savedMax = config.batchSizeMaxThreshold;
+  SCOPE_EXIT {
+    config.batchSizeMaxThreshold = savedMax;
+  };
+
+  constexpr auto kColumnLimit = std::numeric_limits<cudf::size_type>::max();
+  const auto maxRows = static_cast<size_t>(kColumnLimit) - 1;
+  config.batchSizeMaxThreshold.reset();
+  EXPECT_EQ(maxBatchRows(), maxRows);
+
+  config.batchSizeMaxThreshold = kColumnLimit;
+  EXPECT_EQ(maxBatchRows(), maxRows);
+  config.batchSizeMaxThreshold = kColumnLimit - 1;
+  EXPECT_EQ(maxBatchRows(), maxRows);
+  config.batchSizeMaxThreshold = 10;
+  EXPECT_EQ(maxBatchRows(), 10);
+
+  for (const auto invalid : {0, -1}) {
+    config.batchSizeMaxThreshold = invalid;
+    VELOX_ASSERT_THROW(maxBatchRows(), "cuDF max batch size must be positive");
+  }
+}
 
 TEST_F(CudfBatchConcatTest, singleColumnBearingInputPassesThrough) {
   updateCudfConfig(/*min=*/4, /*max=*/std::nullopt);
