@@ -268,6 +268,50 @@ TEST_F(ToCudfSelectionTest, fallbackDoesNotInsertGpuConversion) {
   EXPECT_EQ(stats.count("CudfOrderBy"), 0);
 }
 
+TEST_F(ToCudfSelectionTest, rowNumberWithLimitFallsBack) {
+  auto input = makeRowVector(
+      {"p", "v"},
+      {makeFlatVector<int64_t>({1, 1, 2, 1}),
+       makeFlatVector<int64_t>({10, 20, 30, 40})});
+
+  auto assertRowNumberFallsBack = [&](const core::PlanNodePtr& plan,
+                                      const RowVectorPtr& expected) {
+    auto task = AssertQueryBuilder(plan)
+                    .config("cudf.enabled", true)
+                    .config(cudf_velox::CudfConfig::kCudfAllowCpuFallback, true)
+                    .assertResults(expected);
+    const auto stats = toOperatorStats(task->taskStats());
+    EXPECT_EQ(stats.count("RowNumber"), 1);
+    EXPECT_EQ(stats.count("CudfWindow"), 0);
+  };
+
+  // Per-partition limit.
+  assertRowNumberFallsBack(
+      PlanBuilder().values({input}).rowNumber({"p"}, 1).planNode(),
+      makeRowVector(
+          {"p", "v", "row_number"},
+          {makeFlatVector<int64_t>({1, 2}),
+           makeFlatVector<int64_t>({10, 30}),
+           makeFlatVector<int64_t>({1, 1})}));
+
+  // No row number column.
+  assertRowNumberFallsBack(
+      PlanBuilder()
+          .values({input})
+          .rowNumber({"p"}, std::nullopt, false)
+          .planNode(),
+      input);
+
+  // Duplicate partition keys, which WindowNode rejects.
+  assertRowNumberFallsBack(
+      PlanBuilder().values({input}).rowNumber({"p", "p"}).planNode(),
+      makeRowVector(
+          {"p", "v", "row_number"},
+          {makeFlatVector<int64_t>({1, 1, 2, 1}),
+           makeFlatVector<int64_t>({10, 20, 30, 40}),
+           makeFlatVector<int64_t>({1, 2, 1, 3})}));
+}
+
 TEST_F(ToCudfSelectionTest, unsupportedTypeBeforeLocalBoundary) {
   auto input = makeRowVector(
       {"k", "m"},

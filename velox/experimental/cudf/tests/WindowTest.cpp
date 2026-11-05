@@ -456,6 +456,34 @@ TEST_F(CudfWindowTest, rowNumberMultiBatch) {
   AssertQueryBuilder(plan).assertResults(expected);
 }
 
+TEST_F(CudfWindowTest, rowNumberOperator) {
+  auto data = makeRowVector(
+      {"p", "v"},
+      {
+          makeNullableFlatVector<int32_t>(
+              {1, std::nullopt, 2, 1, std::nullopt, 2, 1, 3, std::nullopt}),
+          makeFlatVector<int64_t>({0, 1, 2, 3, 4, 5, 6, 7, 8}),
+      });
+
+  for (const auto& partitionKeys :
+       std::vector<std::vector<std::string>>{{"p"}, {}}) {
+    SCOPED_TRACE(
+        fmt::format("partition by ({})", folly::join(", ", partitionKeys)));
+    auto plan = PlanBuilder()
+                    .values(split(data, 3))
+                    .rowNumber(partitionKeys)
+                    .planNode();
+
+    auto expected =
+        AssertQueryBuilder(plan)
+            .config(cudf_velox::CudfConfig::kCudfEnabled, false)
+            .config(cudf_velox::CudfConfig::kCudfAllowCpuFallback, true)
+            .copyResults(pool());
+    // CPU fallback is disabled, so this fails unless RowNumber runs on cuDF.
+    AssertQueryBuilder(plan).assertResults(expected);
+  }
+}
+
 // Multi-column ORDER BY covered in follow-on PR (requires cuDF upgrade).
 TEST_F(CudfWindowTest, DISABLED_multiFunctionPartitionOrder) {
   // Same shape as valuesRowsStreamingWindowBuild (CPU) but non-streaming window
