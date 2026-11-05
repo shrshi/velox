@@ -64,6 +64,7 @@
 #include "velox/exec/NestedLoopJoinProbe.h"
 #include "velox/exec/OrderBy.h"
 #include "velox/exec/PartitionedOutput.h"
+#include "velox/exec/RowNumber.h"
 #include "velox/exec/StreamingAggregation.h"
 #include "velox/exec/TableScan.h"
 #include "velox/exec/Task.h"
@@ -1296,6 +1297,102 @@ class WindowAdapter : public OperatorAdapter {
   }
 };
 
+/// RowNumberAdapter - Replaces a RowNumber without a limit with a CudfWindow
+/// that computes row_number() over the same partition keys.
+class RowNumberAdapter : public OperatorAdapter {
+ public:
+  RowNumberAdapter() : OperatorAdapter("RowNumber") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->is<exec::RowNumber>();
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    auto windowNode = toWindowNode(planNode);
+    if (!windowNode) {
+      LOG_FALLBACK(
+          "RowNumber with a limit, without a row number column, or with duplicate partition keys, PlanNode id: {}",
+          planNode->id());
+      return false;
+    }
+    std::string reason;
+    if (!CudfWindow::canRunOnGPU(*windowNode, &reason)) {
+      LOG_FALLBACK(
+          "RowNumber: {}, PlanNode id: {}",
+          reason.empty() ? "unknown" : reason,
+          planNode->id());
+      return false;
+    }
+    return true;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<CudfWindow>(operatorId, ctx, toWindowNode(planNode)));
+    return result;
+  }
+
+ private:
+  // Returns a WindowNode computing row_number() without ORDER BY, or nullptr
+  // if the RowNumberNode has a limit, does not produce a row number column, or
+  // has duplicate partition keys, which WindowNode rejects.
+  static std::shared_ptr<const core::WindowNode> toWindowNode(
+      const core::PlanNodePtr& planNode) {
+    auto node = std::dynamic_pointer_cast<const core::RowNumberNode>(planNode);
+    if (!node || node->limit().has_value() || !node->generateRowNumber()) {
+      return nullptr;
+    }
+    std::unordered_set<std::string> keyNames;
+    for (const auto& key : node->partitionKeys()) {
+      if (!keyNames.insert(key->name()).second) {
+        return nullptr;
+      }
+    }
+    core::WindowNode::Function rowNumber{
+        std::make_shared<core::CallTypedExpr>(
+            BIGINT(),
+            std::vector<core::TypedExprPtr>{},
+            CudfConfig::getInstance().functionNamePrefix + "row_number"),
+        {core::WindowNode::WindowType::kRows,
+         core::WindowNode::BoundType::kUnboundedPreceding,
+         nullptr,
+         core::WindowNode::BoundType::kCurrentRow,
+         nullptr},
+        false};
+    auto windowNode = std::make_shared<core::WindowNode>(
+        node->id(),
+        node->partitionKeys(),
+        std::vector<core::FieldAccessTypedExprPtr>{},
+        std::vector<core::SortOrder>{},
+        std::vector<std::string>{node->outputType()->names().back()},
+        std::vector<core::WindowNode::Function>{std::move(rowNumber)},
+        false,
+        node->sources()[0]);
+    VELOX_CHECK(
+        *windowNode->outputType() == *node->outputType(),
+        "WindowNode output type {} does not match RowNumberNode output type {}",
+        windowNode->outputType()->toString(),
+        node->outputType()->toString());
+    return windowNode;
+  }
+};
+
 /// GroupIdAdapter - Replaces with CudfGroupId
 class GroupIdAdapter : public OperatorAdapter {
  public:
@@ -1478,6 +1575,7 @@ void registerAllOperatorAdapters() {
   registry.registerAdapter(std::make_unique<CallbackSinkAdapter>());
   registry.registerAdapter(std::make_unique<PartitionedOutputAdapter>());
   registry.registerAdapter(std::make_unique<WindowAdapter>());
+  registry.registerAdapter(std::make_unique<RowNumberAdapter>());
 #ifdef VELOX_ENABLE_UCX_EXCHANGE
   registry.registerAdapter(std::make_unique<UcxExchangeAdapter>());
   registry.registerAdapter(std::make_unique<UcxPartitionedOutputAdapter>());
