@@ -123,7 +123,9 @@ TEST_F(CudfSparkExpressionSelectionTest, isNull) {
               std::make_shared<core::FieldAccessTypedExpr>(type, "value")},
           prefix + "isnull");
 
-      ASSERT_TRUE(FunctionExpression::canEvaluate(expression));
+      ASSERT_TRUE(
+          FunctionExpression::canEvaluate(
+              expression, queryCtx_->queryConfig()));
       ASSERT_EQ(ASTExpression::canEvaluate(expression), !type->isDecimal());
       ASSERT_TRUE(canExprRunOnGpu(expression, nullptr, nullptr));
       auto evaluator = createCudfExpression(
@@ -147,9 +149,13 @@ TEST_F(CudfSparkExpressionSelectionTest, isNullDialectRegistration) {
           std::vector<core::TypedExprPtr>{
               std::make_shared<core::FieldAccessTypedExpr>(INTEGER(), "value")},
           name);
-      EXPECT_EQ(FunctionExpression::canEvaluate(expression), expected);
       EXPECT_EQ(
-          createCudfFunction(name, expression, pool_.get()) != nullptr,
+          FunctionExpression::canEvaluate(expression, queryCtx_->queryConfig()),
+          expected);
+      EXPECT_EQ(
+          createCudfFunction(
+              name, expression, pool_.get(), queryCtx_->queryConfig()) !=
+              nullptr,
           expected);
     };
 
@@ -170,6 +176,31 @@ TEST_F(CudfSparkExpressionSelectionTest, isNullDialectRegistration) {
     if (!prefix.empty()) {
       check(prefix + "is_null", false);
     }
+  }
+}
+
+// Spark trims spaces only, and its split takes a regular expression, so the
+// cuDF Presto versions must not serve a Spark session.
+TEST_F(CudfSparkExpressionSelectionTest, prestoTrimAndSplitStayOnCpu) {
+  unregisterFunctions();
+  registerBuiltinFunctions("");
+  registerSparkFunctions("");
+  for (const auto* sql :
+       {"trim(name)",
+        "ltrim(name)",
+        "rtrim(name)",
+        "split(name, ',')",
+        "split(name, ',', 2)",
+        "split(name, ',+', 2)",
+        "split(name, ',+', -1)",
+        "split(name, ',+', 0)"}) {
+    SCOPED_TRACE(sql);
+    auto expr = parseAndInferTypedExpr(
+        sql,
+        rowType_,
+        execCtx_.get(),
+        {.parseIntegerAsBigint = false, .functionPrefix = ""});
+    EXPECT_FALSE(canExprRunOnGpu(expr, queryCtx_.get(), pool_.get()));
   }
 }
 
