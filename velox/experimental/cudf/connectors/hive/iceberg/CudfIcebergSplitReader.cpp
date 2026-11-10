@@ -632,7 +632,8 @@ void CudfIcebergSplitReader::setupDeleteFileReaders(
             ioStats_,
             runtimeStats,
             /*splitOffset=*/0,
-            icebergSplit_->connectorId));
+            icebergSplit_->connectorId,
+            /*fileReadOps=*/folly::F14FastMap<std::string, std::string>{}));
   }
 
   for (const auto& [deleteFile, keyNames, keyTypes] : equalityDeleteFiles_) {
@@ -757,7 +758,16 @@ void CudfIcebergSplitReader::applyPositionalDeletes(
 void CudfIcebergSplitReader::applyEqualityDeletes(cudf::table_view input) {
   // Apply equality deletes against the running deleteMask_.
   for (auto& reader : equalityDeleteFileReaders_) {
-    reader->applyDeletes(input, readColumnNames_, deleteMaskView_, stream_);
+    reader->applyDeletes(
+        input,
+        readColumnNames_,
+        deleteMaskView_,
+        stream_,
+        preserveNativeTimestamps_
+            ? std::make_optional(
+                  cudfHiveConfig().timestampTypeSession(
+                      connectorQueryCtx_->sessionProperties()))
+            : std::nullopt);
   }
 }
 
