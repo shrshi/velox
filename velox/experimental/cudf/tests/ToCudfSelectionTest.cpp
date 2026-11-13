@@ -238,6 +238,36 @@ TEST_F(ToCudfSelectionTest, timeToVarcharCastFallsBack) {
   EXPECT_EQ(toOperatorStats(task->taskStats()).count("CudfFromVelox"), 0);
 }
 
+TEST_F(ToCudfSelectionTest, outputTypesReasonWithoutFallback) {
+  auto input = makeRowVector({"k"}, {makeFlatVector<int64_t>({1, 2})});
+  auto plan = PlanBuilder()
+                  .values({input})
+                  .project({"map(array[k], array[k]) AS m"})
+                  .planNode();
+
+  VELOX_ASSERT_THROW(
+      AssertQueryBuilder(plan)
+          .config("cudf.enabled", true)
+          .config(cudf_velox::CudfConfig::kCudfAllowCpuFallback, false)
+          .copyResults(pool()),
+      "Replacement with cuDF operator failed: output types are not convertible to cuDF");
+}
+
+TEST_F(ToCudfSelectionTest, inputTypesReasonWithoutFallback) {
+  auto input = makeRowVector(
+      {"k", "m"},
+      {makeFlatVector<int64_t>({1, 2}),
+       makeMapVector<int64_t, int64_t>({{{10, 100}}, {{20, 200}}})});
+  auto plan = PlanBuilder().values({input}).project({"k"}).planNode();
+
+  VELOX_ASSERT_THROW(
+      AssertQueryBuilder(plan)
+          .config("cudf.enabled", true)
+          .config(cudf_velox::CudfConfig::kCudfAllowCpuFallback, false)
+          .copyResults(pool()),
+      "Replacement with cuDF operator failed: input types are not convertible to cuDF");
+}
+
 TEST_F(ToCudfSelectionTest, fallbackDoesNotInsertGpuConversion) {
   auto input = makeRowVector(
       {"k", "m"},
@@ -273,8 +303,8 @@ TEST_F(ToCudfSelectionTest, unsupportedTypeBeforeLocalBoundary) {
       {"k", "m"},
       {makeFlatVector<int64_t>({2, 1}),
        makeMapVector<int64_t, int64_t>({{{20, 200}}, {{10, 100}}})});
-  auto other = makeRowVector({"k"}, {makeFlatVector<int64_t>({3})});
-  auto expected = makeRowVector({"k"}, {makeFlatVector<int64_t>({1, 2, 3})});
+  auto other = makeNamedRowVector("k", makeFlatVector<int64_t>({3}));
+  auto expected = makeNamedRowVector("k", makeFlatVector<int64_t>({1, 2, 3}));
 
   for (bool merge : {false, true}) {
     SCOPED_TRACE(merge ? "LocalMerge" : "LocalPartition");
@@ -459,10 +489,10 @@ TEST_F(ToCudfSelectionTest, prestoDateAddTimestampFallsBack) {
 }
 
 TEST_F(ToCudfSelectionTest, prestoDateTruncTimestampAdjustTimezoneFallsBack) {
-  auto input = makeRowVector(
-      {"event_ts"},
-      {makeFlatVector<Timestamp>(
-          {Timestamp(1767314700, 0), Timestamp(1767318300, 0)}, TIMESTAMP())});
+  auto input = makeNamedRowVector(
+      "event_ts",
+      makeFlatVector<Timestamp>(
+          {Timestamp(1767314700, 0), Timestamp(1767318300, 0)}, TIMESTAMP()));
 
   auto plan = PlanBuilder()
                   .values({input})
@@ -481,10 +511,10 @@ TEST_F(ToCudfSelectionTest, prestoDateTruncTimestampAdjustTimezoneFallsBack) {
 }
 
 TEST_F(ToCudfSelectionTest, prestoDateTruncSubHourAdjustTimezoneUsesCudf) {
-  auto input = makeRowVector(
-      {"event_ts"},
-      {makeFlatVector<Timestamp>(
-          {Timestamp(1767314700, 0), Timestamp(1767318300, 0)}, TIMESTAMP())});
+  auto input = makeNamedRowVector(
+      "event_ts",
+      makeFlatVector<Timestamp>(
+          {Timestamp(1767314700, 0), Timestamp(1767318300, 0)}, TIMESTAMP()));
 
   auto plan = PlanBuilder()
                   .values({input})
@@ -507,10 +537,10 @@ TEST_F(ToCudfSelectionTest, prestoDateTruncSubHourAdjustTimezoneUsesCudf) {
 TEST_F(
     ToCudfSelectionTest,
     nestedPrestoDateTruncTimestampAdjustTimezoneFallsBack) {
-  auto input = makeRowVector(
-      {"event_ts"},
-      {makeFlatVector<Timestamp>(
-          {Timestamp(1767314700, 0), Timestamp(1767318300, 0)}, TIMESTAMP())});
+  auto input = makeNamedRowVector(
+      "event_ts",
+      makeFlatVector<Timestamp>(
+          {Timestamp(1767314700, 0), Timestamp(1767318300, 0)}, TIMESTAMP()));
 
   auto plan = PlanBuilder()
                   .values({input})
@@ -535,11 +565,11 @@ TEST_F(
 }
 
 TEST_F(ToCudfSelectionTest, prestoDateTruncDateAdjustTimezoneUsesCudf) {
-  auto input = makeRowVector(
-      {"event_date"},
-      {makeFlatVector<int32_t>(
+  auto input = makeNamedRowVector(
+      "event_date",
+      makeFlatVector<int32_t>(
           {DATE()->toDays("2026-01-02"), DATE()->toDays("2026-01-03")},
-          DATE())});
+          DATE()));
 
   auto plan = PlanBuilder()
                   .values({input})
@@ -560,9 +590,9 @@ TEST_F(ToCudfSelectionTest, prestoDateTruncDateAdjustTimezoneUsesCudf) {
 // A TIMESTAMP cast to VARCHAR runs on the GPU in UTC and falls back to the CPU
 // when the session prints it in its own time zone or in the legacy form.
 TEST_F(ToCudfSelectionTest, castTimestampToVarcharFallsBackToCpu) {
-  auto input = makeRowVector(
-      {"event_ts"},
-      {makeFlatVector<Timestamp>({Timestamp(1'767'314'700, 0)}, TIMESTAMP())});
+  auto input = makeNamedRowVector(
+      "event_ts",
+      makeFlatVector<Timestamp>({Timestamp(1'767'314'700, 0)}, TIMESTAMP()));
 
   auto plan = PlanBuilder()
                   .values({input})
@@ -598,8 +628,8 @@ TEST_F(ToCudfSelectionTest, castTimestampToVarcharFallsBackToCpu) {
 }
 
 TEST_F(ToCudfSelectionTest, replaceConstantSearchUsesCudf) {
-  auto input = makeRowVector(
-      {"s"}, {makeFlatVector<std::string>({"2021-01-31", "a-b-c", "abc"})});
+  auto input = makeNamedRowVector(
+      "s", makeFlatVector<std::string>({"2021-01-31", "a-b-c", "abc"}));
 
   auto plan = PlanBuilder()
                   .values({input})
@@ -616,8 +646,8 @@ TEST_F(ToCudfSelectionTest, replaceConstantSearchUsesCudf) {
 TEST_F(ToCudfSelectionTest, replaceEmptySearchFallsBack) {
   // The empty-search semantics differ from cudf::strings::replace, so the empty
   // constant search is declined and evaluated on CPU.
-  auto input = makeRowVector(
-      {"s"}, {makeFlatVector<std::string>({"2021-01-31", "a-b-c", "abc"})});
+  auto input = makeNamedRowVector(
+      "s", makeFlatVector<std::string>({"2021-01-31", "a-b-c", "abc"}));
 
   auto plan = PlanBuilder()
                   .values({input})
@@ -655,8 +685,8 @@ TEST_F(ToCudfSelectionTest, replaceNullSearchUsesCudf) {
   // A null constant search is offloaded (not declined), so ReplaceFunction's
   // all-null branch runs on the GPU rather than the call being folded to a null
   // constant upstream. Guards that the hand-written null path is actually live.
-  auto input = makeRowVector(
-      {"s"}, {makeFlatVector<std::string>({"2021-01-31", "a-b-c", "abc"})});
+  auto input = makeNamedRowVector(
+      "s", makeFlatVector<std::string>({"2021-01-31", "a-b-c", "abc"}));
 
   auto plan = PlanBuilder()
                   .values({input})

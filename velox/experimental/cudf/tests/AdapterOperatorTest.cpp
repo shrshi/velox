@@ -28,6 +28,7 @@
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/functions/prestosql/registration/RegistrationFunctions.h"
+#include "velox/type/tests/utils/CustomTypesForTesting.h"
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
@@ -199,10 +200,53 @@ class DecliningAdapter : public cudf_velox::OperatorAdapter {
         "createReplacements() must not be called for a declined operator");
   }
 };
+
+// Accepts FilterProject but declares a key with custom comparison, so the
+// driver adapter must keep the operator on CPU.
+class CustomComparisonKeyAdapter : public cudf_velox::OperatorAdapter {
+ public:
+  CustomComparisonKeyAdapter()
+      : cudf_velox::OperatorAdapter("CustomComparisonKey") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const exec::FilterProject*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/) const override {
+    return true;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<core::TypedExprPtr> comparisonKeys(
+      const core::PlanNodePtr& /*planNode*/) const override {
+    return {std::make_shared<core::FieldAccessTypedExpr>(
+        facebook::velox::test::BIGINT_TYPE_WITH_CUSTOM_COMPARISON(), "c0")};
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/,
+      int32_t /*operatorId*/) const override {
+    VELOX_FAIL(
+        "createReplacements() must not be called for a custom comparison key");
+  }
+};
 } // namespace
 
 TEST_F(AdapterOperatorTest, adapterStatsMergedIntoPlanNode) {
-  auto data = makeRowVector({"c0"}, {makeFlatVector<int32_t>({1, 2, 3, 4, 5})});
+  auto data =
+      makeNamedRowVector("c0", makeFlatVector<int32_t>({1, 2, 3, 4, 5}));
 
   core::PlanNodeId projNodeId;
   auto plan = PlanBuilder()
@@ -226,7 +270,8 @@ TEST_F(AdapterOperatorTest, emptyReplacementIsRejectedWithoutFallback) {
   registerAdapterFirst(
       std::make_unique<EmptyReplacementAdapter>(/*keepOperator=*/false));
 
-  auto data = makeRowVector({"c0"}, {makeFlatVector<int32_t>({1, 2, 3, 4, 5})});
+  auto data =
+      makeNamedRowVector("c0", makeFlatVector<int32_t>({1, 2, 3, 4, 5}));
   auto plan = PlanBuilder().values({data}).project({"c0 * 2 as x"}).planNode();
 
   std::shared_ptr<exec::Task> task;
@@ -240,7 +285,8 @@ TEST_F(AdapterOperatorTest, keptOperatorNeedsNoAppendedOperators) {
   registerAdapterFirst(
       std::make_unique<EmptyReplacementAdapter>(/*keepOperator=*/true));
 
-  auto data = makeRowVector({"c0"}, {makeFlatVector<int32_t>({1, 2, 3, 4, 5})});
+  auto data =
+      makeNamedRowVector("c0", makeFlatVector<int32_t>({1, 2, 3, 4, 5}));
   auto plan = PlanBuilder().values({data}).project({"c0 * 2 as x"}).planNode();
 
   std::shared_ptr<exec::Task> task;
@@ -256,7 +302,8 @@ TEST_F(
       std::make_unique<EmptyReplacementAdapter>(
           /*keepOperator=*/false, /*producesGpuOutput=*/true));
 
-  auto data = makeRowVector({"c0"}, {makeFlatVector<int32_t>({1, 2, 3, 4, 5})});
+  auto data =
+      makeNamedRowVector("c0", makeFlatVector<int32_t>({1, 2, 3, 4, 5}));
   auto plan = PlanBuilder().values({data}).project({"c0 * 2 as x"}).planNode();
 
   std::shared_ptr<exec::Task> task;
@@ -272,7 +319,8 @@ TEST_F(AdapterOperatorTest, emptyReplacementIsRejectedWithCpuFallbackEnabled) {
       std::make_unique<EmptyReplacementAdapter>(
           /*keepOperator=*/false, /*producesGpuOutput=*/true));
 
-  auto data = makeRowVector({"c0"}, {makeFlatVector<int32_t>({1, 2, 3, 4, 5})});
+  auto data =
+      makeNamedRowVector("c0", makeFlatVector<int32_t>({1, 2, 3, 4, 5}));
   auto plan = PlanBuilder().values({data}).project({"c0 * 2 as x"}).planNode();
 
   std::shared_ptr<exec::Task> task;
@@ -285,7 +333,8 @@ TEST_F(AdapterOperatorTest, emptyReplacementIsRejectedWithCpuFallbackEnabled) {
 TEST_F(AdapterOperatorTest, declinedOperatorIsRejectedWithoutFallback) {
   registerAdapterFirst(std::make_unique<DecliningAdapter>());
 
-  auto data = makeRowVector({"c0"}, {makeFlatVector<int32_t>({1, 2, 3, 4, 5})});
+  auto data =
+      makeNamedRowVector("c0", makeFlatVector<int32_t>({1, 2, 3, 4, 5}));
   auto plan = PlanBuilder().values({data}).project({"c0 * 2 as x"}).planNode();
 
   std::shared_ptr<exec::Task> task;
@@ -299,7 +348,8 @@ TEST_F(AdapterOperatorTest, declinedOperatorRunsOnCpuWithFallback) {
   enableCpuFallback();
   registerAdapterFirst(std::make_unique<DecliningAdapter>());
 
-  auto data = makeRowVector({"c0"}, {makeFlatVector<int32_t>({1, 2, 3, 4, 5})});
+  auto data =
+      makeNamedRowVector("c0", makeFlatVector<int32_t>({1, 2, 3, 4, 5}));
   core::PlanNodeId projNodeId;
   auto plan = PlanBuilder()
                   .values({data})
@@ -310,7 +360,7 @@ TEST_F(AdapterOperatorTest, declinedOperatorRunsOnCpuWithFallback) {
   std::shared_ptr<exec::Task> task;
   auto results = AssertQueryBuilder(plan).copyResults(pool(), task);
   facebook::velox::test::assertEqualVectors(
-      makeRowVector({"x"}, {makeFlatVector<int64_t>({2, 4, 6, 8, 10})}),
+      makeNamedRowVector("x", makeFlatVector<int64_t>({2, 4, 6, 8, 10})),
       results);
 
   auto stats = toPlanStats(task->taskStats());
@@ -323,7 +373,8 @@ TEST_F(AdapterOperatorTest, declinedOperatorRunsOnCpuWithFallback) {
 TEST_F(AdapterOperatorTest, keptOperatorGetsAppendedOperators) {
   registerAdapterFirst(std::make_unique<AppendingAdapter>());
 
-  auto data = makeRowVector({"c0"}, {makeFlatVector<int32_t>({1, 2, 3, 4, 5})});
+  auto data =
+      makeNamedRowVector("c0", makeFlatVector<int32_t>({1, 2, 3, 4, 5}));
   core::PlanNodeId projNodeId;
   auto plan = PlanBuilder()
                   .values({data})
@@ -335,7 +386,7 @@ TEST_F(AdapterOperatorTest, keptOperatorGetsAppendedOperators) {
   auto results = AssertQueryBuilder(plan).copyResults(pool(), task);
 
   facebook::velox::test::assertEqualVectors(
-      makeRowVector({"x"}, {makeFlatVector<int64_t>({2, 4, 6, 8, 10})}),
+      makeNamedRowVector("x", makeFlatVector<int64_t>({2, 4, 6, 8, 10})),
       results);
 
   // All three operators must report under the original plan node.
@@ -360,7 +411,7 @@ TEST_F(AdapterOperatorTest, fromVeloxRejectsDeviceInput) {
         pool(), asRowType(input->type()), numRows, std::move(table), stream);
   };
   auto deviceBatch = uploadToDevice(
-      makeRowVector({"c0"}, {makeFlatVector<int64_t>({1, 2, 3})}));
+      makeNamedRowVector("c0", makeFlatVector<int64_t>({1, 2, 3})));
   auto plan =
       PlanBuilder().values({deviceBatch}).project({"c0 + 1 as x"}).planNode();
   VELOX_ASSERT_THROW(
@@ -368,7 +419,7 @@ TEST_F(AdapterOperatorTest, fromVeloxRejectsDeviceInput) {
       "CudfFromVelox received a device-resident CudfVector");
 
   // The check applies to every input, not only the first one.
-  auto hostBatch = makeRowVector({"c0"}, {makeFlatVector<int64_t>({4, 5, 6})});
+  auto hostBatch = makeNamedRowVector("c0", makeFlatVector<int64_t>({4, 5, 6}));
   plan = PlanBuilder()
              .values({hostBatch, deviceBatch})
              .project({"c0 + 1 as x"})
@@ -376,4 +427,40 @@ TEST_F(AdapterOperatorTest, fromVeloxRejectsDeviceInput) {
   VELOX_ASSERT_THROW(
       AssertQueryBuilder(plan).copyResults(pool()),
       "CudfFromVelox received a device-resident CudfVector");
+}
+
+// A declared key with custom comparison keeps the operator on CPU.
+TEST_F(AdapterOperatorTest, customComparisonKeyIsRejectedWithoutFallback) {
+  registerAdapterFirst(std::make_unique<CustomComparisonKeyAdapter>());
+
+  auto data = makeRowVector({"c0"}, {makeFlatVector<int64_t>({1, 2, 3, 4, 5})});
+  auto plan = PlanBuilder().values({data}).project({"c0 * 2 as x"}).planNode();
+
+  VELOX_ASSERT_THROW(
+      AssertQueryBuilder(plan).copyResults(pool()),
+      "Replacement with cuDF operator failed: keys need custom comparison");
+}
+
+TEST_F(AdapterOperatorTest, customComparisonKeyRunsOnCpuWithFallback) {
+  enableCpuFallback();
+  registerAdapterFirst(std::make_unique<CustomComparisonKeyAdapter>());
+
+  auto data = makeRowVector({"c0"}, {makeFlatVector<int64_t>({1, 2, 3, 4, 5})});
+  core::PlanNodeId projNodeId;
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .project({"c0 * 2 as x"})
+                  .capturePlanNodeId(projNodeId)
+                  .planNode();
+
+  std::shared_ptr<exec::Task> task;
+  auto results = AssertQueryBuilder(plan).copyResults(pool(), task);
+  facebook::velox::test::assertEqualVectors(
+      makeRowVector({"x"}, {makeFlatVector<int64_t>({2, 4, 6, 8, 10})}),
+      results);
+
+  auto stats = toPlanStats(task->taskStats());
+  auto& projStats = stats.at(projNodeId);
+  EXPECT_EQ(projStats.operatorStats.count("FilterProject"), 1);
+  EXPECT_EQ(projStats.operatorStats.count("CudfFilterProject"), 0);
 }
