@@ -128,21 +128,17 @@ void CudfNestedLoopJoinBuild::buildAndPublish(
   // captures this exact completion point before `stream` can be recycled
   // by cudfGlobalStreamPool() for unrelated work. Every probe operator
   // instance/batch just waits on this same event before reading buildData_
-  // (see CudfNestedLoopJoinProbe::waitForBuildReady()). `stream` is also
-  // published in CudfJoinBuildResult below: buildData_'s eventual free is
-  // stream-ordered on `stream` (it was allocated here), so every probe read
-  // makes `stream` wait on its own completion first (see
-  // CudfNestedLoopJoinProbe::recordReadCompletion()), ensuring that free
-  // can't run before all such reads are done.
+  // (see waitForBuildReady()). Each probe operator instance host-waits for
+  // its own reads before it drops its reference to the build data (see
+  // CudfNestedLoopJoinProbe::doClose()), so the data can be freed in any
+  // stream's order.
   auto buildReadyEvent = std::make_shared<CudaEvent>(cudaEventDisableTiming);
   buildReadyEvent->recordFrom(stream);
 
   // Transfer build data to bridge - this will unblock probe operators.
   getCudfJoinBridge<CudfNestedLoopJoinBridge>(*operatorCtx_)
       ->setData(
-          {{std::move(table), buildRowCount},
-           stream,
-           std::move(buildReadyEvent)});
+          {{std::move(table), buildRowCount}, std::move(buildReadyEvent)});
 }
 
 // ============================================================================
@@ -227,15 +223,11 @@ void CudfNestedLoopJoinProbe::initialize() {
 }
 
 void CudfNestedLoopJoinProbe::doClose() {
+  // Host-wait for this instance's reads before releasing the state they use.
+  // buildData_ is shared, so whichever holder drops the last reference may
+  // free it in any stream's order.
+  readTracker_.waitForCompletion();
   Operator::close();
-  // No explicit stream sync needed here: every read of buildData_/
-  // buildPrecomputed_/scalars_/buildMatchedFlags_ already called
-  // recordReadCompletion(), which makes buildStream_ wait on that read's
-  // completion. buildData_'s eventual stream-ordered free is enqueued on
-  // buildStream_ too (it was allocated there), so CUDA's in-order stream
-  // execution guarantees that free can't run before any of those reads -
-  // whichever probe instance's reset() below actually triggers it. See
-  // recordReadCompletion().
   buildData_.reset();
   probeMatchedFlags_.reset();
   buildMatchedFlags_.reset();
@@ -361,7 +353,6 @@ exec::BlockingReason CudfNestedLoopJoinProbe::isBlocked(
 
   buildData_ = std::move(buildResult->payload);
   buildReadyEvent_ = std::move(buildResult->buildReadyEvent);
-  buildStream_ = buildResult->buildStream;
 
   if (buildData_->rowCount == 0) {
     buildEmpty_ = true;
@@ -387,7 +378,7 @@ exec::BlockingReason CudfNestedLoopJoinProbe::isBlocked(
   // since the build table is fixed for the lifetime of this probe operator).
   if (hasFilter_ && !rightPrecomputeInstructions_.empty() && !buildEmpty_) {
     auto precomputeStream = cudfGlobalStreamPool().get_stream();
-    waitForBuildReady(precomputeStream);
+    waitForBuildReady(buildReadyEvent_, precomputeStream);
     auto buildColumnViews = tableViewToColumnViews(buildData_->table->view());
     buildPrecomputed_ = precomputeSubexpressions(
         buildColumnViews,
@@ -401,40 +392,6 @@ exec::BlockingReason CudfNestedLoopJoinProbe::isBlocked(
   }
 
   return exec::BlockingReason::kNotBlocked;
-}
-
-void CudfNestedLoopJoinProbe::waitForBuildReady(cuda::stream_ref probeStream) {
-  if (buildReadyEvent_ != nullptr) {
-    // joinWithBuildBatch() is called once per probe input batch, and each
-    // call gets a fresh stream from cudfGlobalStreamPool(). The event was
-    // already recorded once by the build side (see
-    // CudfNestedLoopJoinBuild::buildAndPublish()); every probe stream that
-    // reads build-side data just needs to wait on it, not just the first
-    // one - otherwise later batches could start reading before the build
-    // data is actually visible on their stream. Matches
-    // CudfHashJoinProbe::waitForBuildReady().
-    buildReadyEvent_->waitOn(probeStream);
-  }
-}
-
-void CudfNestedLoopJoinProbe::recordReadCompletion(
-    cuda::stream_ref probeStream) {
-  if (buildStream_.has_value()) {
-    // buildData_'s underlying device memory is allocated on buildStream_
-    // (see CudfNestedLoopJoinBuild::buildAndPublish()), so its eventual free
-    // is stream-ordered there too, regardless of which probe instance's
-    // reference-drop actually triggers it. Recording a completion event
-    // from probeStream and waiting on it from buildStream_ chains a
-    // dependency: buildStream_ cannot proceed past this point (including
-    // to the eventual free) until this read has finished. Every probe
-    // batch/instance calls this after reading build-side state, so
-    // buildStream_ accumulates a wait for every one of them - matches
-    // CudfHashJoinProbe's cudaEvent_/buildStream_ pattern.
-    if (!cudaEvent_) {
-      cudaEvent_ = std::make_unique<CudaEvent>();
-    }
-    cudaEvent_->recordFrom(probeStream).waitOn(buildStream_.value());
-  }
 }
 
 std::pair<std::unique_ptr<cudf::column>, std::unique_ptr<cudf::column>>
@@ -641,7 +598,6 @@ std::unique_ptr<cudf::table> CudfNestedLoopJoinProbe::joinWithBuildBatch(
         cudf::out_of_bounds_policy::DONT_CHECK,
         stream);
 
-    recordReadCompletion(stream);
     return std::make_unique<cudf::table>(std::move(outCols));
   }
 
@@ -670,7 +626,6 @@ std::unique_ptr<cudf::table> CudfNestedLoopJoinProbe::joinWithBuildBatch(
   outputLayout_.scatterProbeInputColumns(outCols, allCols, 0);
   outputLayout_.scatterBuildInputColumns(outCols, allCols, numProbeCols);
 
-  recordReadCompletion(stream);
   return std::make_unique<cudf::table>(std::move(outCols));
 }
 
@@ -756,7 +711,6 @@ RowVectorPtr CudfNestedLoopJoinProbe::emitBuildMismatchRows(
 
   finished_ = true;
   if (numUnmatched == 0) {
-    recordReadCompletion(stream);
     return nullptr;
   }
 
@@ -773,7 +727,6 @@ RowVectorPtr CudfNestedLoopJoinProbe::emitBuildMismatchRows(
 
   auto out = std::make_unique<cudf::table>(std::move(outCols));
   auto size = static_cast<vector_size_t>(out->num_rows());
-  recordReadCompletion(stream);
   return std::make_shared<CudfVector>(
       operatorCtx_->pool(), outputType_, size, std::move(out), stream);
 }
@@ -786,9 +739,13 @@ RowVectorPtr CudfNestedLoopJoinProbe::doGetOutput() {
         !buildMismatchEmitted_) {
       buildMismatchEmitted_ = true;
       auto stream = cudfGlobalStreamPool().get_stream();
+      readTracker_.registerStream(stream);
+      SCOPE_EXIT {
+        readTracker_.recordCompletion(stream);
+      };
       // Fresh pool stream - must wait for the build-ready event before
       // emitBuildMismatchRows() reads buildData_.
-      waitForBuildReady(stream);
+      waitForBuildReady(buildReadyEvent_, stream);
       return emitBuildMismatchRows(stream);
     }
     if (noMoreInput_) {
@@ -801,11 +758,15 @@ RowVectorPtr CudfNestedLoopJoinProbe::doGetOutput() {
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
   VELOX_CHECK_NOT_NULL(cudfInput);
   auto stream = cudfInput->stream();
+  readTracker_.registerStream(stream);
+  SCOPE_EXIT {
+    readTracker_.recordCompletion(stream);
+  };
   lastProbeStream_ = stream;
   // Wait once here for the rest of doGetOutput(): the LeftSemiProject path
   // below and joinWithBuildBatch() further down both read buildData_ on
   // this same stream.
-  waitForBuildReady(stream);
+  waitForBuildReady(buildReadyEvent_, stream);
 
   // LeftSemiProject: emit all probe rows with a boolean match column.
   if (joinType_ == core::JoinType::kLeftSemiProject) {
@@ -914,10 +875,6 @@ RowVectorPtr CudfNestedLoopJoinProbe::doGetOutput() {
     auto result = std::make_unique<cudf::table>(std::move(outCols));
     input_.reset();
 
-    // Unconditional even though buildData_/buildPrecomputed_ are only
-    // actually read in the hasFilter_ branch above - a harmless no-op link
-    // in the other case, and much simpler than conditionally tracking it.
-    recordReadCompletion(stream);
     auto size = static_cast<vector_size_t>(result->num_rows());
     return makeJoinOutput(
         operatorCtx_->pool(), outputType_, size, std::move(result), stream);

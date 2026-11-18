@@ -39,6 +39,8 @@
 
 namespace facebook::velox::cudf_velox {
 
+class CudaEvent;
+
 /// Returns the INT32 column [0, 1, ..., numRows - 1].
 std::unique_ptr<cudf::column> rowIndexSequence(
     cudf::size_type numRows,
@@ -122,6 +124,52 @@ class CudfJoinMatchTracker {
       rmm::device_async_resource_ref mr);
 
   std::unique_ptr<cudf::column> flags_;
+};
+
+/// Makes stream wait on buildReadyEvent, if set, before stream reads build-side
+/// data. Every probe stream must wait, not only the first one, or its reads
+/// could start before the build data is ready. See
+/// CudfJoinBuildResult::buildReadyEvent.
+void waitForBuildReady(
+    const std::shared_ptr<CudaEvent>& buildReadyEvent,
+    cuda::stream_ref stream);
+
+/// Tracks the streams on which a probe driver reads build-side data or its own
+/// device state, so that it can host-wait for those reads before releasing
+/// that data.
+class CudfJoinReadTracker {
+ public:
+  /// Registers a stream that is about to read the tracked data. Must be called
+  /// before submitting those reads so that creating the stream's completion
+  /// event cannot fail once work is in flight.
+  void registerStream(cuda::stream_ref stream);
+
+  /// Records the stream's completion event after this operator's last read on
+  /// it has been submitted. Re-recording on a reused stream is sufficient
+  /// because stream ordering makes the latest recording cover earlier batches.
+  void recordCompletion(cuda::stream_ref stream) noexcept;
+
+  /// Host-waits for every registered stream's reads, then clears the tracker
+  /// so later calls do not wait again.
+  void waitForCompletion();
+
+ private:
+  struct ReadStream {
+    cuda::stream_ref stream;
+    std::unique_ptr<CudaEvent> completion;
+    /// Registered but not yet recorded. Only stays true if recording failed,
+    /// in which case cleanup falls back to synchronizing the whole stream.
+    bool pending{false};
+  };
+
+  ReadStream* findReadStream(cuda::stream_ref stream);
+
+  /// One reusable completion event per stream this probe instance has read
+  /// shared or operator-owned state on. Streams are tracked independently so
+  /// probe batches on different pool streams can overlap; they only converge
+  /// in waitForCompletion(). Bounded by the global stream pool size, so a
+  /// linear search is sufficient.
+  std::vector<ReadStream> readStreams_;
 };
 
 /// Makes stream wait for the work submitted so far on each probe stream that

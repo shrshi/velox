@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfJoinProbe.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include <cudf/binaryop.hpp>
@@ -27,6 +28,8 @@
 #include <cudf/search.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/utilities/span.hpp>
+
+#include <algorithm>
 
 namespace facebook::velox::cudf_velox {
 
@@ -125,6 +128,58 @@ void CudfJoinMatchTracker::orFlags(
   // can race the kernel. Drain `stream` before the move-assign.
   stream.sync();
   flags_ = std::move(updatedFlags);
+}
+
+void waitForBuildReady(
+    const std::shared_ptr<CudaEvent>& buildReadyEvent,
+    cuda::stream_ref stream) {
+  if (buildReadyEvent != nullptr) {
+    buildReadyEvent->waitOn(stream);
+  }
+}
+
+CudfJoinReadTracker::ReadStream* CudfJoinReadTracker::findReadStream(
+    cuda::stream_ref stream) {
+  auto it = std::find_if(
+      readStreams_.begin(), readStreams_.end(), [&](const ReadStream& rs) {
+        return rs.stream.get() == stream.get();
+      });
+  return it == readStreams_.end() ? nullptr : &*it;
+}
+
+void CudfJoinReadTracker::registerStream(cuda::stream_ref stream) {
+  auto* readStream = findReadStream(stream);
+  if (readStream == nullptr) {
+    readStream = &readStreams_.emplace_back(
+        ReadStream{
+            stream, std::make_unique<CudaEvent>(cudaEventDisableTiming)});
+  }
+  readStream->pending = true;
+}
+
+void CudfJoinReadTracker::recordCompletion(cuda::stream_ref stream) noexcept {
+  auto* readStream = findReadStream(stream);
+  if (readStream == nullptr) {
+    return;
+  }
+  try {
+    readStream->completion->recordFrom(stream);
+    readStream->pending = false;
+  } catch (const std::exception& e) {
+    LOG(WARNING) << "Failed to record cuDF join probe read completion; "
+                 << "cleanup will synchronize the stream instead: " << e.what();
+  }
+}
+
+void CudfJoinReadTracker::waitForCompletion() {
+  for (auto& readStream : readStreams_) {
+    if (readStream.pending) {
+      readStream.stream.sync();
+    } else {
+      readStream.completion->synchronize();
+    }
+  }
+  readStreams_.clear();
 }
 
 void joinProbeStreams(

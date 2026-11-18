@@ -84,53 +84,9 @@ vector_size_t filteredOutputNumRows(
 
 } // namespace
 
-CudfHashJoinProbe::ReadStream* CudfHashJoinProbe::findReadStream(
-    cuda::stream_ref stream) {
-  auto it = std::find_if(
-      readStreams_.begin(), readStreams_.end(), [&](const ReadStream& rs) {
-        return rs.stream.get() == stream.get();
-      });
-  return it == readStreams_.end() ? nullptr : &*it;
-}
-
-void CudfHashJoinProbe::registerReadStream(cuda::stream_ref stream) {
-  auto* readStream = findReadStream(stream);
-  if (readStream == nullptr) {
-    readStream = &readStreams_.emplace_back(
-        ReadStream{
-            stream, std::make_unique<CudaEvent>(cudaEventDisableTiming)});
-  }
-  readStream->pending = true;
-}
-
-void CudfHashJoinProbe::recordReadCompletion(cuda::stream_ref stream) noexcept {
-  auto* readStream = findReadStream(stream);
-  if (readStream == nullptr) {
-    return;
-  }
-  try {
-    readStream->completion->recordFrom(stream);
-    readStream->pending = false;
-  } catch (const std::exception& e) {
-    LOG(WARNING) << "Failed to record hash join probe read completion; "
-                 << "cleanup will synchronize the stream instead: " << e.what();
-  }
-}
-
-void CudfHashJoinProbe::waitForReadCompletion() {
-  for (auto& readStream : readStreams_) {
-    if (readStream.pending) {
-      readStream.stream.sync();
-    } else {
-      readStream.completion->synchronize();
-    }
-  }
-  readStreams_.clear();
-}
-
 void CudfHashJoinProbe::doClose() {
   Operator::close();
-  waitForReadCompletion();
+  readTracker_.waitForCompletion();
   filterEvaluator_.reset();
   scalars_.clear();
   tree_ = {};
@@ -242,7 +198,6 @@ void CudfHashJoinBuild::buildAndPublish(std::vector<CudfVectorPtr> inputs) {
   getCudfJoinBridge<CudfHashJoinBridge>(*operatorCtx_)
       ->setData(
           {std::make_pair(std::move(shared_tbls), std::move(hashObjects)),
-           stream,
            std::move(buildReadyEvent)});
 }
 
@@ -262,8 +217,7 @@ CudfHashJoinProbe::CudfHashJoinProbe(
           joinNode),
       joinNode_(joinNode),
       probeType_(joinNode_->sources()[0]->outputType()),
-      buildType_(joinNode_->sources()[1]->outputType()),
-      cudaEvent_(std::make_unique<CudaEvent>(cudaEventDisableTiming)) {
+      buildType_(joinNode_->sources()[1]->outputType()) {
   auto const& leftKeys = joinNode_->leftKeys(); // probe keys
   auto const& rightKeys = joinNode_->rightKeys(); // build keys
 
@@ -323,12 +277,6 @@ CudfHashJoinProbe::CudfHashJoinProbe(
       VLOG(1) << "Right index to gather " << i << ": "
               << outputLayout_.buildColumnIndices()[i];
     }
-  }
-}
-
-void CudfHashJoinProbe::waitForBuildReady(cuda::stream_ref stream) {
-  if (buildReadyEvent_ != nullptr) {
-    buildReadyEvent_->waitOn(stream);
   }
 }
 
@@ -564,10 +512,6 @@ CudfHashJoinProbe::JoinOutput CudfHashJoinProbe::unfilteredOutput(
       outputType_->names().size(),
       oobPolicy,
       stream);
-  if (buildStream_.has_value()) {
-    // Ensure deallocation of build table happens after probe gathers
-    cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
-  }
   stream.sync();
   return {std::make_unique<cudf::table>(std::move(joinedCols)), numRows};
 }
@@ -642,10 +586,6 @@ CudfHashJoinProbe::JoinOutput CudfHashJoinProbe::filteredOutput(
   outputLayout_.scatterBuildInputColumns(
       filteredjoinedCols, joinedCols, leftColsSize);
   joinedCols = std::move(filteredjoinedCols);
-  if (buildStream_.has_value()) {
-    // Ensure any deallocation of join indices is ordered wrt probe gathers
-    cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
-  }
   stream.sync();
   return {std::make_unique<cudf::table>(std::move(joinedCols)), numRows};
 }
@@ -1524,9 +1464,6 @@ CudfHashJoinProbe::leftSemiProjectJoin(
   // Add match column as the last column
   outputCols.back() = std::move(matchCol);
 
-  if (buildStream_.has_value()) {
-    cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
-  }
   stream.sync();
 
   auto output = std::make_unique<cudf::table>(std::move(outputCols));
@@ -1667,9 +1604,9 @@ RowVectorPtr CudfHashJoinProbe::doGetOutput() {
         !finished_ && isLastDriver_) {
       auto& rightTables = hashObject_.value().first;
       auto stream = cudfGlobalStreamPool().get_stream();
-      registerReadStream(stream);
+      readTracker_.registerStream(stream);
       SCOPE_EXIT {
-        recordReadCompletion(stream);
+        readTracker_.recordCompletion(stream);
       };
       std::vector<std::unique_ptr<cudf::table>> toConcat;
       vector_size_t unmatchedRows = 0;
@@ -1735,11 +1672,11 @@ RowVectorPtr CudfHashJoinProbe::doGetOutput() {
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
   VELOX_CHECK_NOT_NULL(cudfInput);
   auto stream = cudfInput->stream();
-  registerReadStream(stream);
+  readTracker_.registerStream(stream);
   SCOPE_EXIT {
-    recordReadCompletion(stream);
+    readTracker_.recordCompletion(stream);
   };
-  waitForBuildReady(stream);
+  waitForBuildReady(buildReadyEvent_, stream);
   // Use getTableView() to avoid expensive materialization for packed_table.
   // cudfInput is staying alive until the table view is no longer needed.
   auto leftTableView = cudfInput->getTableView();
@@ -1861,7 +1798,6 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
     return exec::BlockingReason::kWaitForJoinBuild;
   }
   hashObject_ = std::move(buildResult->payload);
-  buildStream_ = buildResult->buildStream;
   buildReadyEvent_ = std::move(buildResult->buildReadyEvent);
 
   // Lazy initialize matched flags only when build side is done
@@ -1870,7 +1806,7 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
     rightMatchedFlags_.clear();
     rightMatchedFlags_.reserve(rightTablesInit.size());
     auto initStream = cudfGlobalStreamPool().get_stream();
-    waitForBuildReady(initStream);
+    waitForBuildReady(buildReadyEvent_, initStream);
     for (auto& rt : rightTablesInit) {
       rightMatchedFlags_.emplace_back(
           rt->num_rows(), initStream, get_temp_mr());
@@ -1887,7 +1823,7 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
     cachedExtendedRightViews_.reserve(rightTablesInit.size());
 
     auto initStream = cudfGlobalStreamPool().get_stream();
-    waitForBuildReady(initStream);
+    waitForBuildReady(buildReadyEvent_, initStream);
     for (auto& rt : rightTablesInit) {
       auto rightTableView = rt->view();
       auto rightColumnViews = tableViewToColumnViews(rightTableView);
@@ -1954,10 +1890,9 @@ bool CudfHashJoinProbe::isFinished() {
   // reset() may not be the last reference; each instance still waits for its
   // own reads before dropping its reference.
   if (isFinished) {
-    waitForReadCompletion();
+    readTracker_.waitForCompletion();
     hashObject_.reset();
     buildReadyEvent_.reset();
-    buildStream_.reset();
   }
   return isFinished;
 }
