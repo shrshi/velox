@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/CudfNestedLoopJoin.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 
 #include "velox/core/Expressions.h"
@@ -2031,4 +2032,29 @@ TEST_F(CudfNestedLoopJoinTest, crossJoinZeroColumnBuildAndOutput) {
                   .planNode();
 
   AssertQueryBuilder(plan).assertResults(makeRowVector(ROW({}), 6));
+}
+
+TEST_F(CudfNestedLoopJoinTest, joinBridgeOnlyForNestedLoopJoinNodes) {
+  auto probe = makeNamedRowVector("p0", makeFlatVector<int64_t>({1, 2}));
+  auto build = makeNamedRowVector("b0", makeFlatVector<int64_t>({1, 3}));
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto valuesNode = PlanBuilder(planNodeIdGenerator).values({build}).planNode();
+  auto nestedLoopJoinNode = PlanBuilder(planNodeIdGenerator)
+                                .values({probe})
+                                .nestedLoopJoin(valuesNode, {"p0", "b0"})
+                                .planNode();
+  auto hashJoinNode =
+      PlanBuilder(planNodeIdGenerator)
+          .values({probe})
+          .hashJoin({"p0"}, {"b0"}, valuesNode, "", {"p0", "b0"})
+          .planNode();
+
+  cudf_velox::CudfNestedLoopJoinBridgeTranslator translator;
+  auto nestedLoopJoinBridge = translator.toJoinBridge(nestedLoopJoinNode);
+  EXPECT_NE(
+      dynamic_cast<cudf_velox::CudfNestedLoopJoinBridge*>(
+          nestedLoopJoinBridge.get()),
+      nullptr);
+  EXPECT_EQ(translator.toJoinBridge(hashJoinNode), nullptr);
+  EXPECT_EQ(translator.toJoinBridge(valuesNode), nullptr);
 }

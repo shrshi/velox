@@ -17,6 +17,7 @@
 #pragma once
 
 #include "velox/experimental/cudf/exec/CudfJoin.h"
+#include "velox/experimental/cudf/exec/CudfJoinBridge.h"
 #include "velox/experimental/cudf/exec/CudfJoinBuild.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
@@ -38,60 +39,6 @@
 namespace facebook::velox::cudf_velox {
 
 class CudaEvent;
-
-/// Coordinates data transfer from build to probe operators for nested loop
-/// join. Build operators accumulate batches, then one operator transfers them
-/// to the bridge. Probe operators block until build data is available, then
-/// perform a cartesian product (cross join) with optional filtering.
-///
-/// Thread-safety: All methods use mutex locking for concurrent access.
-class CudfNestedLoopJoinBridge : public exec::JoinBridge {
- public:
-  // Build data: single concatenated build-side table. NLJ requires a single
-  // table because the cross-join output is probe_rows × build_rows — batching
-  // the build side does not prevent output overflow, so we enforce a single
-  // table and fail early if the build side exceeds cudf::size_type limits.
-  struct BuildData {
-    std::shared_ptr<cudf::table> table;
-    // cudf::table cannot represent the row count of a zero-column table.
-    cudf::size_type rowCount;
-  };
-  using build_data_type = BuildData;
-
-  void setData(std::optional<build_data_type> data);
-
-  std::optional<build_data_type> dataOrFuture(ContinueFuture* future);
-
-  // The build-ready event is created and recorded by the build side
-  // (CudfNestedLoopJoinBuild::buildAndPublish()) immediately once the build
-  // table is materialized, on the same stream that did that work - not
-  // lazily by the probe side. Recording immediately (rather than whenever
-  // the first probe batch happens to call waitForBuildReady()) avoids a
-  // window where the build's stream could already have been recycled by
-  // cudfGlobalStreamPool() for unrelated work before anything captures its
-  // completion point. Every probe operator instance/batch just waits on
-  // this same already-recorded event - the same record-once/wait-many
-  // split used by CudfHashJoinBridge's buildReadyEvent_.
-  void setBuildReadyEvent(std::shared_ptr<CudaEvent> buildReadyEvent);
-
-  std::shared_ptr<CudaEvent> getBuildReadyEvent();
-
-  // The stream the build side used to materialize buildData_ - the same
-  // stream setBuildReadyEvent()'s event was recorded from. Exposed so probe
-  // instances can make this stream wait on their own completion before
-  // returning from doGetOutput(), ensuring buildData_'s eventual
-  // stream-ordered free (enqueued on this same stream, since that's where
-  // it was allocated) can't race a still-in-flight probe read. See
-  // CudfNestedLoopJoinProbe::recordReadCompletion().
-  void setBuildStream(cuda::stream_ref buildStream);
-
-  std::optional<cuda::stream_ref> getBuildStream();
-
- private:
-  std::optional<build_data_type> data_;
-  std::shared_ptr<CudaEvent> buildReadyEvent_;
-  std::optional<cuda::stream_ref> buildStream_;
-};
 
 /// Concatenates the build-side input of all build drivers into a single cuDF
 /// table and transfers it to probe operators via CudfNestedLoopJoinBridge.
@@ -153,7 +100,7 @@ class CudfNestedLoopJoinBuild : public CudfJoinBuild {
 /// Multiple probe operators can run concurrently on different batches.
 class CudfNestedLoopJoinProbe : public CudfOperatorBase {
  public:
-  using build_data_type = CudfNestedLoopJoinBridge::build_data_type;
+  using build_data_type = CudfNestedLoopJoinBuildData;
 
   CudfNestedLoopJoinProbe(
       int32_t operatorId,
@@ -323,14 +270,14 @@ class CudfNestedLoopJoinProbe : public CudfOperatorBase {
   // Build-ready event, fetched once from the bridge in isBlocked() -
   // already created and recorded by the build side, so waitForBuildReady()
   // just needs to wait on it for every probe stream. See
-  // CudfNestedLoopJoinBridge::setBuildReadyEvent().
+  // CudfJoinBuildResult::buildReadyEvent.
   std::shared_ptr<CudaEvent> buildReadyEvent_;
 
   // The build side's own stream, fetched once from the bridge in
   // isBlocked(). recordReadCompletion() makes this stream wait on every
   // probe batch's completion, so buildData_'s eventual stream-ordered free
   // (enqueued on this same stream) is correctly ordered after all reads -
-  // see CudfNestedLoopJoinBridge::setBuildStream().
+  // see CudfJoinBuildResult::buildStream.
   std::optional<cuda::stream_ref> buildStream_;
   // Reused event for recordReadCompletion()'s record-then-wait pattern.
   // Safe to reuse across calls since each call finishes using the current
