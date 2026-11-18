@@ -23,6 +23,7 @@
 #include "velox/type/Type.h"
 
 #include <cudf/column/column.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 
@@ -68,6 +69,18 @@ struct CudfJoinOutputLayout {
       std::vector<std::unique_ptr<cudf::column>>& outCols,
       std::vector<std::unique_ptr<cudf::column>>& inputCols,
       std::size_t srcOffset) const;
+
+  /// Gathers this layout's probe and build input columns at probeIndices and
+  /// buildIndices and returns them at their positions in numOutputColumns
+  /// output columns.
+  std::vector<std::unique_ptr<cudf::column>> gatherOutputColumns(
+      cudf::table_view probeView,
+      cudf::column_view probeIndices,
+      cudf::table_view buildView,
+      cudf::column_view buildIndices,
+      std::size_t numOutputColumns,
+      cudf::out_of_bounds_policy oobPolicy,
+      cuda::stream_ref stream) const;
 
   /// Fills this side's output positions with all-null columns of numRows
   /// rows, with dtypes taken from the input type. Used to emit unmatched rows

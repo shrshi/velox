@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/exec/CudfJoin.h"
 #include "velox/experimental/cudf/exec/CudfJoinBridge.h"
 #include "velox/experimental/cudf/exec/CudfJoinBuild.h"
+#include "velox/experimental/cudf/exec/CudfJoinProbe.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/expression/PrecomputeInstruction.h"
@@ -255,7 +256,7 @@ class CudfNestedLoopJoinProbe : public CudfOperatorBase {
   // Build mismatch tracking for right/full joins: BOOL8 column, one element
   // per build row. Updated across all probe inputs via BITWISE_OR. Merged from
   // peers in noMoreInput() before the last driver emits unmatched build rows.
-  std::unique_ptr<cudf::column> buildMatchedFlags_;
+  std::optional<CudfJoinMatchTracker> buildMatchedFlags_;
 
   // Multi-driver coordination for right/full join build mismatch emission.
   bool isLastDriver_{false};

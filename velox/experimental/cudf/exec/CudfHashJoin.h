@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/exec/CudfJoin.h"
 #include "velox/experimental/cudf/exec/CudfJoinBridge.h"
 #include "velox/experimental/cudf/exec/CudfJoinBuild.h"
+#include "velox/experimental/cudf/exec/CudfJoinProbe.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
 #include "velox/experimental/cudf/expression/AstExpression.h"
 #include "velox/experimental/cudf/expression/AstExpressionUtils.h"
@@ -205,7 +206,7 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   // left match.
   /** @brief Flags tracking which build rows have been matched (for right joins)
    */
-  std::vector<std::unique_ptr<cudf::column>> rightMatchedFlags_;
+  std::vector<CudfJoinMatchTracker> rightMatchedFlags_;
 
   /// Cached precomputed columns for right (build) tables
   std::vector<std::vector<ColumnOrView>> cachedRightPrecomputed_;
@@ -344,7 +345,10 @@ class CudfHashJoinProbe : public CudfOperatorBase {
    * @param leftIndicesCol Column of indices into left table
    * @param rightTableView Input build table view
    * @param rightIndicesCol Column of indices into right table
-   * @param func Filter function to apply to joined data
+   * @param tracker If not null, updated with the trackedIndicesCol rows
+   * that pass the filter
+   * @param trackedIndicesCol leftIndicesCol or rightIndicesCol, the side
+   * tracker tracks
    * @param stream CUDA stream for operations
    * @return Filtered join result table with its logical row count
    */
@@ -353,19 +357,20 @@ class CudfHashJoinProbe : public CudfOperatorBase {
       cudf::column_view leftIndicesCol,
       cudf::table_view rightTableView,
       cudf::column_view rightIndicesCol,
-      std::function<std::vector<std::unique_ptr<cudf::column>>(
-          std::vector<std::unique_ptr<cudf::column>>&&,
-          cudf::column_view)> func,
+      CudfJoinMatchTracker* tracker,
+      cudf::column_view trackedIndicesCol,
       cuda::stream_ref stream);
 
-  JoinOutput filteredOutputIndices(
+  /**
+   * @brief Appends the output of the probe rows at probeIndices with NULL
+   * build columns to cudfOutputs. Does nothing if probeIndices is empty.
+   * @param anyBuildTableView Any build table view, for the build column types
+   */
+  void appendProbeRowsOutput(
+      std::vector<JoinOutput>& cudfOutputs,
       cudf::table_view leftTableView,
-      cudf::column_view leftIndicesCol,
-      cudf::table_view rightTableView,
-      cudf::column_view rightIndicesCol,
-      cudf::table_view extendedLeftView,
-      cudf::table_view extendedRightView,
-      cudf::join_kind joinKind,
+      std::unique_ptr<cudf::column> probeIndices,
+      cudf::table_view anyBuildTableView,
       cuda::stream_ref stream);
 };
 
