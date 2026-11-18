@@ -19,6 +19,7 @@
 #include <charconv>
 #include <cstring>
 #include <limits>
+#include <numeric>
 
 #include "velox/buffer/Buffer.h"
 #include "velox/common/EnumDefine.h"
@@ -1587,9 +1588,6 @@ void exportFlattenedVector(
     memory::MemoryPool* pool,
     VeloxToArrowBridgeHolder& holder,
     const uint64_t* nulls) {
-  VELOX_CHECK(
-      vec.valueVector() == nullptr || vec.wrappedVector()->isFlatEncoding(),
-      "An unsupported nested encoding was found.");
   VELOX_CHECK(vec.isScalar(), "Flattening is only supported for scalar types.");
   VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
       flattenAndExport,
@@ -1694,6 +1692,137 @@ void exportConstant(
   runEnds->release = releaseArrowArray;
 }
 
+// Whether 'vec' is a dictionary or constant of a complex type that 'options'
+// flatten. Such a vector is exported flat throughout, see peelComplex() and
+// flattenAll().
+bool isFlattenedComplex(const BaseVector& vec, const ArrowOptions& options) {
+  if (vec.type()->isPrimitiveType()) {
+    return false;
+  }
+  switch (vec.encoding()) {
+    case VectorEncoding::Simple::DICTIONARY:
+      return options.flattenDictionary;
+    case VectorEncoding::Simple::CONSTANT:
+      return options.flattenConstant;
+    default:
+      return false;
+  }
+}
+
+// The options for the contents of a flattened dictionary or constant of a
+// complex type. They flatten everything, so the schema of the contents, like
+// that of a flat vector, follows from their type.
+ArrowOptions flattenAll(const ArrowOptions& options) {
+  auto result = options;
+  result.flattenDictionary = true;
+  result.flattenConstant = true;
+  return result;
+}
+
+// Returns 'vec', a dictionary or constant of a complex type, with its top level
+// flat: the children of a struct, and the elements, keys and values of an array
+// or map, are dictionaries over those of the base of 'vec'. The export then
+// flattens them in turn, reading only the rows it exports. Only the selected
+// rows outside a null struct are decoded, since the indices of rows under a
+// null struct are undefined. The other rows are null.
+VectorPtr peelComplex(
+    const BaseVector& vec,
+    const Selection& rows,
+    const BufferPtr& parentNulls,
+    memory::MemoryPool* pool) {
+  const auto size = vec.size();
+  const auto* rawParentNulls =
+      parentNulls ? parentNulls->as<uint64_t>() : nullptr;
+  SelectivityVector rowsToDecode(size, false);
+  rows.apply([&](vector_size_t row) {
+    if (!isNull(rawParentNulls, row)) {
+      rowsToDecode.setValid(row, true);
+    }
+  });
+  rowsToDecode.updateBounds();
+  DecodedVector decoded(vec, rowsToDecode);
+
+  auto nulls = allocateNulls(size, pool, bits::kNull);
+  auto indices = allocateIndices(size, pool);
+  auto* rawNulls = nulls->asMutable<uint64_t>();
+  auto* rawIndices = indices->asMutable<vector_size_t>();
+  rowsToDecode.applyToSelected([&](vector_size_t row) {
+    if (!decoded.isNullAt(row)) {
+      bits::clearNull(rawNulls, row);
+      rawIndices[row] = decoded.index(row);
+    }
+  });
+
+  const auto& base = *decoded.base();
+  if (base.isConstantEncoding()) {
+    // A null constant has no base: every row is null.
+    auto result = BaseVector::create(vec.type(), size, pool);
+    result->setNulls(nulls);
+    return result;
+  }
+
+  if (vec.typeKind() == TypeKind::ROW) {
+    std::vector<VectorPtr> children;
+    for (const auto& child : base.asUnchecked<RowVector>()->children()) {
+      children.push_back(
+          BaseVector::wrapInDictionary(nulls, indices, size, child));
+    }
+    return std::make_shared<RowVector>(
+        pool, vec.type(), nulls, size, std::move(children));
+  }
+
+  // Lay out the elements of the rows one after the other: the export reads
+  // every element of an array with such offsets.
+  const auto& arrays = *base.asUnchecked<ArrayVectorBase>();
+  auto offsets = allocateOffsets(size, pool);
+  auto sizes = allocateSizes(size, pool);
+  auto* rawOffsets = offsets->asMutable<vector_size_t>();
+  auto* rawSizes = sizes->asMutable<vector_size_t>();
+  vector_size_t numElements = 0;
+  for (vector_size_t row = 0; row < size; ++row) {
+    rawOffsets[row] = numElements;
+    if (!bits::isBitNull(rawNulls, row)) {
+      rawSizes[row] = arrays.sizeAt(rawIndices[row]);
+      numElements = checkedPlus(numElements, rawSizes[row]);
+    }
+  }
+  auto elementIndices = allocateIndices(numElements, pool);
+  auto* rawElementIndices = elementIndices->asMutable<vector_size_t>();
+  for (vector_size_t row = 0; row < size; ++row) {
+    if (!bits::isBitNull(rawNulls, row)) {
+      std::iota(
+          rawElementIndices + rawOffsets[row],
+          rawElementIndices + rawOffsets[row] + rawSizes[row],
+          arrays.offsetAt(rawIndices[row]));
+    }
+  }
+  auto wrapElements = [&](const VectorPtr& elements) {
+    return BaseVector::wrapInDictionary(
+        nullptr, elementIndices, numElements, elements);
+  };
+
+  if (vec.typeKind() == TypeKind::ARRAY) {
+    return std::make_shared<ArrayVector>(
+        pool,
+        vec.type(),
+        nulls,
+        size,
+        offsets,
+        sizes,
+        wrapElements(base.asUnchecked<ArrayVector>()->elements()));
+  }
+  const auto& maps = *base.asUnchecked<MapVector>();
+  return std::make_shared<MapVector>(
+      pool,
+      vec.type(),
+      nulls,
+      size,
+      offsets,
+      sizes,
+      wrapElements(maps.mapKeys()),
+      wrapElements(maps.mapValues()));
+}
+
 void exportToArrowImpl(
     const BaseVector& vec,
     const Selection& rows,
@@ -1701,6 +1830,16 @@ void exportToArrowImpl(
     ArrowArray& out,
     memory::MemoryPool* pool,
     const BufferPtr& parentNulls) {
+  if (isFlattenedComplex(vec, options)) {
+    exportToArrowImpl(
+        *peelComplex(vec, rows, parentNulls, pool),
+        rows,
+        flattenAll(options),
+        out,
+        pool,
+        parentNulls);
+    return;
+  }
   auto holder = std::make_unique<VeloxToArrowBridgeHolder>();
   out.buffers = holder->getArrowBuffers();
   out.length = rows.count();
@@ -1986,6 +2125,19 @@ void exportToArrow(
     const VectorPtr& vec,
     ArrowSchema& arrowSchema,
     const ArrowOptions& options) {
+  if (isFlattenedComplex(*vec, options)) {
+    // The schema of the base with flattenAll(). A null constant has no base:
+    // use an empty vector of its type.
+    const auto& base = BaseVector::wrappedVectorShared(vec);
+    exportToArrow(
+        base->isConstantEncoding()
+            ? BaseVector::create(vec->type(), 0, vec->pool())
+            : base,
+        arrowSchema,
+        flattenAll(options));
+    return;
+  }
+
   auto& type = vec->type();
 
   arrowSchema.name = nullptr;

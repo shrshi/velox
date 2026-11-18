@@ -47,7 +47,6 @@ struct ArrowOptions {
   VELOX_DECLARE_EMBEDDED_ENUM_NAME(VarTypeLayout);
 
   bool flattenDictionary{false};
-  // NOTE: flattenConstant is only supported for scalar types.
   bool flattenConstant{false};
   TimestampUnit timestampUnit = TimestampUnit::kNano;
   std::optional<std::string> timestampTimeZone{std::nullopt};

@@ -1357,6 +1357,134 @@ TEST_F(ArrowBridgeArrayExportTest, flattenedDictionaryIndicesUnderNullStruct) {
   EXPECT_EQ("a", field.GetView(4));
 }
 
+TEST_F(ArrowBridgeArrayExportTest, flattenedNestedEncodings) {
+  // Dictionaries and constants over vectors other than flat scalars, alone and
+  // inside complex types. The dictionaries have nulls: a dictionary without
+  // nulls over a constant is a constant.
+  options_.flattenDictionary = true;
+  options_.flattenConstant = true;
+  auto dictionary = [&](const VectorPtr& base) {
+    return BaseVector::wrapInDictionary(
+        makeNulls(5, nullEvery(4)), makeIndices({3, 0, 0, 2, 1}), 5, base);
+  };
+  auto array =
+      makeArrayVectorFromJson<int64_t>({"[1, 2]", "null", "[]", "[3, null]"});
+  auto map = makeMapVectorFromJson<int32_t, int64_t>(
+      {"{1: 10}", "null", "{2: 20, 3: null}", "{}"});
+  auto row = makeRowVector(
+      {makeFlatVector<int32_t>({1, 2, 3, 4}),
+       wrapInDictionary(
+           makeIndices({1, 1, 0, 0}),
+           makeFlatVector<std::string>({"a", "a string that is not inline"}))},
+      nullEvery(3));
+  auto dictionaryOfConstant = dictionary(makeConstant<int64_t>(7, 4));
+  auto dictionaryOfDictionaryOfConstant = dictionary(
+      BaseVector::wrapInDictionary(
+          makeNulls(4, nullEvery(3)),
+          makeIndices({1, 0, 1, 0}),
+          4,
+          makeConstant<int64_t>(7, 4)));
+  ASSERT_EQ(
+      VectorEncoding::Simple::CONSTANT,
+      dictionaryOfConstant->valueVector()->encoding());
+  ASSERT_EQ(
+      VectorEncoding::Simple::CONSTANT,
+      dictionaryOfDictionaryOfConstant->valueVector()
+          ->valueVector()
+          ->encoding());
+
+  for (const auto& vector : std::vector<VectorPtr>{
+           dictionaryOfConstant,
+           dictionaryOfDictionaryOfConstant,
+           dictionary(makeNullConstant(TypeKind::BIGINT, 4)),
+           dictionary(array),
+           dictionary(map),
+           dictionary(row),
+           dictionary(wrapInDictionary(makeIndicesInReverse(4), array)),
+           dictionary(BaseVector::wrapInConstant(4, 2, row)),
+           dictionary(BaseVector::createNullConstant(row->type(), 4, pool())),
+           BaseVector::wrapInConstant(5, 0, array),
+           BaseVector::wrapInConstant(5, 2, map),
+           BaseVector::wrapInConstant(5, 1, row),
+           BaseVector::createNullConstant(ARRAY(BIGINT()), 5, pool()),
+           makeArrayVector({0, 2}, dictionary(row)),
+           makeRowVector({dictionary(array), dictionaryOfConstant}),
+       }) {
+    SCOPED_TRACE(vector->toString());
+    testRoundTrip(vector);
+  }
+}
+
+TEST_F(ArrowBridgeArrayExportTest, flattenedComplexWithOneOptionSet) {
+  // A flattened dictionary or constant of a complex type is exported flat
+  // throughout, even if only one kind of encoding is flattened.
+  auto row = makeRowVector(
+      {makeConstant<int64_t>(7, 3),
+       wrapInDictionary(
+           makeIndices({2, 0, 1}), makeFlatVector<int32_t>({1, 2, 3}))});
+  options_.flattenDictionary = true;
+  testRoundTrip(wrapInDictionary(makeIndices({2, 0, 1}), row));
+  options_ = {};
+  options_.flattenConstant = true;
+  testRoundTrip(BaseVector::wrapInConstant(3, 1, row));
+}
+
+TEST_F(ArrowBridgeArrayExportTest, flattenedDictionaryOverStructWithNulls) {
+  // The struct is null at row 1, where its child, a dictionary over a
+  // dictionary, has an index out of bounds. The dictionary over the struct
+  // points only to its other rows, so export must not read row 1 of the child.
+  auto childIndices = makeIndices({0, 1, 2, 0});
+  auto child = wrapInDictionary(
+      childIndices,
+      wrapInDictionary(
+          makeIndices({2, 1, 0}), makeFlatVector<int64_t>({10, 20, 30})));
+  auto row = makeRowVector({child}, [](vector_size_t row) { return row == 1; });
+  childIndices->asMutable<vector_size_t>()[1] = 100'000'000;
+  options_.flattenDictionary = true;
+
+  auto array =
+      toArrow(wrapInDictionary(makeIndices({0, 2, 3}), row), options_, pool());
+  ASSERT_OK(array->ValidateFull());
+  const auto& values = static_cast<const arrow::Int64Array&>(
+      *static_cast<const arrow::StructArray&>(*array).field(0));
+  ASSERT_EQ(3, values.length());
+  EXPECT_EQ(0, values.null_count());
+  EXPECT_EQ(30, values.Value(0));
+  EXPECT_EQ(10, values.Value(1));
+  EXPECT_EQ(30, values.Value(2));
+}
+
+TEST_F(ArrowBridgeArrayExportTest, flattenedComplexDictionaryUnderNullStruct) {
+  // As flattenedDictionaryIndicesUnderNullStruct, for a dictionary of arrays
+  // and a dictionary over it.
+  auto base = makeArrayVectorFromJson<int64_t>({"[1]", "[2, 3]", "[]"});
+  options_.flattenDictionary = true;
+  for (bool nested : {false, true}) {
+    SCOPED_TRACE(fmt::format("nested: {}", nested));
+    auto indices = makeIndices({2, 0, 1, 0, 0});
+    auto dictionary = wrapInDictionary(
+        indices,
+        nested ? wrapInDictionary(makeIndices({0, 1, 2}), base) : base);
+    indices->asMutable<vector_size_t>()[1] = 100'000'000;
+    indices->asMutable<vector_size_t>()[3] = -100'000'000;
+    auto vector = makeRowVector(
+        {dictionary}, [](vector_size_t row) { return row == 1 || row == 3; });
+
+    auto array = toArrow(vector, options_, pool());
+    ASSERT_OK(array->ValidateFull());
+    const auto& field = static_cast<const arrow::ListArray&>(
+        *static_cast<const arrow::StructArray&>(*array).field(0));
+    EXPECT_TRUE(field.IsNull(1));
+    EXPECT_TRUE(field.IsNull(3));
+    validateOffsets(field, {0, 0, 0, 2, 2, 3});
+    const auto& values = static_cast<const arrow::Int64Array&>(*field.values());
+    ASSERT_EQ(3, values.length());
+    EXPECT_EQ(2, values.Value(0));
+    EXPECT_EQ(3, values.Value(1));
+    EXPECT_EQ(1, values.Value(2));
+  }
+}
+
 TEST_F(ArrowBridgeArrayExportTest, emptyDictionaryUnderNullStruct) {
   // Every row of the struct is null and the dictionary has no base rows, so no
   // index is valid. Debug builds check the index of every non-null row when a
