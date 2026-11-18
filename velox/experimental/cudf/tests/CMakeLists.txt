@@ -346,6 +346,22 @@ velox_add_cudf_test(
   LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_window fmt::fmt
 )
 
+# cuDF TopNRowNumber Fuzzer (CPU fallback enabled): unsupported operators fall
+# back to CPU.
+add_executable(velox_cudf_topn_row_number_fuzzer TopNRowNumberFuzzer.cpp)
+set_target_properties(
+  velox_cudf_topn_row_number_fuzzer
+  PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CUDF_TESTS_OUTPUT_DIR}
+)
+target_link_libraries(
+  velox_cudf_topn_row_number_fuzzer
+  velox_topn_row_number_fuzzer_lib
+  velox_functions_prestosql
+  velox_window
+  velox_cudf_exec
+  velox_cudf_fuzzer_util
+)
+
 # Only built when VELOX_ENABLE_UCX_EXCHANGE is on; without it the ucx-exchange
 # library does not exist and ucxx was never fetched.
 if(VELOX_ENABLE_UCX_EXCHANGE)

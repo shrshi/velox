@@ -38,3 +38,8 @@ target_link_libraries(
   velox_test_util
   velox_vector_test_lib
 )
+
+add_library(velox_cudf_fuzzer_util CudfFuzzerUtil.cpp)
+velox_add_test_headers(velox_cudf_fuzzer_util CudfFuzzerUtil.h)
+
+target_link_libraries(velox_cudf_fuzzer_util velox_cudf_exec velox_exec)
