@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/exec/CudfJoin.h"
 #include "velox/experimental/cudf/exec/CudfJoinBridge.h"
 #include "velox/experimental/cudf/exec/CudfJoinBuild.h"
+#include "velox/experimental/cudf/exec/CudfJoinProbe.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
 #include "velox/experimental/cudf/expression/AstExpression.h"
 #include "velox/experimental/cudf/expression/AstExpressionUtils.h"
@@ -123,26 +124,6 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   void doClose() override;
 
  private:
-  void waitForBuildReady(cuda::stream_ref stream);
-
-  /// Registers a stream that is about to read hashObject_, rightMatchedFlags_,
-  /// scalars_, tree_, or filterEvaluator_. Must be called before submitting
-  /// those reads so that creating the stream's completion event cannot fail
-  /// once work is in flight.
-  void registerReadStream(cuda::stream_ref stream);
-
-  /// Records the stream's completion event after this operator's last read on
-  /// it has been submitted. Re-recording on a reused stream is sufficient
-  /// because stream ordering makes the latest recording cover earlier batches.
-  void recordReadCompletion(cuda::stream_ref stream) noexcept;
-
-  /// Host-waits for every registered stream's reads, then clears the tracker
-  /// so later isFinished()/doClose() calls do not wait again.
-  void waitForReadCompletion();
-
-  struct ReadStream;
-  ReadStream* findReadStream(cuda::stream_ref stream);
-
   std::shared_ptr<const core::HashJoinNode> joinNode_;
   /** @brief Hash tables and join objects received from build operator */
   std::optional<hash_type> hashObject_;
@@ -193,19 +174,15 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   // hanging problem at the producer side caused by the early query finish.
   bool skipInput_{false};
 
-  /** @brief CUDA stream from build operator for synchronization */
-  std::optional<cuda::stream_ref> buildStream_;
   /** @brief Event recorded after build-side CUDA work is ready for probes */
   std::shared_ptr<CudaEvent> buildReadyEvent_;
-  /** @brief CUDA event for coordinating stream synchronization */
-  std::unique_ptr<CudaEvent> cudaEvent_;
 
   // Streaming right join state
   // Per-build-table flags indicating whether a build row has had at least one
   // left match.
   /** @brief Flags tracking which build rows have been matched (for right joins)
    */
-  std::vector<std::unique_ptr<cudf::column>> rightMatchedFlags_;
+  std::vector<CudfJoinMatchTracker> rightMatchedFlags_;
 
   /// Cached precomputed columns for right (build) tables
   std::vector<std::vector<ColumnOrView>> cachedRightPrecomputed_;
@@ -225,20 +202,9 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   /// host-synchronized all-false init state with no pending GPU work.
   std::optional<cuda::stream_ref> lastProbeStream_;
 
-  struct ReadStream {
-    cuda::stream_ref stream;
-    std::unique_ptr<CudaEvent> completion;
-    /// Registered but not yet recorded. Only stays true if recording failed,
-    /// in which case cleanup falls back to synchronizing the whole stream.
-    bool pending{false};
-  };
-
-  /// One reusable completion event per stream this probe instance has read
-  /// shared or operator-owned state on. Streams are tracked independently so
-  /// probe batches on different pool streams can overlap; they only converge
-  /// in waitForReadCompletion(). Bounded by the global stream pool size, so a
-  /// linear search is sufficient.
-  std::vector<ReadStream> readStreams_;
+  /// Streams that read hashObject_, rightMatchedFlags_, scalars_, tree_, or
+  /// filterEvaluator_. Waited for before isFinished()/doClose() release them.
+  CudfJoinReadTracker readTracker_;
 
   static constexpr auto oobPolicy = cudf::out_of_bounds_policy::NULLIFY;
 
@@ -344,7 +310,10 @@ class CudfHashJoinProbe : public CudfOperatorBase {
    * @param leftIndicesCol Column of indices into left table
    * @param rightTableView Input build table view
    * @param rightIndicesCol Column of indices into right table
-   * @param func Filter function to apply to joined data
+   * @param tracker If not null, updated with the trackedIndicesCol rows
+   * that pass the filter
+   * @param trackedIndicesCol leftIndicesCol or rightIndicesCol, the side
+   * tracker tracks
    * @param stream CUDA stream for operations
    * @return Filtered join result table with its logical row count
    */
@@ -353,19 +322,20 @@ class CudfHashJoinProbe : public CudfOperatorBase {
       cudf::column_view leftIndicesCol,
       cudf::table_view rightTableView,
       cudf::column_view rightIndicesCol,
-      std::function<std::vector<std::unique_ptr<cudf::column>>(
-          std::vector<std::unique_ptr<cudf::column>>&&,
-          cudf::column_view)> func,
+      CudfJoinMatchTracker* tracker,
+      cudf::column_view trackedIndicesCol,
       cuda::stream_ref stream);
 
-  JoinOutput filteredOutputIndices(
+  /**
+   * @brief Appends the output of the probe rows at probeIndices with NULL
+   * build columns to cudfOutputs. Does nothing if probeIndices is empty.
+   * @param anyBuildTableView Any build table view, for the build column types
+   */
+  void appendProbeRowsOutput(
+      std::vector<JoinOutput>& cudfOutputs,
       cudf::table_view leftTableView,
-      cudf::column_view leftIndicesCol,
-      cudf::table_view rightTableView,
-      cudf::column_view rightIndicesCol,
-      cudf::table_view extendedLeftView,
-      cudf::table_view extendedRightView,
-      cudf::join_kind joinKind,
+      std::unique_ptr<cudf::column> probeIndices,
+      cudf::table_view anyBuildTableView,
       cuda::stream_ref stream);
 };
 

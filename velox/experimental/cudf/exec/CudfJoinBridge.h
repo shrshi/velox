@@ -25,8 +25,6 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
-#include <cuda/stream>
-
 #include <memory>
 #include <utility>
 #include <vector>
@@ -38,12 +36,10 @@ class CudaEvent;
 /// The build result a cuDF join build publishes once to its probe drivers.
 template <typename Payload>
 struct CudfJoinBuildResult {
+  /// Each probe host-waits for its own reads before it drops its reference, so
+  /// the payload can be freed in any stream's order.
   Payload payload;
-  /// The stream the build ran on. The payload's device memory is freed in this
-  /// stream's order, so each probe makes this stream wait on its own reads
-  /// before the free can run (see the probes' recordReadCompletion()).
-  cuda::stream_ref buildStream;
-  /// Recorded on buildStream by the build as soon as the payload is ready, not
+  /// Recorded on the build's stream as soon as the payload is ready, not
   /// lazily by a probe, so it captures that point before cudfGlobalStreamPool()
   /// can recycle the stream. Every probe stream waits on this one event.
   std::shared_ptr<CudaEvent> buildReadyEvent;

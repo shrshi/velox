@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/exec/CudfJoin.h"
 #include "velox/experimental/cudf/exec/CudfJoinBridge.h"
 #include "velox/experimental/cudf/exec/CudfJoinBuild.h"
+#include "velox/experimental/cudf/exec/CudfJoinProbe.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/expression/PrecomputeInstruction.h"
@@ -165,19 +166,6 @@ class CudfNestedLoopJoinProbe : public CudfOperatorBase {
   /// called by the last driver after merging flags from all peers.
   RowVectorPtr emitBuildMismatchRows(cuda::stream_ref stream);
 
-  // Makes the given probe stream wait on the build-ready event before it
-  // reads build-side data. See buildReadyEvent_.
-  void waitForBuildReady(cuda::stream_ref probeStream);
-
-  // Records completion of a read of build-side state on probeStream, and
-  // makes buildStream_ wait on it. Must be called after every read of
-  // buildData_/buildPrecomputed_/scalars_/buildMatchedFlags_, so that
-  // buildStream_ accumulates a wait for every probe batch's completion
-  // before buildData_'s eventual stream-ordered free (enqueued on
-  // buildStream_) can run - matching CudfHashJoinProbe's pattern. A no-op
-  // if buildStream_ was never fetched (e.g. build side never ran).
-  void recordReadCompletion(cuda::stream_ref probeStream);
-
   /// Evaluates a join condition that isn't AST-representable (e.g. `probe.col
   /// LIKE build.pattern`) by materializing the probe x build cross product
   /// and running filterEvaluator_ over it. Returns (probeIndex, buildIndex)
@@ -255,7 +243,7 @@ class CudfNestedLoopJoinProbe : public CudfOperatorBase {
   // Build mismatch tracking for right/full joins: BOOL8 column, one element
   // per build row. Updated across all probe inputs via BITWISE_OR. Merged from
   // peers in noMoreInput() before the last driver emits unmatched build rows.
-  std::unique_ptr<cudf::column> buildMatchedFlags_;
+  std::optional<CudfJoinMatchTracker> buildMatchedFlags_;
 
   // Multi-driver coordination for right/full join build mismatch emission.
   bool isLastDriver_{false};
@@ -273,16 +261,10 @@ class CudfNestedLoopJoinProbe : public CudfOperatorBase {
   // CudfJoinBuildResult::buildReadyEvent.
   std::shared_ptr<CudaEvent> buildReadyEvent_;
 
-  // The build side's own stream, fetched once from the bridge in
-  // isBlocked(). recordReadCompletion() makes this stream wait on every
-  // probe batch's completion, so buildData_'s eventual stream-ordered free
-  // (enqueued on this same stream) is correctly ordered after all reads -
-  // see CudfJoinBuildResult::buildStream.
-  std::optional<cuda::stream_ref> buildStream_;
-  // Reused event for recordReadCompletion()'s record-then-wait pattern.
-  // Safe to reuse across calls since each call finishes using the current
-  // recording (via waitOn()) before the next call re-records it.
-  std::unique_ptr<CudaEvent> cudaEvent_;
+  // Streams that read buildData_/buildPrecomputed_/scalars_/tree_/
+  // filterEvaluator_/buildMatchedFlags_ in doGetOutput(). doClose() host-waits
+  // for them before releasing that state.
+  CudfJoinReadTracker readTracker_;
 };
 
 /// Creates CUDF nested loop join operators and bridges.

@@ -23,6 +23,7 @@
 #include "velox/common/base/Exceptions.h"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 
 #include <optional>
@@ -152,6 +153,36 @@ void CudfJoinOutputLayout::scatterBuildInputColumns(
     std::vector<std::unique_ptr<cudf::column>>& inputCols,
     std::size_t srcOffset) const {
   scatterInputColumns(buildProjections_, outCols, inputCols, srcOffset);
+}
+
+std::vector<std::unique_ptr<cudf::column>>
+CudfJoinOutputLayout::gatherOutputColumns(
+    cudf::table_view probeView,
+    cudf::column_view probeIndices,
+    cudf::table_view buildView,
+    cudf::column_view buildIndices,
+    std::size_t numOutputColumns,
+    cudf::out_of_bounds_policy oobPolicy,
+    cuda::stream_ref stream) const {
+  auto probeResult = cudf::gather(
+      probeView.select(probeColumnIndices_),
+      probeIndices,
+      oobPolicy,
+      stream,
+      cudf::memory_resources{get_output_mr(), get_temp_mr()});
+  auto buildResult = cudf::gather(
+      buildView.select(buildColumnIndices_),
+      buildIndices,
+      oobPolicy,
+      stream,
+      cudf::memory_resources{get_output_mr(), get_temp_mr()});
+
+  std::vector<std::unique_ptr<cudf::column>> outCols(numOutputColumns);
+  auto probeCols = probeResult->release();
+  auto buildCols = buildResult->release();
+  scatterGatheredProbeColumns(outCols, probeCols);
+  scatterGatheredBuildColumns(outCols, buildCols);
+  return outCols;
 }
 
 void CudfJoinOutputLayout::fillNullProbeColumns(
