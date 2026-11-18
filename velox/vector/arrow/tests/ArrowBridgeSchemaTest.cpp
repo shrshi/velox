@@ -356,15 +356,36 @@ TEST_F(ArrowBridgeSchemaExportTest, constant) {
   testConstant(MAP(UNKNOWN(), REAL()), "+m");
   testConstant(ROW({TIMESTAMP(), DOUBLE()}), "+s");
   testConstant(ROW({UNKNOWN(), UNKNOWN()}), "+s");
-  VELOX_ASSERT_THROW(
-      testConstant(ARRAY(INTEGER()), "+l", {false, true}),
-      "Flattening is only supported for scalar types.");
-  VELOX_ASSERT_THROW(
-      testConstant(MAP(BOOLEAN(), REAL()), "+m", {false, true}),
-      "Flattening is only supported for scalar types.");
-  VELOX_ASSERT_THROW(
-      testConstant(ROW({BOOLEAN(), REAL()}), "+s", {false, true}),
-      "Flattening is only supported for scalar types.");
+
+  // Flattened, a constant of a complex type is exported as its type.
+  for (const auto& type : std::vector<TypePtr>{
+           ARRAY(INTEGER()),
+           MAP(BOOLEAN(), REAL()),
+           ROW({BOOLEAN(), REAL()})}) {
+    ArrowSchema arrowSchema;
+    velox::exportToArrow(
+        BaseVector::wrapInConstant(
+            100, 3, BaseVector::create(type, 100, pool())),
+        arrowSchema,
+        ArrowOptions{.flattenConstant = true});
+    EXPECT_EQ(*type, *importFromArrow(arrowSchema));
+    arrowSchema.release(&arrowSchema);
+  }
+
+  // A vector that allocates nothing can have no pool.
+  auto row = std::make_shared<RowVector>(
+      nullptr,
+      ROW({BIGINT()}),
+      nullptr,
+      3,
+      std::vector<VectorPtr>{makeFlatVector<int64_t>({1, 2, 3})});
+  ArrowSchema arrowSchema;
+  velox::exportToArrow(
+      BaseVector::wrapInConstant(3, 0, row),
+      arrowSchema,
+      ArrowOptions{.flattenConstant = true});
+  EXPECT_EQ(*row->type(), *importFromArrow(arrowSchema));
+  arrowSchema.release(&arrowSchema);
 }
 
 TEST_F(ArrowBridgeSchemaExportTest, dictionaryTimestampUtc) {
