@@ -1377,6 +1377,7 @@ TEST_F(ArrowBridgeArrayExportTest, flattenedNestedEncodings) {
            makeIndices({1, 1, 0, 0}),
            makeFlatVector<std::string>({"a", "a string that is not inline"}))},
       nullEvery(3));
+  auto unknownRow = makeRowVector({BaseVector::create(UNKNOWN(), 4, pool())});
   auto dictionaryOfConstant = dictionary(makeConstant<int64_t>(7, 4));
   auto dictionaryOfDictionaryOfConstant = dictionary(
       BaseVector::wrapInDictionary(
@@ -1408,7 +1409,18 @@ TEST_F(ArrowBridgeArrayExportTest, flattenedNestedEncodings) {
            BaseVector::wrapInConstant(5, 1, row),
            BaseVector::createNullConstant(ARRAY(BIGINT()), 5, pool()),
            makeArrayVector({0, 2}, dictionary(row)),
+           // Elements out of order and with a gap.
+           std::make_shared<ArrayVector>(
+               pool(),
+               ARRAY(row->type()),
+               nullptr,
+               2,
+               makeIndices({3, 0}),
+               makeIndices({2, 2}),
+               dictionary(row)),
            makeRowVector({dictionary(array), dictionaryOfConstant}),
+           dictionary(unknownRow),
+           BaseVector::wrapInConstant(5, 1, unknownRow),
        }) {
     SCOPED_TRACE(vector->toString());
     testRoundTrip(vector);
@@ -1439,11 +1451,13 @@ TEST_F(ArrowBridgeArrayExportTest, flattenedDictionaryOverStructWithNulls) {
       wrapInDictionary(
           makeIndices({2, 1, 0}), makeFlatVector<int64_t>({10, 20, 30})));
   auto row = makeRowVector({child}, [](vector_size_t row) { return row == 1; });
+  // Debug builds check the indices of the base of a dictionary when it is
+  // built.
+  auto vector = wrapInDictionary(makeIndices({0, 2, 3}), row);
   childIndices->asMutable<vector_size_t>()[1] = 100'000'000;
   options_.flattenDictionary = true;
 
-  auto array =
-      toArrow(wrapInDictionary(makeIndices({0, 2, 3}), row), options_, pool());
+  auto array = toArrow(vector, options_, pool());
   ASSERT_OK(array->ValidateFull());
   const auto& values = static_cast<const arrow::Int64Array&>(
       *static_cast<const arrow::StructArray&>(*array).field(0));

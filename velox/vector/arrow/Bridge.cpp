@@ -1693,8 +1693,7 @@ void exportConstant(
 }
 
 // Whether 'vec' is a dictionary or constant of a complex type that 'options'
-// flatten. Such a vector is exported flat throughout, see peelComplex() and
-// flattenAll().
+// flatten. Such a vector is exported as a flat copy, see flattenRows().
 bool isFlattenedComplex(const BaseVector& vec, const ArrowOptions& options) {
   if (vec.type()->isPrimitiveType()) {
     return false;
@@ -1709,70 +1708,60 @@ bool isFlattenedComplex(const BaseVector& vec, const ArrowOptions& options) {
   }
 }
 
-// The options for the contents of a flattened dictionary or constant of a
-// complex type. They flatten everything, so the schema of the contents, like
-// that of a flat vector, follows from their type.
-ArrowOptions flattenAll(const ArrowOptions& options) {
-  auto result = options;
-  result.flattenDictionary = true;
-  result.flattenConstant = true;
-  return result;
-}
-
-// Returns 'vec', a dictionary or constant of a complex type, with its top level
-// flat: the children of a struct, and the elements, keys and values of an array
-// or map, are dictionaries over those of the base of 'vec'. The export then
-// flattens them in turn, reading only the rows it exports. Only the selected
-// rows outside a null struct are decoded, since the indices of rows under a
-// null struct are undefined. The other rows are null.
-VectorPtr peelComplex(
+// Returns a flat vector of 'size' rows, whose row 'i' of 'rows' is row
+// 'indices[i]' of 'vec', and whose other rows are null. It decodes and copies
+// only these rows of 'vec', and only the elements of their arrays and maps. So
+// it reads no row under a null struct, whose indices are undefined. Unlike a
+// dictionary over 'vec', it does not validate the other rows either.
+VectorPtr flattenRows(
     const BaseVector& vec,
-    const Selection& rows,
-    const BufferPtr& parentNulls,
+    vector_size_t size,
+    const SelectivityVector& rows,
+    const vector_size_t* indices,
     memory::MemoryPool* pool) {
-  const auto size = vec.size();
-  const auto* rawParentNulls =
-      parentNulls ? parentNulls->as<uint64_t>() : nullptr;
-  SelectivityVector rowsToDecode(size, false);
-  rows.apply([&](vector_size_t row) {
-    if (!isNull(rawParentNulls, row)) {
-      rowsToDecode.setValid(row, true);
-    }
-  });
+  SelectivityVector rowsToDecode(vec.size(), false);
+  rows.applyToSelected(
+      [&](vector_size_t row) { rowsToDecode.setValid(indices[row], true); });
   rowsToDecode.updateBounds();
   DecodedVector decoded(vec, rowsToDecode);
 
   auto nulls = allocateNulls(size, pool, bits::kNull);
-  auto indices = allocateIndices(size, pool);
+  auto baseIndices = allocateIndices(size, pool);
   auto* rawNulls = nulls->asMutable<uint64_t>();
-  auto* rawIndices = indices->asMutable<vector_size_t>();
-  rowsToDecode.applyToSelected([&](vector_size_t row) {
-    if (!decoded.isNullAt(row)) {
+  auto* rawBaseIndices = baseIndices->asMutable<vector_size_t>();
+  SelectivityVector nonNullRows(size, false);
+  rows.applyToSelected([&](vector_size_t row) {
+    if (!decoded.isNullAt(indices[row])) {
       bits::clearNull(rawNulls, row);
-      rawIndices[row] = decoded.index(row);
+      rawBaseIndices[row] = decoded.index(indices[row]);
+      nonNullRows.setValid(row, true);
     }
   });
+  nonNullRows.updateBounds();
 
   const auto& base = *decoded.base();
-  if (base.isConstantEncoding()) {
-    // A null constant has no base: every row is null.
-    auto result = BaseVector::create(vec.type(), size, pool);
-    result->setNulls(nulls);
-    return result;
+  // The base of a scalar is flat or constant. A null constant of a complex
+  // type has no base, but then every row is null.
+  if (vec.type()->isPrimitiveType() || base.isConstantEncoding()) {
+    auto flat = BaseVector::create(vec.type(), size, pool);
+    if (nonNullRows.hasSelections()) {
+      flat->copy(&base, nonNullRows, rawBaseIndices);
+    }
+    flat->setNulls(nulls);
+    return flat;
   }
 
   if (vec.typeKind() == TypeKind::ROW) {
     std::vector<VectorPtr> children;
     for (const auto& child : base.asUnchecked<RowVector>()->children()) {
       children.push_back(
-          BaseVector::wrapInDictionary(nulls, indices, size, child));
+          flattenRows(*child, size, nonNullRows, rawBaseIndices, pool));
     }
     return std::make_shared<RowVector>(
         pool, vec.type(), nulls, size, std::move(children));
   }
 
-  // Lay out the elements of the rows one after the other: the export reads
-  // every element of an array with such offsets.
+  // Copy the elements of the rows, one after the other.
   const auto& arrays = *base.asUnchecked<ArrayVectorBase>();
   auto offsets = allocateOffsets(size, pool);
   auto sizes = allocateSizes(size, pool);
@@ -1781,24 +1770,23 @@ VectorPtr peelComplex(
   vector_size_t numElements = 0;
   for (vector_size_t row = 0; row < size; ++row) {
     rawOffsets[row] = numElements;
-    if (!bits::isBitNull(rawNulls, row)) {
-      rawSizes[row] = arrays.sizeAt(rawIndices[row]);
+    if (nonNullRows.isValid(row)) {
+      rawSizes[row] = arrays.sizeAt(rawBaseIndices[row]);
       numElements = checkedPlus(numElements, rawSizes[row]);
     }
   }
   auto elementIndices = allocateIndices(numElements, pool);
   auto* rawElementIndices = elementIndices->asMutable<vector_size_t>();
-  for (vector_size_t row = 0; row < size; ++row) {
-    if (!bits::isBitNull(rawNulls, row)) {
-      std::iota(
-          rawElementIndices + rawOffsets[row],
-          rawElementIndices + rawOffsets[row] + rawSizes[row],
-          arrays.offsetAt(rawIndices[row]));
-    }
-  }
-  auto wrapElements = [&](const VectorPtr& elements) {
-    return BaseVector::wrapInDictionary(
-        nullptr, elementIndices, numElements, elements);
+  nonNullRows.applyToSelected([&](vector_size_t row) {
+    std::iota(
+        rawElementIndices + rawOffsets[row],
+        rawElementIndices + rawOffsets[row] + rawSizes[row],
+        arrays.offsetAt(rawBaseIndices[row]));
+  });
+  const SelectivityVector allElements(numElements);
+  auto flattenElements = [&](const BaseVector& elements) {
+    return flattenRows(
+        elements, numElements, allElements, rawElementIndices, pool);
   };
 
   if (vec.typeKind() == TypeKind::ARRAY) {
@@ -1809,7 +1797,7 @@ VectorPtr peelComplex(
         size,
         offsets,
         sizes,
-        wrapElements(base.asUnchecked<ArrayVector>()->elements()));
+        flattenElements(*base.asUnchecked<ArrayVector>()->elements()));
   }
   const auto& maps = *base.asUnchecked<MapVector>();
   return std::make_shared<MapVector>(
@@ -1819,8 +1807,8 @@ VectorPtr peelComplex(
       size,
       offsets,
       sizes,
-      wrapElements(maps.mapKeys()),
-      wrapElements(maps.mapValues()));
+      flattenElements(*maps.mapKeys()),
+      flattenElements(*maps.mapValues()));
 }
 
 void exportToArrowImpl(
@@ -1831,10 +1819,23 @@ void exportToArrowImpl(
     memory::MemoryPool* pool,
     const BufferPtr& parentNulls) {
   if (isFlattenedComplex(vec, options)) {
+    // Copy the rows the export reads: the selected rows outside a null struct.
+    const auto* rawParentNulls =
+        parentNulls ? parentNulls->as<uint64_t>() : nullptr;
+    SelectivityVector rowsToCopy(vec.size(), false);
+    rows.apply([&](vector_size_t row) {
+      if (!isNull(rawParentNulls, row)) {
+        rowsToCopy.setValid(row, true);
+      }
+    });
+    rowsToCopy.updateBounds();
+    auto identity = allocateIndices(vec.size(), pool);
+    auto* rawIdentity = identity->asMutable<vector_size_t>();
+    std::iota(rawIdentity, rawIdentity + vec.size(), 0);
     exportToArrowImpl(
-        *peelComplex(vec, rows, parentNulls, pool),
+        *flattenRows(vec, vec.size(), rowsToCopy, rawIdentity, pool),
         rows,
-        flattenAll(options),
+        options,
         out,
         pool,
         parentNulls);
@@ -2126,15 +2127,19 @@ void exportToArrow(
     ArrowSchema& arrowSchema,
     const ArrowOptions& options) {
   if (isFlattenedComplex(*vec, options)) {
-    // The schema of the base with flattenAll(). A null constant has no base:
-    // use an empty vector of its type.
+    // The data is flat throughout, so its schema is that of the base with every
+    // encoding flattened. A null constant has no base: use an empty vector of
+    // its type.
+    auto flatOptions = options;
+    flatOptions.flattenDictionary = true;
+    flatOptions.flattenConstant = true;
     const auto& base = BaseVector::wrappedVectorShared(vec);
     exportToArrow(
         base->isConstantEncoding()
             ? BaseVector::create(vec->type(), 0, vec->pool())
             : base,
         arrowSchema,
-        flattenAll(options));
+        flatOptions);
     return;
   }
 
