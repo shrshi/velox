@@ -223,67 +223,6 @@ void CudfHashJoinProbe::doClose() {
   tree_ = {};
 }
 
-void CudfHashJoinBridge::setHashTable(
-    std::optional<CudfHashJoinBridge::hash_type> hashObject) {
-  if (CudfConfig::getInstance().debugEnabled) {
-    VLOG(2) << "Calling CudfHashJoinBridge::setHashTable";
-  }
-  std::vector<ContinuePromise> promises;
-  {
-    std::lock_guard<std::mutex> l(mutex_);
-    VELOX_CHECK(
-        !hashObject_.has_value(),
-        "CudfHashJoinBridge already has a hash table");
-    hashObject_ = std::move(hashObject);
-    promises = std::move(promises_);
-  }
-  notify(std::move(promises));
-}
-
-std::optional<CudfHashJoinBridge::hash_type> CudfHashJoinBridge::hashOrFuture(
-    ContinueFuture* future) {
-  if (CudfConfig::getInstance().debugEnabled) {
-    VLOG(2) << "Calling CudfHashJoinBridge::hashOrFuture";
-  }
-  std::lock_guard<std::mutex> l(mutex_);
-  if (hashObject_.has_value()) {
-    return hashObject_;
-  }
-  if (CudfConfig::getInstance().debugEnabled) {
-    VLOG(2) << "Calling CudfHashJoinBridge::hashOrFuture constructing promise";
-  }
-  promises_.emplace_back("CudfHashJoinBridge::hashOrFuture");
-  if (CudfConfig::getInstance().debugEnabled) {
-    VLOG(2) << "Calling CudfHashJoinBridge::hashOrFuture getSemiFuture";
-  }
-  *future = promises_.back().getSemiFuture();
-  if (CudfConfig::getInstance().debugEnabled) {
-    VLOG(2) << "Calling CudfHashJoinBridge::hashOrFuture returning nullopt";
-  }
-  return std::nullopt;
-}
-
-void CudfHashJoinBridge::setBuildStream(cuda::stream_ref buildStream) {
-  std::lock_guard<std::mutex> l(mutex_);
-  buildStream_ = buildStream;
-}
-
-std::optional<cuda::stream_ref> CudfHashJoinBridge::getBuildStream() {
-  std::lock_guard<std::mutex> l(mutex_);
-  return buildStream_;
-}
-
-void CudfHashJoinBridge::setBuildReadyEvent(
-    std::shared_ptr<CudaEvent> buildReadyEvent) {
-  std::lock_guard<std::mutex> l(mutex_);
-  buildReadyEvent_ = std::move(buildReadyEvent);
-}
-
-std::shared_ptr<CudaEvent> CudfHashJoinBridge::getBuildReadyEvent() {
-  std::lock_guard<std::mutex> l(mutex_);
-  return buildReadyEvent_;
-}
-
 CudfHashJoinBuild::CudfHashJoinBuild(
     int32_t operatorId,
     exec::DriverCtx* driverCtx,
@@ -387,16 +326,11 @@ void CudfHashJoinBuild::buildAndPublish(std::vector<CudfVectorPtr> inputs) {
     shared_tbls.push_back(std::move(tbl));
   }
   // set hash table to CudfHashJoinBridge
-  auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
-      operatorCtx_->driverCtx()->splitGroupId, planNodeId());
-  auto cudfHashJoinBridge =
-      std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
-
-  cudfHashJoinBridge->setBuildStream(stream);
-  cudfHashJoinBridge->setBuildReadyEvent(std::move(buildReadyEvent));
-  cudfHashJoinBridge->setHashTable(
-      std::make_optional(
-          std::make_pair(std::move(shared_tbls), std::move(hashObjects))));
+  getCudfJoinBridge<CudfHashJoinBridge>(*operatorCtx_)
+      ->setData(
+          {std::make_pair(std::move(shared_tbls), std::move(hashObjects)),
+           stream,
+           std::move(buildReadyEvent)});
 }
 
 CudfHashJoinProbe::CudfHashJoinProbe(
@@ -2300,23 +2234,19 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
     return exec::BlockingReason::kNotBlocked;
   }
 
-  auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
-      operatorCtx_->driverCtx()->splitGroupId, planNodeId());
-  auto cudfJoinBridge =
-      std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
-  VELOX_CHECK_NOT_NULL(cudfJoinBridge);
   VELOX_CHECK_NOT_NULL(future);
-  auto hashObject = cudfJoinBridge->hashOrFuture(future);
+  auto buildResult = getCudfJoinBridge<CudfHashJoinBridge>(*operatorCtx_)
+                         ->dataOrFuture(future);
 
-  if (!hashObject.has_value()) {
+  if (!buildResult.has_value()) {
     if (CudfConfig::getInstance().debugEnabled) {
       VLOG(2) << "CudfHashJoinProbe is blocked, waiting for join build";
     }
     return exec::BlockingReason::kWaitForJoinBuild;
   }
-  hashObject_ = std::move(hashObject);
-  buildStream_ = cudfJoinBridge->getBuildStream();
-  buildReadyEvent_ = cudfJoinBridge->getBuildReadyEvent();
+  hashObject_ = std::move(buildResult->payload);
+  buildStream_ = buildResult->buildStream;
+  buildReadyEvent_ = std::move(buildResult->buildReadyEvent);
 
   // Lazy initialize matched flags only when build side is done
   if (joinNode_->isRightJoin() || joinNode_->isFullJoin()) {

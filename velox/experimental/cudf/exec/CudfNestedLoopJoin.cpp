@@ -84,54 +84,6 @@ cudf::size_type checkedCrossJoinOutputRows(
 
 } // namespace
 
-void CudfNestedLoopJoinBridge::setData(
-    std::optional<CudfNestedLoopJoinBridge::build_data_type> data) {
-  std::vector<ContinuePromise> promises;
-  {
-    std::lock_guard<std::mutex> l(mutex_);
-    VELOX_CHECK(!data_.has_value(), "Bridge already has data");
-    data_ = std::move(data);
-    promises = std::move(promises_); // Extract promises to fulfill outside lock
-  }
-  notify(std::move(promises)); // Wake up all blocked probe operators
-}
-
-// Returns build data if available, otherwise returns a future to wait on.
-// Called by probe operators in isBlocked().
-std::optional<CudfNestedLoopJoinBridge::build_data_type>
-CudfNestedLoopJoinBridge::dataOrFuture(ContinueFuture* future) {
-  std::lock_guard<std::mutex> l(mutex_);
-  VELOX_CHECK(!cancelled_, "Getting data after the build side is aborted");
-  if (data_.has_value()) {
-    return data_;
-  }
-  // Data not ready yet, create a promise that will be fulfilled by setData()
-  promises_.emplace_back("CudfNestedLoopJoinBridge::dataOrFuture");
-  *future = promises_.back().getSemiFuture();
-  return std::nullopt; // Probe will block on the future
-}
-
-void CudfNestedLoopJoinBridge::setBuildReadyEvent(
-    std::shared_ptr<CudaEvent> buildReadyEvent) {
-  std::lock_guard<std::mutex> l(mutex_);
-  buildReadyEvent_ = std::move(buildReadyEvent);
-}
-
-std::shared_ptr<CudaEvent> CudfNestedLoopJoinBridge::getBuildReadyEvent() {
-  std::lock_guard<std::mutex> l(mutex_);
-  return buildReadyEvent_;
-}
-
-void CudfNestedLoopJoinBridge::setBuildStream(cuda::stream_ref buildStream) {
-  std::lock_guard<std::mutex> l(mutex_);
-  buildStream_ = buildStream;
-}
-
-std::optional<cuda::stream_ref> CudfNestedLoopJoinBridge::getBuildStream() {
-  std::lock_guard<std::mutex> l(mutex_);
-  return buildStream_;
-}
-
 // ============================================================================
 // Build Operator Implementation
 // ============================================================================
@@ -178,7 +130,7 @@ void CudfNestedLoopJoinBuild::buildAndPublish(
   // by cudfGlobalStreamPool() for unrelated work. Every probe operator
   // instance/batch just waits on this same event before reading buildData_
   // (see CudfNestedLoopJoinProbe::waitForBuildReady()). `stream` is also
-  // exposed via setBuildStream() below: buildData_'s eventual free is
+  // published in CudfJoinBuildResult below: buildData_'s eventual free is
   // stream-ordered on `stream` (it was allocated here), so every probe read
   // makes `stream` wait on its own completion first (see
   // CudfNestedLoopJoinProbe::recordReadCompletion()), ensuring that free
@@ -187,16 +139,11 @@ void CudfNestedLoopJoinBuild::buildAndPublish(
   buildReadyEvent->recordFrom(stream);
 
   // Transfer build data to bridge - this will unblock probe operators.
-  auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
-      operatorCtx_->driverCtx()->splitGroupId, planNodeId());
-  auto bridge = std::dynamic_pointer_cast<CudfNestedLoopJoinBridge>(joinBridge);
-
-  bridge->setBuildReadyEvent(std::move(buildReadyEvent));
-  bridge->setBuildStream(stream);
-  bridge->setData(
-      std::make_optional(
-          CudfNestedLoopJoinBridge::build_data_type{
-              std::shared_ptr<cudf::table>(std::move(table)), buildRowCount}));
+  getCudfJoinBridge<CudfNestedLoopJoinBridge>(*operatorCtx_)
+      ->setData(
+          {{std::move(table), buildRowCount},
+           stream,
+           std::move(buildReadyEvent)});
 }
 
 // ============================================================================
@@ -420,19 +367,17 @@ exec::BlockingReason CudfNestedLoopJoinProbe::isBlocked(
     return exec::BlockingReason::kNotBlocked;
   }
 
-  auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
-      operatorCtx_->driverCtx()->splitGroupId, planNodeId());
-  auto bridge = std::dynamic_pointer_cast<CudfNestedLoopJoinBridge>(joinBridge);
-  VELOX_CHECK_NOT_NULL(bridge);
   VELOX_CHECK_NOT_NULL(future);
 
-  buildData_ = bridge->dataOrFuture(future);
-  if (!buildData_.has_value()) {
+  auto buildResult = getCudfJoinBridge<CudfNestedLoopJoinBridge>(*operatorCtx_)
+                         ->dataOrFuture(future);
+  if (!buildResult.has_value()) {
     return exec::BlockingReason::kWaitForJoinBuild;
   }
 
-  buildReadyEvent_ = bridge->getBuildReadyEvent();
-  buildStream_ = bridge->getBuildStream();
+  buildData_ = std::move(buildResult->payload);
+  buildReadyEvent_ = std::move(buildResult->buildReadyEvent);
+  buildStream_ = buildResult->buildStream;
 
   if (buildData_->rowCount == 0) {
     buildEmpty_ = true;
@@ -1183,8 +1128,11 @@ std::unique_ptr<exec::Operator> CudfNestedLoopJoinBridgeTranslator::toOperator(
 
 std::unique_ptr<exec::JoinBridge>
 CudfNestedLoopJoinBridgeTranslator::toJoinBridge(
-    const core::PlanNodePtr& /* node */) {
-  return std::make_unique<CudfNestedLoopJoinBridge>();
+    const core::PlanNodePtr& node) {
+  if (std::dynamic_pointer_cast<const core::NestedLoopJoinNode>(node)) {
+    return std::make_unique<CudfNestedLoopJoinBridge>();
+  }
+  return nullptr;
 }
 
 exec::OperatorSupplier CudfNestedLoopJoinBridgeTranslator::toOperatorSupplier(
