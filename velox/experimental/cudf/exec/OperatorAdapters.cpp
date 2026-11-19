@@ -41,6 +41,7 @@
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/Validation.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
+#include "velox/experimental/cudf/expression/AstExpressionUtils.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #ifdef VELOX_ENABLE_UCX_EXCHANGE
 #include "velox/experimental/ucx-exchange/UcxExchange.h"
@@ -73,6 +74,7 @@
 #include "velox/exec/TopNRowNumber.h"
 #include "velox/exec/Values.h"
 #include "velox/exec/Window.h"
+#include "velox/expression/ExprOptimizer.h"
 
 namespace facebook::velox::cudf_velox {
 
@@ -508,6 +510,25 @@ class CudfHashJoinBaseAdapter : public OperatorAdapter {
               op->pool())) {
         LOG_FALLBACK(
             "HashJoin join filter cannot be evaluated by cuDF, PlanNode id: {}",
+            planNode->id());
+        return false;
+      }
+      // These joins require an AST filter. Same check as
+      // CudfHashJoinProbe::initialize().
+      if ((joinPlanNode->isLeftSemiFilterJoin() ||
+           joinPlanNode->isRightSemiFilterJoin() ||
+           joinPlanNode->isAntiJoin() || joinPlanNode->isFullJoin() ||
+           joinPlanNode->isLeftSemiProjectJoin()) &&
+          hasNonAstSubexprSpanningBothSides(
+              expression::optimize(
+                  joinPlanNode->filter(),
+                  ctx->task->queryCtx().get(),
+                  op->pool()),
+              joinPlanNode->sources()[0]->outputType(),
+              joinPlanNode->sources()[1]->outputType())) {
+        LOG_FALLBACK(
+            "HashJoin filter has a non-AST expression spanning both sides, "
+            "PlanNode id: {}",
             planNode->id());
         return false;
       }

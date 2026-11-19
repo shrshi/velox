@@ -303,14 +303,6 @@ void CudfHashJoinProbe::initialize() {
     useAstFilter_ = false;
   }
 
-  // Validate AST filtering for this join type now to avoid run-time error.
-  if (joinNode_->isRightSemiFilterJoin() || joinNode_->isLeftSemiFilterJoin() ||
-      joinNode_->isAntiJoin()) {
-    VELOX_CHECK(
-        useAstFilter_,
-        "AST expression evaluation must be enabled for semi-filter and anti joins.");
-  }
-
   // Create a reusable evaluator for the filter column. This is expensive to
   // build, and the expression + input schema are stable for the lifetime of
   // the operator instance.
@@ -329,7 +321,14 @@ void CudfHashJoinProbe::initialize() {
     VLOG(1) << "Filter expression spans both join sides, using "
                "filterEvaluator_ instead of AST";
     useAstFilter_ = false;
-    return;
+  }
+
+  // Validate AST filtering for this join type now to avoid run-time error.
+  if (joinNode_->isRightSemiFilterJoin() || joinNode_->isLeftSemiFilterJoin() ||
+      joinNode_->isAntiJoin()) {
+    VELOX_CHECK(
+        useAstFilter_,
+        "AST expression evaluation must be enabled for semi-filter and anti joins.");
   }
 
   // We don't need to get tables that contain conditional comparison columns
@@ -622,6 +621,30 @@ void CudfHashJoinProbe::appendProbeRowsOutput(
       stream));
 }
 
+cudf::table_view CudfHashJoinProbe::extendedProbeView(
+    cudf::table_view probeView,
+    std::vector<ColumnOrView>& precomputed,
+    cuda::stream_ref stream) const {
+  if (leftPrecomputeInstructions_.empty()) {
+    return probeView;
+  }
+  precomputed = precomputeSubexpressions(
+      tableViewToColumnViews(probeView),
+      leftPrecomputeInstructions_,
+      scalars_,
+      probeType_,
+      stream);
+  return makeExtendedTableView(probeView, precomputed);
+}
+
+cudf::table_view CudfHashJoinProbe::extendedBuildView(
+    size_t buildTableIdx,
+    cudf::table_view buildView) const {
+  return rightPrecomputeInstructions_.empty()
+      ? buildView
+      : cachedExtendedRightViews_[buildTableIdx];
+}
+
 std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::innerJoin(
     cudf::table_view leftTableView,
     cuda::stream_ref stream) {
@@ -632,29 +655,15 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::innerJoin(
 
   // Precompute left (probe) table columns if needed (once, outside loop)
   std::vector<ColumnOrView> leftPrecomputed;
-  cudf::table_view extendedLeftView = leftTableView;
-  if (joinNode_->filter() && useAstFilter_ &&
-      !leftPrecomputeInstructions_.empty()) {
-    auto leftColumnViews = tableViewToColumnViews(leftTableView);
-    leftPrecomputed = precomputeSubexpressions(
-        leftColumnViews,
-        leftPrecomputeInstructions_,
-        scalars_,
-        probeType_,
-        stream);
-    extendedLeftView = makeExtendedTableView(leftTableView, leftPrecomputed);
-  }
+  auto extendedLeftView =
+      extendedProbeView(leftTableView, leftPrecomputed, stream);
 
   for (auto i = 0; i < rightTables.size(); i++) {
     auto rightTableView = rightTables[i]->view();
     auto& hb = hbs[i];
 
     // Use cached precomputed columns for right (build) table
-    cudf::table_view extendedRightView =
-        (joinNode_->filter() && useAstFilter_ &&
-         !rightPrecomputeInstructions_.empty())
-        ? cachedExtendedRightViews_[i]
-        : rightTableView;
+    auto extendedRightView = extendedBuildView(i, rightTableView);
 
     // left = probe, right = build
     VELOX_CHECK_NOT_NULL(hb);
@@ -723,17 +732,8 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::leftJoin(
 
   // Precompute left (probe) table columns if needed (once, outside loop)
   std::vector<ColumnOrView> leftPrecomputed;
-  cudf::table_view extendedLeftView = leftTableView;
-  if (joinNode_->filter() && !leftPrecomputeInstructions_.empty()) {
-    auto leftColumnViews = tableViewToColumnViews(leftTableView);
-    leftPrecomputed = precomputeSubexpressions(
-        leftColumnViews,
-        leftPrecomputeInstructions_,
-        scalars_,
-        probeType_,
-        stream);
-    extendedLeftView = makeExtendedTableView(leftTableView, leftPrecomputed);
-  }
+  auto extendedLeftView =
+      extendedProbeView(leftTableView, leftPrecomputed, stream);
 
   // Processes a build batch of join indices: applies the filter (if any),
   // updates probeTracker from post-filter left indices, and appends the result
@@ -743,9 +743,7 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::leftJoin(
                           cudf::table_view rightTableView,
                           size_t buildBatchIdx) {
     if (joinNode_->filter()) {
-      cudf::table_view extendedRightView = !rightPrecomputeInstructions_.empty()
-          ? cachedExtendedRightViews_[buildBatchIdx]
-          : rightTableView;
+      auto extendedRightView = extendedBuildView(buildBatchIdx, rightTableView);
 
       if (useAstFilter_) {
         // Inline filter_join_indices so we can access post-filter left indices
@@ -898,6 +896,10 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::fullJoin(
   // rows can be emitted with NULL build columns after the loop.
   CudfJoinMatchTracker probeTracker(numProbeRows, stream, get_temp_mr());
 
+  std::vector<ColumnOrView> leftPrecomputed;
+  auto extendedLeftView =
+      extendedProbeView(leftTableView, leftPrecomputed, stream);
+
   for (auto i = 0; i < rightTables.size(); i++) {
     auto rightTableView = rightTables[i]->view();
     auto& hb = hbs[i];
@@ -923,8 +925,8 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::fullJoin(
       // Apply filter and keep only pairs where the predicate passes.
       auto [filteredLeftJoinIndices, filteredRightJoinIndices] =
           filterJoinIndices(
-              leftTableView,
-              rightTableView,
+              extendedLeftView,
+              extendedBuildView(i, rightTableView),
               leftIndicesCol,
               rightIndicesCol,
               tree_.back(),
@@ -982,6 +984,10 @@ CudfHashJoinProbe::leftSemiFilterJoin(
   // probe row is emitted at most once (semi-join semantics).
   CudfJoinMatchTracker probeTracker(numProbeRows, stream, get_temp_mr());
 
+  std::vector<ColumnOrView> leftPrecomputed;
+  auto extendedLeftView =
+      extendedProbeView(leftTableView, leftPrecomputed, stream);
+
   for (auto i = 0; i < rightTables.size(); i++) {
     auto rightTableView = rightTables[i]->view();
     std::unique_ptr<rmm::device_uvector<cudf::size_type>> leftJoinIndices;
@@ -990,8 +996,8 @@ CudfHashJoinProbe::leftSemiFilterJoin(
       leftJoinIndices = cudf::mixed_left_semi_join(
           leftTableView.select(leftKeyIndices_),
           rightTableView.select(rightKeyIndices_),
-          leftTableView,
-          rightTableView,
+          extendedLeftView,
+          extendedBuildView(i, rightTableView),
           tree_.back(),
           cudf::null_equality::UNEQUAL,
           stream,
@@ -1148,27 +1154,15 @@ CudfHashJoinProbe::leftSemiProjectJoin(
 
   // Precompute left (probe) table columns if needed for filter
   std::vector<ColumnOrView> leftPrecomputed;
-  cudf::table_view extendedLeftView = leftTableView;
-  if (joinNode_->filter() && !leftPrecomputeInstructions_.empty()) {
-    auto leftColumnViews = tableViewToColumnViews(leftTableView);
-    leftPrecomputed = precomputeSubexpressions(
-        leftColumnViews,
-        leftPrecomputeInstructions_,
-        scalars_,
-        probeType_,
-        stream);
-    extendedLeftView = makeExtendedTableView(leftTableView, leftPrecomputed);
-  }
+  auto extendedLeftView =
+      extendedProbeView(leftTableView, leftPrecomputed, stream);
 
   for (auto i = 0; i < rightTables.size(); i++) {
     auto rightTableView = rightTables[i]->view();
     auto& hb = hbs[i];
 
     // Use cached precomputed columns for right (build) table
-    cudf::table_view extendedRightView =
-        (joinNode_->filter() && !rightPrecomputeInstructions_.empty())
-        ? cachedExtendedRightViews_[i]
-        : rightTableView;
+    auto extendedRightView = extendedBuildView(i, rightTableView);
 
     // Step 1: Inner join to get (probe_idx, build_idx) pairs where keys match.
     // Unlike left_join, inner_join only returns valid pairs (no JoinNoMatch).
@@ -1325,10 +1319,7 @@ CudfHashJoinProbe::leftSemiProjectJoin(
         }
 
         // Get extended views for filter evaluation
-        cudf::table_view extendedRightView =
-            (!rightPrecomputeInstructions_.empty())
-            ? cachedExtendedRightViews_[i]
-            : rightTableView;
+        auto extendedRightView = extendedBuildView(i, rightTableView);
 
         // Type B: Null probe keys × all build rows
         if (probeHasNulls) {
@@ -1488,11 +1479,14 @@ CudfHashJoinProbe::rightSemiFilterJoin(
 
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> rightJoinIndices;
   if (joinNode_->filter()) {
+    std::vector<ColumnOrView> leftPrecomputed;
+    auto extendedLeftView =
+        extendedProbeView(leftTableView, leftPrecomputed, stream);
     rightJoinIndices = cudf::mixed_left_semi_join(
         rightTableView.select(rightKeyIndices_),
         leftTableView.select(leftKeyIndices_),
-        rightTableView,
-        leftTableView,
+        extendedBuildView(0, rightTableView),
+        extendedLeftView,
         tree_.back(),
         cudf::null_equality::UNEQUAL,
         stream,
@@ -1555,11 +1549,14 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::antiJoin(
 
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> leftJoinIndices;
   if (joinNode_->filter()) {
+    std::vector<ColumnOrView> leftPrecomputed;
+    auto extendedLeftView =
+        extendedProbeView(leftTableView, leftPrecomputed, stream);
     leftJoinIndices = cudf::mixed_left_anti_join(
         leftTableView.select(leftKeyIndices_),
         rightTableView.select(rightKeyIndices_),
-        leftTableView,
-        rightTableView,
+        extendedLeftView,
+        extendedBuildView(0, rightTableView),
         tree_.back(),
         cudf::null_equality::UNEQUAL,
         stream,

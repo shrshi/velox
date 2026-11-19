@@ -273,6 +273,161 @@ TEST_F(HashJoinTest, countStarOverLikeFilterSpanningBothSidesJoin) {
   AssertQueryBuilder(plan).assertResults(expected);
 }
 
+// Join filters for semi, anti and full joins with a one-sided subexpression
+// the AST cannot evaluate, which is precomputed into an extra column.
+class HashJoinPrecomputedFilterTest : public HashJoinTest {
+ protected:
+  void SetUp() override {
+    HashJoinTest::SetUp();
+    cudf_velox::registerPrestoFunctions(
+        cudf_velox::CudfConfig::getInstance().functionNamePrefix);
+    probe_ = makeRowVector(
+        {"k", "t_val", "t_num"},
+        {makeFlatVector<int32_t>({1, 2, 2, 3}),
+         makeFlatVector<std::string>({"x", "6", "2.5", "-10"}),
+         makeFlatVector<double>({0.0, 1.0, 3.0, -30.0})});
+    build_ = makeRowVector(
+        {"u_k", "u_threshold", "u_val", "u_pattern"},
+        {makeFlatVector<int32_t>({2, 3, 4}),
+         makeFlatVector<double>({5.0, 0.0, 1.0}),
+         makeFlatVector<std::string>({"2", "-35", "y"}),
+         makeFlatVector<std::string>({"2%", "%5", "%"})});
+    createDuckDbTable("t", {probe_});
+    createDuckDbTable("u", {build_});
+  }
+
+  void TearDown() override {
+    probe_.reset();
+    build_.reset();
+    HashJoinTest::TearDown();
+  }
+
+  void assertJoin(
+      core::JoinType joinType,
+      const std::string& filter,
+      const std::vector<std::string>& outputLayout,
+      const std::string& referenceQuery) {
+    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    auto plan =
+        PlanBuilder(planNodeIdGenerator)
+            .values({probe_})
+            .hashJoin(
+                {"k"},
+                {"u_k"},
+                PlanBuilder(planNodeIdGenerator).values({build_}).planNode(),
+                filter,
+                outputLayout,
+                joinType)
+            .planNode();
+    assertQuery(plan, referenceQuery);
+  }
+
+  RowVectorPtr probe_;
+  RowVectorPtr build_;
+};
+
+TEST_F(HashJoinPrecomputedFilterTest, leftSemiFilterProbeSide) {
+  assertJoin(
+      core::JoinType::kLeftSemiFilter,
+      "try_cast(t_val as double) > u_threshold",
+      {"k", "t_val"},
+      "SELECT k, t_val FROM t WHERE EXISTS (SELECT * FROM u "
+      "WHERE u_k = k AND try_cast(t_val AS DOUBLE) > u_threshold)");
+}
+
+TEST_F(HashJoinPrecomputedFilterTest, rightSemiFilterProbeSide) {
+  assertJoin(
+      core::JoinType::kRightSemiFilter,
+      "try_cast(t_val as double) > u_threshold",
+      {"u_k", "u_threshold"},
+      "SELECT u_k, u_threshold FROM u WHERE EXISTS (SELECT * FROM t "
+      "WHERE u_k = k AND try_cast(t_val AS DOUBLE) > u_threshold)");
+}
+
+TEST_F(HashJoinPrecomputedFilterTest, rightSemiFilterBuildSide) {
+  assertJoin(
+      core::JoinType::kRightSemiFilter,
+      "try_cast(u_val as double) > t_num",
+      {"u_k", "u_threshold"},
+      "SELECT u_k, u_threshold FROM u WHERE EXISTS (SELECT * FROM t "
+      "WHERE u_k = k AND try_cast(u_val AS DOUBLE) > t_num)");
+}
+
+TEST_F(HashJoinPrecomputedFilterTest, antiProbeSide) {
+  assertJoin(
+      core::JoinType::kAnti,
+      "try_cast(t_val as double) > u_threshold",
+      {"k", "t_val"},
+      "SELECT k, t_val FROM t WHERE NOT EXISTS (SELECT * FROM u "
+      "WHERE u_k = k AND try_cast(t_val AS DOUBLE) > u_threshold)");
+}
+
+TEST_F(HashJoinPrecomputedFilterTest, fullProbeSide) {
+  assertJoin(
+      core::JoinType::kFull,
+      "try_cast(t_val as double) > u_threshold",
+      {"k", "t_val", "u_k", "u_threshold"},
+      "SELECT k, t_val, u_k, u_threshold FROM t FULL OUTER JOIN u "
+      "ON u_k = k AND try_cast(t_val AS DOUBLE) > u_threshold");
+}
+
+// These joins need an AST filter, so a non-AST filter spanning both sides
+// keeps them on the CPU.
+TEST_F(HashJoinPrecomputedFilterTest, leftSemiFilterCrossSideNonAst) {
+  VELOX_ASSERT_THROW(
+      assertJoin(
+          core::JoinType::kLeftSemiFilter,
+          "t_val LIKE u_pattern",
+          {"k", "t_val"},
+          "SELECT k, t_val FROM t WHERE EXISTS (SELECT * FROM u "
+          "WHERE u_k = k AND t_val LIKE u_pattern)"),
+      "Replacement with cuDF operator failed");
+}
+
+TEST_F(HashJoinPrecomputedFilterTest, rightSemiFilterCrossSideNonAst) {
+  VELOX_ASSERT_THROW(
+      assertJoin(
+          core::JoinType::kRightSemiFilter,
+          "t_val LIKE u_pattern",
+          {"u_k", "u_threshold"},
+          "SELECT u_k, u_threshold FROM u WHERE EXISTS (SELECT * FROM t "
+          "WHERE u_k = k AND t_val LIKE u_pattern)"),
+      "Replacement with cuDF operator failed");
+}
+
+TEST_F(HashJoinPrecomputedFilterTest, antiCrossSideNonAst) {
+  VELOX_ASSERT_THROW(
+      assertJoin(
+          core::JoinType::kAnti,
+          "t_val LIKE u_pattern",
+          {"k", "t_val"},
+          "SELECT k, t_val FROM t WHERE NOT EXISTS (SELECT * FROM u "
+          "WHERE u_k = k AND t_val LIKE u_pattern)"),
+      "Replacement with cuDF operator failed");
+}
+
+TEST_F(HashJoinPrecomputedFilterTest, fullCrossSideNonAst) {
+  VELOX_ASSERT_THROW(
+      assertJoin(
+          core::JoinType::kFull,
+          "t_val LIKE u_pattern",
+          {"k", "t_val", "u_k", "u_threshold"},
+          "SELECT k, t_val, u_k, u_threshold FROM t FULL OUTER JOIN u "
+          "ON u_k = k AND t_val LIKE u_pattern"),
+      "Replacement with cuDF operator failed");
+}
+
+TEST_F(HashJoinPrecomputedFilterTest, leftSemiProjectCrossSideNonAst) {
+  VELOX_ASSERT_THROW(
+      assertJoin(
+          core::JoinType::kLeftSemiProject,
+          "t_val LIKE u_pattern",
+          {"k", "t_val", "match"},
+          "SELECT k, t_val, EXISTS (SELECT * FROM u "
+          "WHERE u_k = k AND t_val LIKE u_pattern) FROM t"),
+      "Replacement with cuDF operator failed");
+}
+
 TEST_F(HashJoinTest, countStarOverFullJoinWithZeroColumnOutput) {
   auto probe = makeNamedRowVector("k", makeFlatVector<int32_t>({1, 2, 2, 3}));
   auto build = makeNamedRowVector("u_k", makeFlatVector<int32_t>({2, 2, 3, 4}));
