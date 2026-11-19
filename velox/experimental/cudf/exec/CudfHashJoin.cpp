@@ -39,7 +39,6 @@
 #include <cudf/groupby.hpp>
 #include <cudf/join/filtered_join.hpp>
 #include <cudf/join/join.hpp>
-#include <cudf/join/mixed_join.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/reshape.hpp>
@@ -156,14 +155,14 @@ void CudfHashJoinBuild::buildAndPublish(std::vector<CudfVectorPtr> inputs) {
         buildType->getChildIdx(rightKeys[i]->name()));
   }
 
-  // Construct hash_join object for join types that use hb->inner_join() or
-  // hb->left_join(). Semi filter and anti joins use standalone cudf functions
-  // (e.g., mixed_left_semi_join, filtered_join) that build hash tables
-  // internally, so they don't need this.
+  // These join types probe a hash_join; no-filter semi/anti use filtered_join.
   bool buildHashJoin =
       (joinNode_->isInnerJoin() || joinNode_->isLeftJoin() ||
        joinNode_->isRightJoin() || joinNode_->isFullJoin() ||
-       joinNode_->isLeftSemiProjectJoin());
+       joinNode_->isLeftSemiProjectJoin() ||
+       (joinNode_->filter() &&
+        (joinNode_->isLeftSemiFilterJoin() ||
+         joinNode_->isRightSemiFilterJoin() || joinNode_->isAntiJoin())));
 
   std::vector<std::shared_ptr<cudf::hash_join>> hashObjects;
   for (auto i = 0; i < tbls.size(); i++) {
@@ -978,6 +977,7 @@ CudfHashJoinProbe::leftSemiFilterJoin(
   std::vector<JoinOutput> cudfOutputs;
 
   auto& rightTables = hashObject_.value().first;
+  auto& hbs = hashObject_.value().second;
   auto numProbeRows = leftTableView.num_rows();
 
   // Track which probe rows matched across all build chunks so that each
@@ -993,15 +993,21 @@ CudfHashJoinProbe::leftSemiFilterJoin(
     std::unique_ptr<rmm::device_uvector<cudf::size_type>> leftJoinIndices;
 
     if (joinNode_->filter()) {
-      leftJoinIndices = cudf::mixed_left_semi_join(
+      auto& hb = hbs[i];
+      VELOX_CHECK_NOT_NULL(hb);
+      auto [probeIndices, buildIndices] = hb->inner_join(
           leftTableView.select(leftKeyIndices_),
-          rightTableView.select(rightKeyIndices_),
-          extendedLeftView,
-          extendedBuildView(i, rightTableView),
-          tree_.back(),
-          cudf::null_equality::UNEQUAL,
+          std::nullopt,
           stream,
           get_temp_mr());
+      leftJoinIndices = filterJoinIndices(
+                            extendedLeftView,
+                            extendedBuildView(i, rightTableView),
+                            indicesView(*probeIndices),
+                            indicesView(*buildIndices),
+                            tree_.back(),
+                            stream)
+                            .first;
     } else {
       cudf::filtered_join filter_join(
           rightTableView.select(rightKeyIndices_),
@@ -1478,19 +1484,34 @@ CudfHashJoinProbe::rightSemiFilterJoin(
       "Multiple right tables not yet supported for rightSemiFilterJoin");
 
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> rightJoinIndices;
+  std::unique_ptr<cudf::column> matchedBuildIndices;
   if (joinNode_->filter()) {
     std::vector<ColumnOrView> leftPrecomputed;
     auto extendedLeftView =
         extendedProbeView(leftTableView, leftPrecomputed, stream);
-    rightJoinIndices = cudf::mixed_left_semi_join(
-        rightTableView.select(rightKeyIndices_),
+    auto& hb = hashObject_.value().second[0];
+    VELOX_CHECK_NOT_NULL(hb);
+    auto [probeIndices, buildIndices] = hb->inner_join(
         leftTableView.select(leftKeyIndices_),
-        extendedBuildView(0, rightTableView),
-        extendedLeftView,
-        tree_.back(),
-        cudf::null_equality::UNEQUAL,
+        std::nullopt,
         stream,
         get_temp_mr());
+    // The build side is the AST left table for right semi joins.
+    auto filteredBuildIndices = filterJoinIndices(
+                                    extendedBuildView(0, rightTableView),
+                                    extendedLeftView,
+                                    indicesView(*buildIndices),
+                                    indicesView(*probeIndices),
+                                    tree_.back(),
+                                    stream)
+                                    .first;
+    CudfJoinMatchTracker buildTracker(
+        rightTableView.num_rows(), stream, get_temp_mr());
+    if (filteredBuildIndices->size() > 0) {
+      buildTracker.update(
+          indicesView(*filteredBuildIndices), stream, get_temp_mr());
+    }
+    matchedBuildIndices = buildTracker.matchedIndices(stream, get_temp_mr());
   } else {
     cudf::filtered_join filter_join(
         leftTableView.select(leftKeyIndices_),
@@ -1501,7 +1522,8 @@ CudfHashJoinProbe::rightSemiFilterJoin(
         rightTableView.select(rightKeyIndices_), stream, get_temp_mr());
   }
 
-  auto rightIndicesCol = indicesView(*rightJoinIndices);
+  auto rightIndicesCol = joinNode_->filter() ? matchedBuildIndices->view()
+                                             : indicesView(*rightJoinIndices);
   auto leftIndicesCol = cudf::empty_like(rightIndicesCol);
   cudfOutputs.push_back(unfilteredOutput(
       leftTableView,
@@ -1552,15 +1574,34 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::antiJoin(
     std::vector<ColumnOrView> leftPrecomputed;
     auto extendedLeftView =
         extendedProbeView(leftTableView, leftPrecomputed, stream);
-    leftJoinIndices = cudf::mixed_left_anti_join(
+    auto& hb = hashObject_.value().second[0];
+    VELOX_CHECK_NOT_NULL(hb);
+    auto [probeIndices, buildIndices] = hb->inner_join(
         leftTableView.select(leftKeyIndices_),
-        rightTableView.select(rightKeyIndices_),
-        extendedLeftView,
-        extendedBuildView(0, rightTableView),
-        tree_.back(),
-        cudf::null_equality::UNEQUAL,
+        std::nullopt,
         stream,
         get_temp_mr());
+    auto filteredProbeIndices = filterJoinIndices(
+                                    extendedLeftView,
+                                    extendedBuildView(0, rightTableView),
+                                    indicesView(*probeIndices),
+                                    indicesView(*buildIndices),
+                                    tree_.back(),
+                                    stream)
+                                    .first;
+    CudfJoinMatchTracker probeTracker(
+        leftTableView.num_rows(), stream, get_temp_mr());
+    if (filteredProbeIndices->size() > 0) {
+      probeTracker.update(
+          indicesView(*filteredProbeIndices), stream, get_temp_mr());
+    }
+    appendProbeRowsOutput(
+        cudfOutputs,
+        leftTableView,
+        probeTracker.unmatchedIndices(stream, get_temp_mr()),
+        rightTableView,
+        stream);
+    return cudfOutputs;
   } else {
     auto const rightTableHasNulls =
         cudf::has_nulls(rightTableView.select(rightKeyIndices_));
