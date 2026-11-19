@@ -140,6 +140,20 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   std::vector<PrecomputeInstruction> leftPrecomputeInstructions_;
   /** @brief Precompute instructions for right (build) table columns */
   std::vector<PrecomputeInstruction> rightPrecomputeInstructions_;
+
+  // Returns 'probeView' with the probe-side precomputed filter columns
+  // appended. 'precomputed' owns those columns and must outlive the view.
+  cudf::table_view extendedProbeView(
+      cudf::table_view probeView,
+      std::vector<ColumnOrView>& precomputed,
+      cuda::stream_ref stream) const;
+
+  // Returns the cached extended view of build table 'buildTableIdx', or
+  // 'buildView' if the filter has no build-side precomputed columns.
+  cudf::table_view extendedBuildView(
+      size_t buildTableIdx,
+      cudf::table_view buildView) const;
+
   /** @brief Row type for probe table (needed for precomputation) */
   RowTypePtr probeType_;
   /** @brief Row type for build table (needed for precomputation) */
