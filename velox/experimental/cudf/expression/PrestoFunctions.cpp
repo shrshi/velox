@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/expression/CommonFunctions.h"
+#include "velox/experimental/cudf/expression/ConstantLookupFunctions.h"
 #include "velox/experimental/cudf/expression/DateTruncFunction.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/expression/PrestoFunctions.h"
@@ -149,6 +150,9 @@ void registerPrestoFunctions(const std::string& prefix) {
   // Presto's rules.
   setPrestoCastEnabled(true);
   registerPrestoArrayAccessFunctions(prefix);
+
+  registerConstantMapElementAtFunction(prefix + "element_at");
+  registerConstantArrayContainsFunction(prefix + "contains");
 
   registerCudfFunction(
       prefix + "array_join",
