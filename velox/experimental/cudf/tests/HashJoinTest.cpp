@@ -428,6 +428,105 @@ TEST_F(HashJoinPrecomputedFilterTest, leftSemiProjectCrossSideNonAst) {
       "Replacement with cuDF operator failed");
 }
 
+// Filtered semi and anti joins over tables with a nullable ROW payload column
+// that the filter does not reference, with nullable duplicate keys on both
+// sides (the shape of facebookincubator/velox#18230).
+class HashJoinNestedPayloadFilterTest : public HashJoinTest {
+ protected:
+  void SetUp() override {
+    HashJoinTest::SetUp();
+    probe_ = makeRowVector(
+        {"t0", "t1", "tp"},
+        {makeFlatVector<double>(
+             1000, [](auto row) { return (row % 5) * 1.5; }, nullEvery(6)),
+         makeFlatVector<bool>(1000, [](auto row) { return row % 3 == 0; }),
+         makeRowVector(
+             {makeFlatVector<int16_t>(
+                 1000, [](auto row) { return row; }, nullEvery(5))},
+             nullEvery(9))});
+    build_ = makeRowVector(
+        {"u0", "u1", "up"},
+        {makeFlatVector<double>(
+             130, [](auto row) { return (row % 4) * 1.5; }, nullEvery(4)),
+         makeFlatVector<bool>(130, [](auto row) { return row % 2 == 0; }),
+         makeRowVector(
+             {makeFlatVector<int16_t>(
+                 130, [](auto row) { return row; }, nullEvery(5))},
+             nullEvery(9))});
+    createDuckDbTable("t", {probe_});
+    createDuckDbTable("u", {build_});
+  }
+
+  void TearDown() override {
+    probe_.reset();
+    build_.reset();
+    HashJoinTest::TearDown();
+  }
+
+  void assertJoin(
+      core::JoinType joinType,
+      const std::string& filter,
+      const std::vector<std::string>& outputLayout,
+      const std::string& referenceQuery,
+      const std::string& buildFilter = "") {
+    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    auto buildPlan = PlanBuilder(planNodeIdGenerator).values({build_});
+    if (!buildFilter.empty()) {
+      buildPlan.filter(buildFilter);
+    }
+    auto plan = PlanBuilder(planNodeIdGenerator)
+                    .values({probe_})
+                    .hashJoin(
+                        {"t0"},
+                        {"u0"},
+                        buildPlan.planNode(),
+                        filter,
+                        outputLayout,
+                        joinType)
+                    .planNode();
+    assertQuery(plan, referenceQuery);
+  }
+
+  RowVectorPtr probe_;
+  RowVectorPtr build_;
+};
+
+TEST_F(HashJoinNestedPayloadFilterTest, leftSemiNestedBuildPayload) {
+  assertJoin(
+      core::JoinType::kLeftSemiFilter,
+      "t1 = true",
+      {"t0", "t1"},
+      "SELECT t0, t1 FROM t WHERE EXISTS (SELECT * FROM u "
+      "WHERE t0 = u0 AND t1 = true)");
+}
+
+TEST_F(HashJoinNestedPayloadFilterTest, antiNestedBuildPayload) {
+  assertJoin(
+      core::JoinType::kAnti,
+      "t1 = true",
+      {"t0", "t1"},
+      "SELECT t0, t1 FROM t WHERE NOT EXISTS (SELECT * FROM u "
+      "WHERE t0 = u0 AND t1 = true)");
+}
+
+TEST_F(HashJoinNestedPayloadFilterTest, rightSemiNestedProbePayload) {
+  assertJoin(
+      core::JoinType::kRightSemiFilter,
+      "u1 = true",
+      {"u0", "u1"},
+      "SELECT u0, u1 FROM u WHERE EXISTS (SELECT * FROM t "
+      "WHERE t0 = u0 AND u1 = true)");
+}
+
+TEST_F(HashJoinNestedPayloadFilterTest, rightSemiFilterEmptyBuild) {
+  assertJoin(
+      core::JoinType::kRightSemiFilter,
+      "u1 = true",
+      {"u0", "u1"},
+      "SELECT u0, u1 FROM u WHERE false",
+      "u0 < 0.0");
+}
+
 TEST_F(HashJoinTest, countStarOverFullJoinWithZeroColumnOutput) {
   auto probe = makeNamedRowVector("k", makeFlatVector<int32_t>({1, 2, 2, 3}));
   auto build = makeNamedRowVector("u_k", makeFlatVector<int32_t>({2, 2, 3, 4}));
