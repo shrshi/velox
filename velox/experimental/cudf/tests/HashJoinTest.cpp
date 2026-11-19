@@ -371,6 +371,63 @@ TEST_F(HashJoinPrecomputedFilterTest, fullProbeSide) {
       "ON u_k = k AND try_cast(t_val AS DOUBLE) > u_threshold");
 }
 
+// These joins need an AST filter, so a non-AST filter spanning both sides
+// keeps them on the CPU.
+TEST_F(HashJoinPrecomputedFilterTest, leftSemiFilterCrossSideNonAst) {
+  VELOX_ASSERT_THROW(
+      assertJoin(
+          core::JoinType::kLeftSemiFilter,
+          "t_val LIKE u_pattern",
+          {"k", "t_val"},
+          "SELECT k, t_val FROM t WHERE EXISTS (SELECT * FROM u "
+          "WHERE u_k = k AND t_val LIKE u_pattern)"),
+      "Replacement with cuDF operator failed");
+}
+
+TEST_F(HashJoinPrecomputedFilterTest, rightSemiFilterCrossSideNonAst) {
+  VELOX_ASSERT_THROW(
+      assertJoin(
+          core::JoinType::kRightSemiFilter,
+          "t_val LIKE u_pattern",
+          {"u_k", "u_threshold"},
+          "SELECT u_k, u_threshold FROM u WHERE EXISTS (SELECT * FROM t "
+          "WHERE u_k = k AND t_val LIKE u_pattern)"),
+      "Replacement with cuDF operator failed");
+}
+
+TEST_F(HashJoinPrecomputedFilterTest, antiCrossSideNonAst) {
+  VELOX_ASSERT_THROW(
+      assertJoin(
+          core::JoinType::kAnti,
+          "t_val LIKE u_pattern",
+          {"k", "t_val"},
+          "SELECT k, t_val FROM t WHERE NOT EXISTS (SELECT * FROM u "
+          "WHERE u_k = k AND t_val LIKE u_pattern)"),
+      "Replacement with cuDF operator failed");
+}
+
+TEST_F(HashJoinPrecomputedFilterTest, fullCrossSideNonAst) {
+  VELOX_ASSERT_THROW(
+      assertJoin(
+          core::JoinType::kFull,
+          "t_val LIKE u_pattern",
+          {"k", "t_val", "u_k", "u_threshold"},
+          "SELECT k, t_val, u_k, u_threshold FROM t FULL OUTER JOIN u "
+          "ON u_k = k AND t_val LIKE u_pattern"),
+      "Replacement with cuDF operator failed");
+}
+
+TEST_F(HashJoinPrecomputedFilterTest, leftSemiProjectCrossSideNonAst) {
+  VELOX_ASSERT_THROW(
+      assertJoin(
+          core::JoinType::kLeftSemiProject,
+          "t_val LIKE u_pattern",
+          {"k", "t_val", "match"},
+          "SELECT k, t_val, EXISTS (SELECT * FROM u "
+          "WHERE u_k = k AND t_val LIKE u_pattern) FROM t"),
+      "Replacement with cuDF operator failed");
+}
+
 TEST_F(HashJoinTest, countStarOverFullJoinWithZeroColumnOutput) {
   auto probe = makeNamedRowVector("k", makeFlatVector<int32_t>({1, 2, 2, 3}));
   auto build = makeNamedRowVector("u_k", makeFlatVector<int32_t>({2, 2, 3, 4}));

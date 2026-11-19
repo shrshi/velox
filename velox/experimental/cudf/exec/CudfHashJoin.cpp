@@ -303,14 +303,6 @@ void CudfHashJoinProbe::initialize() {
     useAstFilter_ = false;
   }
 
-  // Validate AST filtering for this join type now to avoid run-time error.
-  if (joinNode_->isRightSemiFilterJoin() || joinNode_->isLeftSemiFilterJoin() ||
-      joinNode_->isAntiJoin()) {
-    VELOX_CHECK(
-        useAstFilter_,
-        "AST expression evaluation must be enabled for semi-filter and anti joins.");
-  }
-
   // Create a reusable evaluator for the filter column. This is expensive to
   // build, and the expression + input schema are stable for the lifetime of
   // the operator instance.
@@ -329,7 +321,14 @@ void CudfHashJoinProbe::initialize() {
     VLOG(1) << "Filter expression spans both join sides, using "
                "filterEvaluator_ instead of AST";
     useAstFilter_ = false;
-    return;
+  }
+
+  // Validate AST filtering for this join type now to avoid run-time error.
+  if (joinNode_->isRightSemiFilterJoin() || joinNode_->isLeftSemiFilterJoin() ||
+      joinNode_->isAntiJoin()) {
+    VELOX_CHECK(
+        useAstFilter_,
+        "AST expression evaluation must be enabled for semi-filter and anti joins.");
   }
 
   // We don't need to get tables that contain conditional comparison columns
