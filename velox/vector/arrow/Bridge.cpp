@@ -19,6 +19,7 @@
 #include <charconv>
 #include <cstring>
 #include <limits>
+#include <numeric>
 
 #include "velox/buffer/Buffer.h"
 #include "velox/common/EnumDefine.h"
@@ -1587,9 +1588,6 @@ void exportFlattenedVector(
     memory::MemoryPool* pool,
     VeloxToArrowBridgeHolder& holder,
     const uint64_t* nulls) {
-  VELOX_CHECK(
-      vec.valueVector() == nullptr || vec.wrappedVector()->isFlatEncoding(),
-      "An unsupported nested encoding was found.");
   VELOX_CHECK(vec.isScalar(), "Flattening is only supported for scalar types.");
   VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
       flattenAndExport,
@@ -1694,6 +1692,125 @@ void exportConstant(
   runEnds->release = releaseArrowArray;
 }
 
+// Whether 'vec' is a dictionary or constant of a complex type that 'options'
+// flatten. Such a vector is exported as a flat copy, see flattenRows().
+bool isFlattenedComplex(const BaseVector& vec, const ArrowOptions& options) {
+  if (vec.type()->isPrimitiveType()) {
+    return false;
+  }
+  switch (vec.encoding()) {
+    case VectorEncoding::Simple::DICTIONARY:
+      return options.flattenDictionary;
+    case VectorEncoding::Simple::CONSTANT:
+      return options.flattenConstant;
+    default:
+      return false;
+  }
+}
+
+// Returns a flat vector of 'size' rows, whose row 'i' of 'rows' is row
+// 'indices[i]' of 'vec', and whose other rows are null. It decodes and copies
+// only these rows of 'vec', and only the elements of their arrays and maps. So
+// it reads no row under a null struct, whose indices are undefined. Unlike a
+// dictionary over 'vec', it does not validate the other rows either.
+VectorPtr flattenRows(
+    const BaseVector& vec,
+    vector_size_t size,
+    const SelectivityVector& rows,
+    const vector_size_t* indices,
+    memory::MemoryPool* pool) {
+  SelectivityVector rowsToDecode(vec.size(), false);
+  rows.applyToSelected(
+      [&](vector_size_t row) { rowsToDecode.setValid(indices[row], true); });
+  rowsToDecode.updateBounds();
+  DecodedVector decoded(vec, rowsToDecode);
+
+  auto nulls = allocateNulls(size, pool, bits::kNull);
+  auto baseIndices = allocateIndices(size, pool);
+  auto* rawNulls = nulls->asMutable<uint64_t>();
+  auto* rawBaseIndices = baseIndices->asMutable<vector_size_t>();
+  SelectivityVector nonNullRows(size, false);
+  rows.applyToSelected([&](vector_size_t row) {
+    if (!decoded.isNullAt(indices[row])) {
+      bits::clearNull(rawNulls, row);
+      rawBaseIndices[row] = decoded.index(indices[row]);
+      nonNullRows.setValid(row, true);
+    }
+  });
+  nonNullRows.updateBounds();
+
+  const auto& base = *decoded.base();
+  // The base of a scalar is flat or constant. A null constant of a complex
+  // type has no base, but then every row is null.
+  if (vec.type()->isPrimitiveType() || base.isConstantEncoding()) {
+    auto flat = BaseVector::create(vec.type(), size, pool);
+    if (nonNullRows.hasSelections()) {
+      flat->copy(&base, nonNullRows, rawBaseIndices);
+    }
+    flat->setNulls(nulls);
+    return flat;
+  }
+
+  if (vec.typeKind() == TypeKind::ROW) {
+    std::vector<VectorPtr> children;
+    for (const auto& child : base.asUnchecked<RowVector>()->children()) {
+      children.push_back(
+          flattenRows(*child, size, nonNullRows, rawBaseIndices, pool));
+    }
+    return std::make_shared<RowVector>(
+        pool, vec.type(), nulls, size, std::move(children));
+  }
+
+  // Copy the elements of the rows, one after the other.
+  const auto& arrays = *base.asUnchecked<ArrayVectorBase>();
+  auto offsets = allocateOffsets(size, pool);
+  auto sizes = allocateSizes(size, pool);
+  auto* rawOffsets = offsets->asMutable<vector_size_t>();
+  auto* rawSizes = sizes->asMutable<vector_size_t>();
+  vector_size_t numElements = 0;
+  for (vector_size_t row = 0; row < size; ++row) {
+    rawOffsets[row] = numElements;
+    if (nonNullRows.isValid(row)) {
+      rawSizes[row] = arrays.sizeAt(rawBaseIndices[row]);
+      numElements = checkedPlus(numElements, rawSizes[row]);
+    }
+  }
+  auto elementIndices = allocateIndices(numElements, pool);
+  auto* rawElementIndices = elementIndices->asMutable<vector_size_t>();
+  nonNullRows.applyToSelected([&](vector_size_t row) {
+    std::iota(
+        rawElementIndices + rawOffsets[row],
+        rawElementIndices + rawOffsets[row] + rawSizes[row],
+        arrays.offsetAt(rawBaseIndices[row]));
+  });
+  const SelectivityVector allElements(numElements);
+  auto flattenElements = [&](const BaseVector& elements) {
+    return flattenRows(
+        elements, numElements, allElements, rawElementIndices, pool);
+  };
+
+  if (vec.typeKind() == TypeKind::ARRAY) {
+    return std::make_shared<ArrayVector>(
+        pool,
+        vec.type(),
+        nulls,
+        size,
+        offsets,
+        sizes,
+        flattenElements(*base.asUnchecked<ArrayVector>()->elements()));
+  }
+  const auto& maps = *base.asUnchecked<MapVector>();
+  return std::make_shared<MapVector>(
+      pool,
+      vec.type(),
+      nulls,
+      size,
+      offsets,
+      sizes,
+      flattenElements(*maps.mapKeys()),
+      flattenElements(*maps.mapValues()));
+}
+
 void exportToArrowImpl(
     const BaseVector& vec,
     const Selection& rows,
@@ -1701,6 +1818,29 @@ void exportToArrowImpl(
     ArrowArray& out,
     memory::MemoryPool* pool,
     const BufferPtr& parentNulls) {
+  if (isFlattenedComplex(vec, options)) {
+    // Copy the rows the export reads: the selected rows outside a null struct.
+    const auto* rawParentNulls =
+        parentNulls ? parentNulls->as<uint64_t>() : nullptr;
+    SelectivityVector rowsToCopy(vec.size(), false);
+    rows.apply([&](vector_size_t row) {
+      if (!isNull(rawParentNulls, row)) {
+        rowsToCopy.setValid(row, true);
+      }
+    });
+    rowsToCopy.updateBounds();
+    auto identity = allocateIndices(vec.size(), pool);
+    auto* rawIdentity = identity->asMutable<vector_size_t>();
+    std::iota(rawIdentity, rawIdentity + vec.size(), 0);
+    exportToArrowImpl(
+        *flattenRows(vec, vec.size(), rowsToCopy, rawIdentity, pool),
+        rows,
+        options,
+        out,
+        pool,
+        parentNulls);
+    return;
+  }
   auto holder = std::make_unique<VeloxToArrowBridgeHolder>();
   out.buffers = holder->getArrowBuffers();
   out.length = rows.count();
@@ -1986,6 +2126,23 @@ void exportToArrow(
     const VectorPtr& vec,
     ArrowSchema& arrowSchema,
     const ArrowOptions& options) {
+  if (isFlattenedComplex(*vec, options)) {
+    // The data is flat throughout, so its schema is that of the base with every
+    // encoding flattened. A null constant has no base: use an empty vector of
+    // its type.
+    auto flatOptions = options;
+    flatOptions.flattenDictionary = true;
+    flatOptions.flattenConstant = true;
+    const auto& base = BaseVector::wrappedVectorShared(vec);
+    exportToArrow(
+        base->isConstantEncoding()
+            ? BaseVector::create(vec->type(), 0, vec->pool())
+            : base,
+        arrowSchema,
+        flatOptions);
+    return;
+  }
+
   auto& type = vec->type();
 
   arrowSchema.name = nullptr;
