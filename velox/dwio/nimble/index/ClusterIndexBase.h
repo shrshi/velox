@@ -138,6 +138,14 @@ class ClusterIndexBase : public IndexLookup {
       const LookupRequest& request,
       std::span<const KeyChunk> keyChunks) const;
 
+  /// Returns the offset in 'keyChunk' of its first row whose key is not below
+  /// 'key', or nullopt when every key of the chunk is below 'key'. Only a
+  /// Stripe layout index supports this. Decodes the chunk in place, without a
+  /// copy, and keeps nothing of it.
+  std::optional<uint32_t> seekRow(
+      std::string_view key,
+      const KeyChunk& keyChunk) const;
+
   /// Returns the minimum key across all partitions.
   std::string_view minKey() const override {
     return firstKey_;
@@ -152,6 +160,11 @@ class ClusterIndexBase : public IndexLookup {
   /// Requires loadData to have been provided at construction.
   /// Used to compute resume keys when lookup results are truncated.
   std::string keyAtRow(uint32_t row) const override;
+
+  /// Returns the encoded key at row 'rowInChunk' of 'keyChunk', the offset of
+  /// the row in the stripe of the chunk. Only a Stripe layout index supports
+  /// this. Decodes the chunk in place, without a copy, and keeps nothing of it.
+  std::string keyAtRow(uint32_t rowInChunk, const KeyChunk& keyChunk) const;
 
   /// Returns the number of partitions in the index.
   uint32_t numPartitions() const {
@@ -254,11 +267,11 @@ class ClusterIndexBase : public IndexLookup {
   void preloadIndex();
 
   // Builds the flat LookupResult from partitionRowRanges. Subclasses override
-  // this to apply their own narrowing. The base implementation rejects any
-  // lookup extension it is handed, because ignoring one would silently return
-  // a wider range than the caller asked for.
+  // this to apply their own narrowing. validateLookupRequest() has already
+  // validated the request's additional requirements, because ignoring its
+  // parameters would silently return a wider range than the caller asked for.
   virtual LookupResult buildLookupResult(
-      const LookupOptions& options,
+      const LookupRequest& request,
       const std::vector<RowRange>& partitionRowRanges) const;
 
   // Accumulated row counts of a partition's key chunks (prefix sum), so that

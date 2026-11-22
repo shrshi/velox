@@ -435,8 +435,9 @@ void ClusterIndexBase::resolvePartitionBounds(
 }
 
 IndexLookup::LookupResult ClusterIndexBase::buildLookupResult(
-    const LookupOptions& options,
+    const LookupRequest& request,
     const std::vector<RowRange>& partitionRowRanges) const {
+  const auto& options = request.options();
   std::vector<RowRange> locations;
   locations.reserve(partitionRowRanges.size());
   std::vector<uint32_t> offsets;
@@ -576,6 +577,7 @@ IndexLookup::LookupResult ClusterIndexBase::lookup(
     const LookupRequest& request,
     std::optional<std::span<const KeyChunk>> keyChunks,
     LowerBoundChunk* lowerBoundChunk) const {
+  validateLookupRequest(request);
   std::vector<PartitionLookup> partitionLookups;
   std::vector<RowRange> partitionRowRanges;
   lookupPartitions(request, partitionLookups, partitionRowRanges);
@@ -583,7 +585,7 @@ IndexLookup::LookupResult ClusterIndexBase::lookup(
   NIMBLE_CHECK_LE(partitionLookups.size(), 2 * request.size());
   resolvePartitionBounds(keyChunks, partitionLookups, lowerBoundChunk);
 
-  return buildLookupResult(request.options(), partitionRowRanges);
+  return buildLookupResult(request, partitionRowRanges);
 }
 
 std::vector<StripeRange> ClusterIndexBase::lookupStripes(
@@ -1089,6 +1091,35 @@ std::string ClusterIndexBase::keyAtRow(uint32_t row) const {
   return decodedChunk.data->reader->get(rowInChunk);
 }
 
+std::string ClusterIndexBase::keyAtRow(
+    uint32_t rowInChunk,
+    const KeyChunk& keyChunk) const {
+  NIMBLE_CHECK_EQ(
+      keyStreamLayout_,
+      KeyStreamLayout::kStripe,
+      "Only a Stripe layout index reads keys from a given key chunk");
+  const auto decodedChunk = decodeKeyChunk(
+      keyChunk.data, DataInput::Handle{}, keyReaderFactory_, pool_);
+  NIMBLE_CHECK_LT(
+      rowInChunk,
+      decodedChunk->reader->rowCount(),
+      "Row is past the key chunk of stripe {}",
+      keyChunk.stripe);
+  return decodedChunk->reader->get(rowInChunk);
+}
+
+std::optional<uint32_t> ClusterIndexBase::seekRow(
+    std::string_view key,
+    const KeyChunk& keyChunk) const {
+  NIMBLE_CHECK_EQ(
+      keyStreamLayout_,
+      KeyStreamLayout::kStripe,
+      "Only a Stripe layout index seeks keys in a given key chunk");
+  const auto decodedChunk = decodeKeyChunk(
+      keyChunk.data, DataInput::Handle{}, keyReaderFactory_, pool_);
+  return decodedChunk->reader->seek(key, /*inclusive=*/true);
+}
+
 // ---------------------------------------------------------------------------
 // ClusterIndexBase::KeyIterator
 // ---------------------------------------------------------------------------
@@ -1160,7 +1191,7 @@ ClusterIndexBase::SeekResult ClusterIndexBase::seek(
     const velox::serializer::EncodedKeyBounds& bounds) const {
   LowerBoundChunk lowerBoundChunk;
   const auto result = lookup(
-      LookupRequest::rangeScan({bounds}),
+      *LookupRequest::rangeScan({bounds}),
       /*keyChunks=*/std::nullopt,
       &lowerBoundChunk);
   NIMBLE_CHECK_EQ(result.size(), 1);

@@ -975,7 +975,7 @@ void SelectiveNimbleRowReader::initIndexBounds() {
 
   // Single lookup to get the exact file-level row range.
   const auto lookupResult = clusterIndex_->lookup(
-      index::IndexLookup::LookupRequest::rangeScan({encodedBounds}));
+      *index::IndexLookup::LookupRequest::rangeScan({encodedBounds}));
   const auto rowRanges = lookupResult[0];
   if (rowRanges.empty()) {
     skipRemainingStripes();
@@ -1028,11 +1028,12 @@ void SelectiveNimbleRowReader::narrowToRows(RowRange rows) {
 }
 
 void SelectiveNimbleRowReader::maybeUpdateRandomSkip(int64_t rowsSkipped) {
-  if (readerBase_->randomSkip() && rowsSkipped > 0) {
-    const auto skip = readerBase_->randomSkip()->nextSkip();
-    readerBase_->randomSkip()->consume(
-        std::min(static_cast<int64_t>(skip), rowsSkipped));
+  if (readerBase_->randomSkip() == nullptr || rowsSkipped <= 0) {
+    return;
   }
+
+  // The rows aren't read, so their hits are dropped.
+  readerBase_->randomSkip()->forEachHit(rowsSkipped, [](uint64_t) {});
 }
 
 void SelectiveNimbleRowReader::restoreFilters() {
