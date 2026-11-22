@@ -17,6 +17,7 @@
 #pragma once
 
 #include "velox/experimental/cudf/exec/CudfJoin.h"
+#include "velox/experimental/cudf/exec/CudfJoinBridge.h"
 #include "velox/experimental/cudf/exec/CudfJoinBuild.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
 #include "velox/experimental/cudf/expression/AstExpression.h"
@@ -42,52 +43,6 @@ namespace facebook::velox::cudf_velox {
 
 class CudaEvent;
 class CudfExpression;
-
-/**
- * @brief Bridge for transferring build-side hash tables between build and probe
- * operators.
- *
- * This bridge manages the lifecycle of CUDF hash join objects and ensures
- * proper synchronization between build and probe phases. It stores the
- * constructed hash tables and hash join objects created from build-side data,
- * making them available to probe operators across different driver threads.
- *
- * The bridge handles batched hash tables when build data exceeds
- * cudf::size_type limits, and manages CUDA stream coordination between build
- * and probe operations.
- */
-class CudfHashJoinBridge : public exec::JoinBridge {
- public:
-  // The bridge transfers all build side batches and the hash join objects
-  // constructed from them to the probe operator
-  /** @brief Hash tables paired with their corresponding join objects for
-   * batched processing */
-  using hash_type = std::pair<
-      std::vector<std::shared_ptr<cudf::table>>,
-      std::vector<std::shared_ptr<cudf::hash_join>>>;
-
-  void setHashTable(std::optional<hash_type> hashObject);
-
-  std::optional<hash_type> hashOrFuture(ContinueFuture* future);
-
-  // Store and retrieve the CUDA stream used for building the hash join.
-  void setBuildStream(cuda::stream_ref buildStream);
-
-  std::optional<cuda::stream_ref> getBuildStream();
-
-  void setBuildReadyEvent(std::shared_ptr<CudaEvent> buildReadyEvent);
-
-  std::shared_ptr<CudaEvent> getBuildReadyEvent();
-
- private:
-  /** @brief Hash tables and join objects transferred from build to probe
-   * operators */
-  std::optional<hash_type> hashObject_;
-  /** @brief CUDA stream used by build operator for proper synchronization */
-  std::optional<cuda::stream_ref> buildStream_;
-  /** @brief Event recorded after build-side CUDA work is ready for probes */
-  std::shared_ptr<CudaEvent> buildReadyEvent_;
-};
 
 /**
  * @brief Build operator that constructs CUDF hash tables from build-side input
@@ -125,7 +80,7 @@ class CudfHashJoinBuild : public CudfJoinBuild {
  */
 class CudfHashJoinProbe : public CudfOperatorBase {
  public:
-  using hash_type = CudfHashJoinBridge::hash_type;
+  using hash_type = CudfHashJoinBuildData;
 
   CudfHashJoinProbe(
       int32_t operatorId,
