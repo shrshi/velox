@@ -50,6 +50,7 @@
 #include <cstdlib>
 #include <limits>
 #include <optional>
+#include <random>
 #include <type_traits>
 #include <typeinfo>
 
@@ -228,6 +229,12 @@ bool isValidAt(const std::vector<cudf::bitmask_type>& mask, size_t idx) {
   return (mask[word] >> bit) & 1;
 }
 
+struct CompactRunOptions {
+  std::optional<int32_t> gpuBatchRows;
+  bool streaming{false};
+  int32_t maxDrivers{1};
+};
+
 class CudfDecimalTest : public exec::test::OperatorTestBase {
  protected:
   void SetUp() override {
@@ -264,6 +271,133 @@ class CudfDecimalTest : public exec::test::OperatorTestBase {
     unregisterCudf();
     CudfConfig::getInstance().allowCpuFallback = true;
     registerCudf();
+  }
+
+  RowVectorPtr makeDecimal128Batch(
+      const std::vector<int32_t>& keys,
+      const std::vector<std::optional<int128_t>>& values) {
+    return makeRowVector(
+        {"k", "d"},
+        {makeFlatVector<int32_t>(keys),
+         makeNullableFlatVector<int128_t>(values, DECIMAL(38, 2))});
+  }
+
+  // Velox-core results. Disabling cuDF alone still compiles the plan for the
+  // GPU when CPU fallback is disallowed.
+  RowVectorPtr cpuResults(const core::PlanNodePtr& plan, int32_t maxDrivers) {
+    return exec::test::AssertQueryBuilder(plan)
+        .maxDrivers(maxDrivers)
+        .config(CudfConfig::kCudfEnabled, false)
+        .config(CudfConfig::kCudfAllowCpuFallback, true)
+        .copyResults(pool());
+  }
+
+  // Runs 'original' on the CPU, then its CudfPlanRewriter rewrite on the GPU,
+  // and expects the GPU to return the CPU result or throw the CPU error.
+  // Returns the CPU error message (empty on success) and the GPU task (null on
+  // error).
+  std::pair<std::string, std::shared_ptr<exec::Task>> assertCompactMatchesCpu(
+      const core::PlanNodePtr& original,
+      const CompactRunOptions& options = {}) {
+    RowVectorPtr expected;
+    std::string error;
+    try {
+      expected = cpuResults(original, options.maxDrivers);
+    } catch (const VeloxUserError& e) {
+      error = e.message();
+    }
+
+    auto plan = CudfPlanRewriter::rewrite(original);
+    EXPECT_EQ(*plan->outputType(), *original->outputType());
+    auto& config = CudfConfig::getInstance();
+    const auto savedStreaming = config.streamingGroupbyEnabled;
+    config.streamingGroupbyEnabled = options.streaming;
+    SCOPE_EXIT {
+      config.streamingGroupbyEnabled = savedStreaming;
+    };
+    exec::test::AssertQueryBuilder builder(plan);
+    builder.maxDrivers(options.maxDrivers)
+        .config(core::QueryConfig::kMaxPartialAggregationMemory, 1);
+    if (options.gpuBatchRows) {
+      builder.config(CudfFromVelox::kGpuBatchSizeRows, *options.gpuBatchRows);
+    }
+    if (expected) {
+      return {error, builder.assertResults(expected)};
+    }
+    try {
+      builder.copyResults(pool());
+      ADD_FAILURE() << "GPU succeeded where the CPU failed with: " << error;
+    } catch (const VeloxException& e) {
+      EXPECT_EQ(e.message(), error);
+      EXPECT_NE(dynamic_cast<const VeloxUserError*>(&e), nullptr);
+    }
+    return {error, nullptr};
+  }
+
+  // assertCompactMatchesCpu over partial -> [LocalPartition] ->
+  // [intermediate] -> final plans, GPU batch sizes, and (grouped) streaming
+  // enabled. Every aggregate must get a native state. Returns the CPU error,
+  // which must be the same for every plan shape.
+  std::string assertCompactMatrixMatchesCpu(
+      const std::vector<RowVectorPtr>& batches,
+      const std::vector<std::string>& keys,
+      const std::vector<std::string>& aggregates) {
+    std::optional<std::string> error;
+    for (bool exchange : {false, true}) {
+      for (bool intermediate : {false, true}) {
+        for (std::optional<int32_t> batchRows :
+             {std::optional<int32_t>{}, std::optional<int32_t>{2}}) {
+          for (bool streaming : {false, true}) {
+            if (streaming && keys.empty()) {
+              continue;
+            }
+            SCOPED_TRACE(
+                fmt::format(
+                    "exchange={} intermediate={} batchRows={} streaming={}",
+                    exchange,
+                    intermediate,
+                    batchRows.value_or(0),
+                    streaming));
+            auto builder = exec::test::PlanBuilder();
+            builder.values(batches).partialAggregation(keys, aggregates);
+            if (exchange) {
+              builder.localPartition(keys);
+            }
+            if (intermediate) {
+              builder.intermediateAggregation();
+            }
+            auto original = builder.finalAggregation().planNode();
+            const auto rewritten = CudfPlanRewriter::rewrite(original);
+            auto* final =
+                dynamic_cast<const CudfAggregationNode*>(rewritten.get());
+            EXPECT_NE(final, nullptr);
+            for (size_t i = 0; final && i < aggregates.size(); ++i) {
+              EXPECT_TRUE(final->usesCompactDecimalState(i)) << i;
+            }
+            auto [cpuError, task] = assertCompactMatchesCpu(
+                original,
+                {.gpuBatchRows = batchRows,
+                 .streaming = streaming,
+                 .maxDrivers = exchange ? 2 : 1});
+            EXPECT_EQ(cpuError, error.value_or(cpuError));
+            error = cpuError;
+            if (task && !keys.empty() && !exchange) {
+              // Streaming groupby does not support SUM_OVERFLOW (cuDF R2), so
+              // Decimal128 states always take incremental groupby.
+              const auto stats = exec::toPlanStats(task->taskStats());
+              const auto& customStats = stats.at(original->id()).customStats;
+              EXPECT_EQ(
+                  customStats.count(std::string{kStreamingGroupbyUsedStat}), 0);
+              EXPECT_GT(
+                  customStats.at(std::string{kDirectGroupbyFinalizationStat})
+                      .sum,
+                  0);
+            }
+          }
+        }
+      }
+    }
+    return error.value_or("");
   }
 };
 
@@ -869,30 +1003,22 @@ TEST_F(CudfDecimalTest, streamingDecimalSumAndAvgReusesSegment) {
       makeFlatVector<int32_t>({0, 1, 2, 3}),
       makeNullableFlatVector<int64_t>(
           {999'999'999'999'999'999, -200, std::nullopt, 0}, DECIMAL(18, 2)),
-      makeNullableFlatVector<int128_t>(
-          {100, -200, std::nullopt, 0}, DECIMAL(20, 2)),
   });
   const std::vector<RowVectorPtr> batches(12, input);
   for (bool includeAvg : {false, true}) {
     SCOPED_TRACE(includeAvg);
-    std::vector<std::string> aggregates{"sum(c1)", "sum(c2)"};
+    std::vector<std::string> aggregates{"sum(c1)"};
     std::vector<VectorPtr> expectedColumns{
         makeFlatVector<int32_t>({0, 1, 2, 3}),
         makeNullableFlatVector<int128_t>(
             {int128_t{999'999'999'999'999'999} * 12, -2400, std::nullopt, 0},
-            DECIMAL(38, 2)),
-        makeNullableFlatVector<int128_t>(
-            {1200, -2400, std::nullopt, 0}, DECIMAL(38, 2))};
+            DECIMAL(38, 2))};
     if (includeAvg) {
       aggregates.push_back("avg(c1)");
-      aggregates.push_back("avg(c2)");
       expectedColumns.push_back(
           makeNullableFlatVector<int64_t>(
               {999'999'999'999'999'999, -200, std::nullopt, 0},
               DECIMAL(18, 2)));
-      expectedColumns.push_back(
-          makeNullableFlatVector<int128_t>(
-              {100, -200, std::nullopt, 0}, DECIMAL(20, 2)));
     }
     auto plan = exec::test::PlanBuilder()
                     .values(batches)
@@ -924,28 +1050,21 @@ TEST_F(CudfDecimalTest, streamingDecimalAvgUnequalCounts) {
       keys,
       makeNullableFlatVector<int64_t>(
           {101, 102, -101, -102, std::nullopt, std::nullopt}, DECIMAL(12, 2)),
-      makeNullableFlatVector<int128_t>(
-          {101, 102, -101, -102, std::nullopt, std::nullopt}, DECIMAL(20, 2)),
   });
   auto second = makeRowVector({
       keys,
       makeNullableFlatVector<int64_t>(
           {104, std::nullopt, -104, std::nullopt, std::nullopt, std::nullopt},
           DECIMAL(12, 2)),
-      makeNullableFlatVector<int128_t>(
-          {104, std::nullopt, -104, std::nullopt, std::nullopt, std::nullopt},
-          DECIMAL(20, 2)),
   });
   auto expected = makeRowVector({
       makeFlatVector<int32_t>({0, 1, 2}),
       makeNullableFlatVector<int64_t>(
           {102, -102, std::nullopt}, DECIMAL(12, 2)),
-      makeNullableFlatVector<int128_t>(
-          {102, -102, std::nullopt}, DECIMAL(20, 2)),
   });
   auto plan = exec::test::PlanBuilder()
                   .values({first, second})
-                  .partialAggregation({"c0"}, {"avg(c1)", "avg(c2)"})
+                  .partialAggregation({"c0"}, {"avg(c1)"})
                   .finalAggregation()
                   .planNode();
   auto task = exec::test::AssertQueryBuilder(plan)
@@ -1366,6 +1485,400 @@ TEST_F(CudfDecimalTest, decimalSumGlobalPartialFinalDecimal64Overflow) {
   facebook::velox::test::assertEqualVectors(expected, result);
 }
 
+constexpr int128_t kLongDecimalMax = DecimalUtil::kLongDecimalMax;
+
+// Returns the sum of the (sum, overflow) state whose exact value is
+// sum + overflow * 2^127, given that value modulo 2^128.
+int128_t overflowStateSum(__uint128_t value, int64_t overflow) {
+  return static_cast<int128_t>(
+      value -
+      static_cast<__uint128_t>(overflow) * DecimalUtil::kOverflowMultiplier);
+}
+
+// Single, partial + final and partial + intermediate + final plans.
+std::vector<core::PlanNodePtr> makeAggregationPlans(
+    const std::vector<RowVectorPtr>& input,
+    const std::vector<std::string>& keys,
+    const std::vector<std::string>& aggregates) {
+  return {
+      exec::test::PlanBuilder()
+          .values(input)
+          .singleAggregation(keys, aggregates)
+          .planNode(),
+      exec::test::PlanBuilder()
+          .values(input)
+          .partialAggregation(keys, aggregates)
+          .finalAggregation()
+          .planNode(),
+      exec::test::PlanBuilder()
+          .values(input)
+          .partialAggregation(keys, aggregates)
+          .intermediateAggregation()
+          .finalAggregation()
+          .planNode(),
+  };
+}
+
+// DECIMAL(38, 0) sums that wrap int128 before cancelling stay exact, as the
+// state carries the net overflow like the CPU LongDecimalWithOverflowState.
+TEST_F(CudfDecimalTest, longDecimalSumOverflowCancels) {
+  // Group 1 wraps past 2^127 and back to 5; group 2 the other way to
+  // -max + 7. Separate batches carry non-zero overflow in partial states.
+  auto first = makeRowVector(
+      {"k", "d"},
+      {makeFlatVector<int32_t>({1, 1, 2, 2}),
+       makeFlatVector<int128_t>(
+           {kLongDecimalMax,
+            kLongDecimalMax,
+            -kLongDecimalMax,
+            -kLongDecimalMax},
+           DECIMAL(38, 0))});
+  auto second = makeRowVector(
+      {"k", "d"},
+      {makeFlatVector<int32_t>({1, 1, 1, 2, 2}),
+       makeFlatVector<int128_t>(
+           {-kLongDecimalMax, -kLongDecimalMax, 5, kLongDecimalMax, 7},
+           DECIMAL(38, 0))});
+  auto expectedGrouped = makeRowVector(
+      {makeFlatVector<int32_t>({1, 2}),
+       makeFlatVector<int128_t>({5, -kLongDecimalMax + 7}, DECIMAL(38, 0))});
+  auto expectedGlobal = makeRowVector(
+      {makeFlatVector<int128_t>({-kLongDecimalMax + 12}, DECIMAL(38, 0))});
+
+  for (bool grouped : {true, false}) {
+    SCOPED_TRACE(grouped);
+    const std::vector<std::string> keys =
+        grouped ? std::vector<std::string>{"k"} : std::vector<std::string>{};
+    for (const auto& plan :
+         makeAggregationPlans({first, second}, keys, {"sum(d)"})) {
+      exec::test::AssertQueryBuilder(plan)
+          .maxDrivers(1)
+          .config(CudfFromVelox::kGpuBatchSizeRows, 1)
+          .config(core::QueryConfig::kMaxPartialAggregationMemory, 1)
+          .assertResults(grouped ? expectedGrouped : expectedGlobal);
+    }
+  }
+}
+
+TEST_F(CudfDecimalTest, longDecimalSumOverflowThrows) {
+  // 2 * max does not fit int128 and max + 1 does not fit DECIMAL(38); the CPU
+  // DecimalSumAggregate rejects both.
+  const std::vector<std::vector<int128_t>> inputs = {
+      {kLongDecimalMax, kLongDecimalMax}, {kLongDecimalMax, 1}};
+  for (const auto& values : inputs) {
+    auto input = makeRowVector(
+        {"k", "d"},
+        {makeFlatVector<int32_t>(std::vector<int32_t>(values.size(), 1)),
+         makeFlatVector<int128_t>(values, DECIMAL(38, 0))});
+    for (bool grouped : {true, false}) {
+      SCOPED_TRACE(grouped);
+      const std::vector<std::string> keys =
+          grouped ? std::vector<std::string>{"k"} : std::vector<std::string>{};
+      for (const auto& plan : makeAggregationPlans({input}, keys, {"sum(d)"})) {
+        VELOX_ASSERT_THROW(
+            exec::test::AssertQueryBuilder(plan).copyResults(pool()),
+            "Decimal overflow");
+      }
+    }
+  }
+}
+
+TEST_F(CudfDecimalTest, longDecimalAvgOverflow) {
+  // Each group's sum wraps int128; AVG divides the exact sum like
+  // DecimalUtil::computeAverage: (3 * max - 1) / 3 rounds to max.
+  auto first = makeRowVector(
+      {"k", "d"},
+      {makeFlatVector<int32_t>({1, 1, 2, 2}),
+       makeFlatVector<int128_t>(
+           {kLongDecimalMax,
+            kLongDecimalMax,
+            -kLongDecimalMax,
+            -kLongDecimalMax},
+           DECIMAL(38, 0))});
+  auto second = makeRowVector(
+      {"k", "d"},
+      {makeFlatVector<int32_t>({1, 2}),
+       makeFlatVector<int128_t>(
+           {kLongDecimalMax - 1, -kLongDecimalMax}, DECIMAL(38, 0))});
+  auto expected = makeRowVector(
+      {makeFlatVector<int32_t>({1, 2}),
+       makeFlatVector<int128_t>(
+           {kLongDecimalMax, -kLongDecimalMax}, DECIMAL(38, 0))});
+  for (const auto& plan :
+       makeAggregationPlans({first, second}, {"k"}, {"avg(d)"})) {
+    exec::test::AssertQueryBuilder(plan)
+        .maxDrivers(1)
+        .config(CudfFromVelox::kGpuBatchSizeRows, 1)
+        .config(core::QueryConfig::kMaxPartialAggregationMemory, 1)
+        .assertResults(expected);
+  }
+
+  auto globalFirst = makeRowVector(
+      {"d"},
+      {makeFlatVector<int128_t>(
+          {kLongDecimalMax, kLongDecimalMax}, DECIMAL(38, 0))});
+  auto globalSecond = makeRowVector(
+      {"d"}, {makeFlatVector<int128_t>({kLongDecimalMax - 1}, DECIMAL(38, 0))});
+  auto expectedGlobal = makeRowVector(
+      {makeFlatVector<int128_t>({kLongDecimalMax}, DECIMAL(38, 0))});
+  for (const auto& plan :
+       makeAggregationPlans({globalFirst, globalSecond}, {}, {"avg(d)"})) {
+    exec::test::AssertQueryBuilder(plan)
+        .maxDrivers(1)
+        .config(CudfFromVelox::kGpuBatchSizeRows, 1)
+        .config(core::QueryConfig::kMaxPartialAggregationMemory, 1)
+        .assertResults(expectedGlobal);
+  }
+}
+
+// Incremental groupby merges long decimal states of successive batches as a
+// struct. Every batch wraps int128, the partial step either merges all batches
+// before flushing or flushes each one, and the sum keeps the input scale.
+TEST_F(CudfDecimalTest, longDecimalBufferedStateAcrossBatches) {
+  const auto type = DECIMAL(38, 2);
+  const auto makeBatch = [&](std::vector<int128_t> values) {
+    return makeRowVector(
+        {"k", "d"},
+        {makeFlatVector<int32_t>({1, 1, 2, 2}),
+         makeFlatVector<int128_t>(values, type)});
+  };
+  const auto up = makeBatch(
+      {kLongDecimalMax, kLongDecimalMax, -kLongDecimalMax, -kLongDecimalMax});
+  const auto down = makeBatch(
+      {-kLongDecimalMax, -kLongDecimalMax, kLongDecimalMax, kLongDecimalMax});
+  const auto last = makeBatch({5, 4, -7, -2});
+  // Group 1 sums to 9 over 10 rows and group 2 to -9.
+  auto expected = makeRowVector(
+      {makeFlatVector<int32_t>({1, 2}),
+       makeFlatVector<int128_t>({9, -9}, type),
+       makeFlatVector<int128_t>({1, -1}, type)});
+  for (const auto* maxPartialMemory : {"1", "1000000"}) {
+    SCOPED_TRACE(maxPartialMemory);
+    for (const auto& plan : makeAggregationPlans(
+             {up, down, up, down, last}, {"k"}, {"sum(d)", "avg(d)"})) {
+      exec::test::AssertQueryBuilder(plan)
+          .maxDrivers(1)
+          .config(CudfFromVelox::kGpuBatchSizeRows, 4)
+          .config(
+              core::QueryConfig::kMaxPartialAggregationMemory, maxPartialMemory)
+          .assertResults(expected);
+    }
+  }
+}
+
+TEST_F(CudfDecimalTest, longDecimalBufferedStateConversions) {
+  auto input = makeRowVector(
+      {"k", "d"},
+      {makeFlatVector<int32_t>({1}),
+       makeFlatVector<int128_t>({1}, DECIMAL(38, 2))});
+  auto plan = exec::test::PlanBuilder()
+                  .values({input})
+                  .partialAggregation({"k"}, {"sum(d)", "avg(d)"})
+                  .finalAggregation()
+                  .planNode();
+  auto final = std::dynamic_pointer_cast<const core::AggregationNode>(plan);
+  ASSERT_NE(final, nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+
+  // Exact sums are 5 and -7; the last state has no input.
+  constexpr auto kInt128Min = std::numeric_limits<int128_t>::min();
+  constexpr auto kInt128Max = std::numeric_limits<int128_t>::max();
+  const std::vector<int128_t> sums{kInt128Min + 5, kInt128Max - 6, 0};
+  const std::vector<int64_t> counts{2, 3, 0};
+  const std::vector<int64_t> overflows{1, -1, 0};
+  auto sumCol = makeDecimalColumn<int128_t>(sums, 0, nullptr, stream);
+  auto countCol = makeInt64Column(counts, nullptr, stream);
+  auto overflowCol = makeInt64Column(overflows, nullptr, stream);
+  const auto overflowView = overflowCol->view();
+  auto encoded = serializeDecimalSumState(
+      sumCol->view(), countCol->view(), &overflowView, stream, mr);
+  ASSERT_EQ(encoded->null_count(), 1);
+
+  const std::vector<VectorPtr> constants(2);
+  auto intermediate = toGroupbyAggregators(
+      *final,
+      core::AggregationNode::Step::kIntermediate,
+      final->outputType(),
+      constants,
+      {},
+      true);
+  ASSERT_EQ(intermediate.size(), 2);
+  for (const auto& aggregator : intermediate) {
+    ASSERT_NE(aggregator->bufferedStateType(), nullptr);
+    EXPECT_EQ(
+        aggregator->bufferedStateType()->toString(),
+        "ROW<sum:DECIMAL(38, 0),count:BIGINT,overflow:BIGINT>");
+  }
+  auto withoutBuffering = toGroupbyAggregators(
+      *final,
+      core::AggregationNode::Step::kIntermediate,
+      final->outputType(),
+      constants,
+      {});
+  EXPECT_EQ(withoutBuffering[0]->bufferedStateType(), nullptr);
+
+  auto buffered = intermediate[0]->toBufferedState(encoded->view(), stream, mr);
+  ASSERT_EQ(buffered->type().id(), cudf::type_id::STRUCT);
+  ASSERT_EQ(buffered->num_children(), 3);
+  EXPECT_EQ(buffered->null_count(), 0);
+  const auto sum = buffered->view().child(0);
+  EXPECT_EQ(sum.type(), cudf::data_type(cudf::type_id::DECIMAL128, 0));
+  const auto bufferedSums = copyColumnData<int128_t>(sum, stream);
+  EXPECT_EQ(bufferedSums[0], sums[0]);
+  EXPECT_EQ(bufferedSums[1], sums[1]);
+  EXPECT_FALSE(isValidAt(copyNullMask(sum, stream), 2));
+  const auto bufferedCounts =
+      copyColumnData<int64_t>(buffered->view().child(1), stream);
+  EXPECT_EQ(bufferedCounts[0], 2);
+  EXPECT_EQ(bufferedCounts[1], 3);
+  const auto bufferedOverflows =
+      copyColumnData<int64_t>(buffered->view().child(2), stream);
+  EXPECT_EQ(bufferedOverflows[0], 1);
+  EXPECT_EQ(bufferedOverflows[1], -1);
+
+  auto keys = makeFixedWidthColumn<int32_t>(
+      cudf::data_type{cudf::type_id::INT32}, {1, 2, 3}, nullptr, stream);
+  cudf::table_view table({keys->view(), buffered->view(), buffered->view()});
+  for (const auto& aggregator : intermediate) {
+    std::vector<cudf::groupby::aggregation_request> requests;
+    aggregator->addGroupbyRequest(table, requests, stream, mr);
+    ASSERT_EQ(requests.size(), 3);
+    EXPECT_EQ(requests[0].values.type(), sum.type());
+    aggregator->releaseInput();
+  }
+
+  // The VARBINARY state round-trips through the buffered state.
+  auto reencoded = intermediate[0]->fromBufferedState(
+      std::make_unique<cudf::column>(buffered->view(), stream, mr), stream, mr);
+  auto decoded = deserializeDecimalSumState(reencoded->view(), 0, stream, mr);
+  const auto decodedSums =
+      copyColumnData<int128_t>(decoded.sum->view(), stream);
+  EXPECT_EQ(decodedSums[0], sums[0]);
+  EXPECT_EQ(decodedSums[1], sums[1]);
+  EXPECT_EQ(decoded.sum->null_count(), 1);
+  const auto decodedOverflows =
+      copyColumnData<int64_t>(decoded.overflow->view(), stream);
+  EXPECT_EQ(decodedOverflows[0], 1);
+  EXPECT_EQ(decodedOverflows[1], -1);
+
+  // Finalization folds the overflow in and restores the result scale.
+  auto finals = toGroupbyAggregators(
+      *final, final->step(), final->outputType(), constants, {}, true);
+  ASSERT_EQ(finals.size(), 2);
+  const auto checkResult = [&](const cudf::column_view& result,
+                               const std::vector<int128_t>& expected) {
+    EXPECT_EQ(result.type(), cudf::data_type(cudf::type_id::DECIMAL128, -2));
+    ASSERT_EQ(result.size(), 3);
+    const auto values = copyColumnData<int128_t>(result, stream);
+    EXPECT_EQ(values[0], expected[0]);
+    EXPECT_EQ(values[1], expected[1]);
+    EXPECT_EQ(result.null_count(), 1);
+    EXPECT_FALSE(isValidAt(copyNullMask(result, stream), 2));
+  };
+  auto finalSum = finals[0]->finalize(
+      std::make_unique<cudf::column>(buffered->view(), stream, mr), stream, mr);
+  checkResult(finalSum->view(), {5, -7});
+  // AVG matches finalizing the VARBINARY state.
+  auto encodedAvg = finals[1]->finalize(
+      std::make_unique<cudf::column>(encoded->view(), stream, mr), stream, mr);
+  const auto encodedAvgValues =
+      copyColumnData<int128_t>(encodedAvg->view(), stream);
+  auto finalAvg = finals[1]->finalize(std::move(buffered), stream, mr);
+  checkResult(finalAvg->view(), {encodedAvgValues[0], encodedAvgValues[1]});
+  EXPECT_EQ(encodedAvgValues[1], -2);
+}
+
+// GPU and CPU partial states hold the same overflow, so either side can
+// finalize the other's state.
+TEST_F(CudfDecimalTest, longDecimalSumOverflowStateMatchesCpu) {
+  auto first = makeRowVector(
+      {"d"},
+      {makeFlatVector<int128_t>(
+          {kLongDecimalMax, kLongDecimalMax, 5}, DECIMAL(38, 0))});
+  auto second = makeRowVector(
+      {"d"},
+      {makeFlatVector<int128_t>(
+          {-kLongDecimalMax, -kLongDecimalMax}, DECIMAL(38, 0))});
+  auto expected =
+      makeRowVector({makeFlatVector<int128_t>({5}, DECIMAL(38, 0))});
+
+  const auto partialStates = [&]() {
+    std::vector<RowVectorPtr> states;
+    for (const auto& input : {first, second}) {
+      auto plan = exec::test::PlanBuilder()
+                      .values({input})
+                      .partialAggregation({}, {"sum(d) AS s"})
+                      .planNode();
+      states.push_back(
+          exec::test::AssertQueryBuilder(plan).copyResults(pool()));
+    }
+    return states;
+  };
+  const auto finalPlan = [](const std::vector<RowVectorPtr>& states) {
+    return exec::test::PlanBuilder()
+        .values(states)
+        .finalAggregation({}, {"sum(s)"}, {{DECIMAL(38, 0)}})
+        .planNode();
+  };
+
+  const auto gpuStates = partialStates();
+  unregisterCudf();
+  exec::test::AssertQueryBuilder(finalPlan(gpuStates)).assertResults(expected);
+  VELOX_ASSERT_THROW(
+      exec::test::AssertQueryBuilder(finalPlan({gpuStates[0]}))
+          .copyResults(pool()),
+      "Decimal overflow");
+
+  const auto cpuStates = partialStates();
+  registerCudf();
+  exec::test::AssertQueryBuilder(finalPlan(cpuStates)).assertResults(expected);
+  VELOX_ASSERT_THROW(
+      exec::test::AssertQueryBuilder(finalPlan({cpuStates[0]}))
+          .copyResults(pool()),
+      "Decimal overflow");
+}
+
+TEST_F(CudfDecimalTest, streamingGroupbySkipsLongDecimalSum) {
+  // Streaming groupby merges sums without an overflow count, so long decimal
+  // SUM and AVG use the regular groupby.
+  auto& config = CudfConfig::getInstance();
+  const auto savedEnabled = config.streamingGroupbyEnabled;
+  config.streamingGroupbyEnabled = true;
+  SCOPE_EXIT {
+    config.streamingGroupbyEnabled = savedEnabled;
+  };
+  auto first = makeRowVector(
+      {"k", "d"},
+      {makeFlatVector<int32_t>({1, 1, 2}),
+       makeFlatVector<int128_t>(
+           {kLongDecimalMax, kLongDecimalMax, 100}, DECIMAL(38, 0))});
+  auto second = makeRowVector(
+      {"k", "d"},
+      {makeFlatVector<int32_t>({1, 1, 2}),
+       makeFlatVector<int128_t>(
+           {-kLongDecimalMax, -kLongDecimalMax, 300}, DECIMAL(38, 0))});
+  auto expected = makeRowVector(
+      {makeFlatVector<int32_t>({1, 2}),
+       makeFlatVector<int128_t>({0, 400}, DECIMAL(38, 0)),
+       makeFlatVector<int128_t>({0, 200}, DECIMAL(38, 0))});
+  auto plan = exec::test::PlanBuilder()
+                  .values({first, second})
+                  .partialAggregation({"k"}, {"sum(d)", "avg(d)"})
+                  .finalAggregation()
+                  .planNode();
+  auto task = exec::test::AssertQueryBuilder(plan)
+                  .maxDrivers(1)
+                  .config(CudfFromVelox::kGpuBatchSizeRows, 1)
+                  .config(core::QueryConfig::kMaxPartialAggregationMemory, 1)
+                  .assertResults(expected);
+  const auto stats = exec::toPlanStats(task->taskStats());
+  EXPECT_EQ(
+      stats.at(plan->id())
+          .customStats.count(std::string{kStreamingGroupbyUsedStat}),
+      0);
+}
+
 TEST_F(CudfDecimalTest, decimalSumPartialFinalVarbinaryNullGroup) {
   auto rowType = ROW({
       {"k", INTEGER()},
@@ -1604,24 +2117,28 @@ TEST_F(CudfDecimalTest, streamingCompactSumThroughLocalExchange) {
   const auto* final = dynamic_cast<const CudfAggregationNode*>(plan.get());
   ASSERT_NE(final, nullptr);
   ASSERT_TRUE(final->usesCompactDecimalState(0));
-  ASSERT_FALSE(final->usesCompactDecimalState(1));
+  ASSERT_TRUE(final->usesCompactDecimalState(1));
   ASSERT_TRUE(final->usesCompactDecimalState(2));
   ASSERT_EQ(
       *plan->sources()[0]->outputType()->childAt(3),
       *ROW({{"sum", DECIMAL(38, 2)}, {"count", BIGINT()}}));
   ASSERT_EQ(*plan->sources()[0]->outputType()->childAt(1), *DECIMAL(38, 2));
+  ASSERT_EQ(
+      *plan->sources()[0]->outputType()->childAt(2),
+      *ROW({{"sum", DECIMAL(38, 2)}, {"overflow", BIGINT()}}));
 
   auto task = exec::test::AssertQueryBuilder(plan)
                   .maxDrivers(1)
                   .config(CudfFromVelox::kGpuBatchSizeRows, 6)
                   .config(core::QueryConfig::kMaxPartialAggregationMemory, 1)
                   .assertResults(expected);
+  // The Decimal128 state of sum(c2) is merged with SUM_OVERFLOW, which
+  // streaming groupby supports only after cuDF R2, so the node falls back to
+  // incremental groupby.
   const auto stats = exec::toPlanStats(task->taskStats());
-  EXPECT_GT(
-      stats.at(plan->id())
-          .customStats.at(std::string{kStreamingGroupbyUsedStat})
-          .sum,
-      0);
+  const auto& customStats = stats.at(plan->id()).customStats;
+  EXPECT_EQ(customStats.count(std::string{kStreamingGroupbyUsedStat}), 0);
+  EXPECT_GT(customStats.at(std::string{kDirectGroupbyFinalizationStat}).sum, 0);
 }
 
 TEST_F(CudfDecimalTest, compactAvgGroupedBatches) {
@@ -1720,6 +2237,113 @@ TEST_F(CudfDecimalTest, compactAvgGroupedEmpty) {
       {"k", "a"},
       {makeFlatVector<int32_t>({}),
        makeFlatVector<int64_t>({}, DECIMAL(12, 2))}));
+}
+
+// Raw grouped Decimal64 SUM and AVG sum at 64 bits and widen once per group.
+// Groups wrap 64 bits once, wrap negative, wrap up and back down to cancel,
+// hold only nulls, or mix nulls and small values.
+TEST_F(CudfDecimalTest, decimal64GroupedSumWrapsMatchCpu) {
+  constexpr int64_t kBig = 999'999'999'999'999'999;
+  std::vector<int32_t> keys;
+  std::vector<std::optional<int64_t>> values;
+  std::vector<bool> mask;
+  auto add = [&](int32_t key, std::optional<int64_t> value, int count) {
+    for (int i = 0; i < count; ++i) {
+      keys.push_back(key);
+      values.push_back(value);
+      mask.push_back(keys.size() % 3 != 0);
+    }
+  };
+  add(0, kBig, 10);
+  add(1, -kBig, 25);
+  add(2, kBig, 20);
+  add(2, -kBig, 20);
+  add(2, 7, 1);
+  add(3, std::nullopt, 4);
+  add(4, std::nullopt, 2);
+  add(4, -12345, 5);
+  add(5, kBig, 40);
+  add(5, -kBig, 1);
+  auto input = makeRowVector(
+      {"k", "d", "m"},
+      {makeFlatVector<int32_t>(keys),
+       makeNullableFlatVector<int64_t>(values, DECIMAL(18, 2)),
+       makeFlatVector<bool>(mask)});
+  const std::vector<RowVectorPtr> batches = {input, input};
+  const std::vector<std::string> aggregates = {"sum(d) AS s", "avg(d) AS a"};
+
+  // Native state. Unlike Decimal128 state, the final step may stream.
+  for (bool intermediate : {false, true}) {
+    for (std::optional<int32_t> batchRows :
+         {std::optional<int32_t>{}, std::optional<int32_t>{7}}) {
+      for (bool streaming : {false, true}) {
+        SCOPED_TRACE(
+            fmt::format(
+                "intermediate={} batchRows={} streaming={}",
+                intermediate,
+                batchRows.value_or(0),
+                streaming));
+        auto builder = exec::test::PlanBuilder();
+        builder.values(batches)
+            .partialAggregation({"k"}, aggregates)
+            .localPartition({"k"});
+        if (intermediate) {
+          builder.intermediateAggregation();
+        }
+        auto original = builder.finalAggregation().planNode();
+        const auto rewritten = CudfPlanRewriter::rewrite(original);
+        auto* final = dynamic_cast<const CudfAggregationNode*>(rewritten.get());
+        ASSERT_NE(final, nullptr);
+        EXPECT_EQ(*final->intermediateType(0), *DECIMAL(38, 2));
+        EXPECT_EQ(
+            *final->intermediateType(1),
+            *ROW({{"sum", DECIMAL(38, 2)}, {"count", BIGINT()}}));
+        EXPECT_EQ(
+            assertCompactMatchesCpu(
+                original,
+                {.gpuBatchRows = batchRows,
+                 .streaming = streaming,
+                 .maxDrivers = 2})
+                .first,
+            "");
+      }
+    }
+  }
+
+  // VARBINARY state and single aggregation. Masked avg runs on the CPU, so
+  // only sum is masked.
+  for (bool masked : {false, true}) {
+    const auto aggs =
+        masked ? std::vector<std::string>{"sum(d) AS s"} : aggregates;
+    const auto masks =
+        masked ? std::vector<std::string>{"m"} : std::vector<std::string>{};
+    std::vector<core::PlanNodePtr> plans;
+    plans.push_back(
+        exec::test::PlanBuilder()
+            .values(batches)
+            .singleAggregation({"k"}, aggs, masks)
+            .planNode());
+    plans.push_back(
+        exec::test::PlanBuilder()
+            .values(batches)
+            .partialAggregation({"k"}, aggs, masks)
+            .finalAggregation()
+            .planNode());
+    plans.push_back(
+        exec::test::PlanBuilder()
+            .values(batches)
+            .partialAggregation({"k"}, aggs, masks)
+            .intermediateAggregation()
+            .finalAggregation()
+            .planNode());
+    for (size_t i = 0; i < plans.size(); ++i) {
+      SCOPED_TRACE(fmt::format("masked={} plan={}", masked, i));
+      exec::test::AssertQueryBuilder(plans[i])
+          .maxDrivers(1)
+          .config(core::QueryConfig::kMaxPartialAggregationMemory, 1)
+          .assertResults(cpuResults(plans[i], 1));
+    }
+  }
 }
 
 TEST_F(CudfDecimalTest, compactAvgThroughRenamedProject) {
@@ -1846,12 +2470,15 @@ TEST_F(CudfDecimalTest, compactAvgSlicedStateAndFinalization) {
   checkAverage(result->view());
 }
 
-TEST_F(CudfDecimalTest, compactAvgLeavesGlobalAndLongDecimalsUnchanged) {
+TEST_F(CudfDecimalTest, compactAvgLeavesGlobalDecimal64Unchanged) {
   auto input = makeRowVector(
       {"k", "d", "l"},
       {makeFlatVector<int32_t>({1}),
        makeFlatVector<int64_t>({100}, DECIMAL(12, 2)),
        makeFlatVector<int128_t>({100}, DECIMAL(20, 2))});
+  const auto avgState = ROW(
+      {{"sum", DECIMAL(38, 2)}, {"count", BIGINT()}, {"overflow", BIGINT()}});
+  const auto sumState = ROW({{"sum", DECIMAL(38, 2)}, {"overflow", BIGINT()}});
   for (const auto& keys :
        {std::vector<std::string>{}, std::vector<std::string>{"k"}}) {
     auto original =
@@ -1862,19 +2489,18 @@ TEST_F(CudfDecimalTest, compactAvgLeavesGlobalAndLongDecimalsUnchanged) {
             .planNode();
     auto plan = CudfPlanRewriter::rewrite(original);
     const auto& stateType = plan->sources()[0]->outputType();
-    EXPECT_EQ(*stateType->childAt(keys.size() + 1), *VARBINARY());
-    EXPECT_EQ(*stateType->childAt(keys.size() + 2), *VARBINARY());
+    EXPECT_EQ(*stateType->childAt(keys.size() + 1), *avgState);
+    EXPECT_EQ(*stateType->childAt(keys.size() + 2), *sumState);
+    auto* final = dynamic_cast<const CudfAggregationNode*>(plan.get());
+    ASSERT_NE(final, nullptr);
+    EXPECT_EQ(final->usesCompactDecimalState(0), !keys.empty());
+    EXPECT_TRUE(final->usesCompactDecimalState(1));
+    EXPECT_TRUE(final->usesCompactDecimalState(2));
     if (keys.empty()) {
       EXPECT_EQ(*stateType->childAt(0), *VARBINARY());
-      EXPECT_EQ(plan->serialize(), original->serialize());
-    } else {
-      auto* final = dynamic_cast<const CudfAggregationNode*>(plan.get());
-      ASSERT_NE(final, nullptr);
-      EXPECT_TRUE(final->usesCompactDecimalState(0));
-      EXPECT_FALSE(final->usesCompactDecimalState(1));
-      EXPECT_FALSE(final->usesCompactDecimalState(2));
     }
     EXPECT_EQ(*plan->outputType(), *original->outputType());
+    exec::test::AssertQueryBuilder(plan).assertResults(cpuResults(original, 1));
   }
 }
 
@@ -2080,10 +2706,7 @@ TEST_F(CudfDecimalTest, compactSumSurroundingNodeResults) {
   for (size_t i = 0; i < plans.size(); ++i) {
     const auto& plan = plans[i];
     SCOPED_TRACE(plan->toString(true, true));
-    auto expected = exec::test::AssertQueryBuilder(plan)
-                        .config(CudfConfig::kCudfEnabled, false)
-                        .maxDrivers(1)
-                        .copyResults(pool());
+    auto expected = cpuResults(plan, 1);
     auto query =
         exec::test::AssertQueryBuilder(CudfPlanRewriter::rewrite(plan));
     query.config(CudfConfig::kCudfEnabled, true).maxDrivers(1);
@@ -2281,8 +2904,7 @@ TEST_F(CudfDecimalTest, compactSumThroughEnforceSingleRow) {
   EXPECT_EQ(*singleRow->outputType()->findChild("s"), *DECIMAL(38, 2));
   exec::test::AssertQueryBuilder(rewritten).maxDrivers(1).assertResults(
       makeRowVector(
-          {"total"},
-          {makeFlatVector<int128_t>({600}, DECIMAL(38, 2))}));
+          {"total"}, {makeFlatVector<int128_t>({600}, DECIMAL(38, 2))}));
 }
 
 TEST_F(CudfDecimalTest, compactSumThroughWindow) {
@@ -2432,6 +3054,509 @@ TEST_F(CudfDecimalTest, compactSumRejectsUnsupportedBoundariesAndModifiers) {
       "Compact aggregation state project must contain only field references");
 }
 
+// CPU LongDecimalWithOverflowState accumulation of 'values'.
+std::pair<int128_t, int64_t> cpuDecimal128State(
+    const std::vector<int128_t>& values) {
+  int128_t sum = 0;
+  int64_t overflow = 0;
+  for (auto value : values) {
+    overflow += DecimalUtil::addWithOverflow(sum, sum, value);
+  }
+  return {sum, overflow};
+}
+
+int128_t cpuDecimal128Average(const std::vector<int128_t>& values) {
+  auto [sum, overflow] = cpuDecimal128State(values);
+  int128_t average = 0;
+  DecimalUtil::computeAverage(average, sum, values.size(), overflow);
+  return average;
+}
+
+TEST_F(CudfDecimalTest, decimal128StateCarriesOverflowUntilCancellation) {
+  // Groups 0 and 1 overflow int128 in opposite directions within each
+  // partial batch and cancel back into range only when partials merge. Like
+  // the CPU, the GPU must carry the overflow instead of wrapping or failing.
+  const auto kMax = DecimalUtil::kLongDecimalMax;
+  const std::vector<RowVectorPtr> batches = {
+      makeDecimal128Batch(
+          {0, 0, 1, 1, 2, 3, 4},
+          {kMax, kMax, -kMax, -kMax, std::nullopt, 42, kMax}),
+      makeDecimal128Batch(
+          {0, 0, 1, 1, 2, 3, 4},
+          {-kMax,
+           -kMax + 5,
+           kMax,
+           kMax - 7,
+           std::nullopt,
+           std::nullopt,
+           -kMax}),
+      makeDecimal128Batch({0, 1, 4, 5}, {0, 0, 0, kMax}),
+  };
+  EXPECT_EQ(
+      assertCompactMatrixMatchesCpu(batches, {"k"}, {"sum(d)", "avg(d)"}), "");
+  auto plan = CudfPlanRewriter::rewrite(
+      exec::test::PlanBuilder()
+          .values(batches)
+          .partialAggregation({"k"}, {"sum(d)", "avg(d)"})
+          .finalAggregation()
+          .planNode());
+  exec::test::AssertQueryBuilder(plan)
+      .config(CudfFromVelox::kGpuBatchSizeRows, 7)
+      .assertResults(makeRowVector({
+          makeFlatVector<int32_t>({0, 1, 2, 3, 4, 5}),
+          makeNullableFlatVector<int128_t>(
+              {5, -7, std::nullopt, 42, 0, kMax}, DECIMAL(38, 2)),
+          makeNullableFlatVector<int128_t>(
+              {1, -1, std::nullopt, 42, 0, kMax}, DECIMAL(38, 2)),
+      }));
+
+  const std::vector<RowVectorPtr> globalBatches = {
+      makeDecimal128Batch({0, 0, 0}, {kMax, kMax, kMax}),
+      makeDecimal128Batch({0, 0, 0}, {-kMax, -kMax, -kMax + 11}),
+      makeDecimal128Batch({0}, {std::nullopt}),
+  };
+  EXPECT_EQ(
+      assertCompactMatrixMatchesCpu(globalBatches, {}, {"sum(d)", "avg(d)"}),
+      "");
+}
+
+TEST_F(CudfDecimalTest, decimal128SumOverflowErrorsMatchCpu) {
+  const auto kMax = DecimalUtil::kLongDecimalMax;
+  // 2^127 - 1.
+  const auto kInt128Max = std::numeric_limits<int128_t>::max();
+  const auto rangeError = [](int128_t value) {
+    return fmt::format(
+        "Decimal overflow. Value '{}' is not in the range of Decimal Type",
+        value);
+  };
+  struct Case {
+    std::vector<std::vector<int128_t>> batches;
+    std::string error;
+  };
+  // Values in int128 but outside DECIMAL(38) fail the range check. Values that
+  // reach +/-2^127 fail adjustSumForOverflow, including exactly -2^127.
+  const std::vector<Case> cases = {
+      {{{kMax}, {1}}, rangeError(kMax + 1)},
+      {{{-kMax}, {-1}}, rangeError(-kMax - 1)},
+      {{{kMax, kInt128Max - kMax}}, rangeError(kInt128Max)},
+      {{{kMax}, {kInt128Max - kMax + 1}}, "Decimal overflow"},
+      {{{-kMax}, {-(kInt128Max - kMax + 1)}}, "Decimal overflow"},
+      {{{kMax, kMax}}, "Decimal overflow"},
+      {{{-kMax}, {-kMax}}, "Decimal overflow"},
+      {{{kMax, kMax, kMax}, {kMax, kMax}}, "Decimal overflow"},
+  };
+  for (size_t i = 0; i < cases.size(); ++i) {
+    SCOPED_TRACE(i);
+    std::vector<RowVectorPtr> grouped;
+    std::vector<RowVectorPtr> global;
+    for (const auto& values : cases[i].batches) {
+      std::vector<std::optional<int128_t>> column(values.begin(), values.end());
+      global.push_back(
+          makeDecimal128Batch(std::vector<int32_t>(values.size(), 0), column));
+      // A second, valid group shows only the overflowing group fails.
+      std::vector<int32_t> keys(values.size(), 0);
+      keys.push_back(1);
+      column.push_back(1);
+      grouped.push_back(makeDecimal128Batch(keys, column));
+    }
+    EXPECT_EQ(
+        assertCompactMatrixMatchesCpu(grouped, {"k"}, {"sum(d)"}),
+        cases[i].error);
+    EXPECT_EQ(
+        assertCompactMatrixMatchesCpu(global, {}, {"sum(d)"}), cases[i].error);
+    // AVG of the same state never fails.
+    EXPECT_EQ(assertCompactMatrixMatchesCpu(grouped, {"k"}, {"avg(d)"}), "");
+    EXPECT_EQ(assertCompactMatrixMatchesCpu(global, {}, {"avg(d)"}), "");
+  }
+}
+
+TEST_F(CudfDecimalTest, decimal128AvgOverflowRoundingAndCountsMatchCpu) {
+  const auto kMax = DecimalUtil::kLongDecimalMax;
+  // Group 0/1: overflowing exact .5 ties of the same sign round away from
+  // zero. 2: overflow by more than one 2^127. 3: mixed signs with an odd count.
+  // 4: unequal partial counts. 5: nulls. 6: all null. 7: negative overflow.
+  const std::vector<RowVectorPtr> batches = {
+      makeDecimal128Batch(
+          {0, 1, 2, 2, 2, 3, 3, 4, 5, 6, 7, 7, 7},
+          {kMax,
+           -kMax,
+           kMax,
+           kMax,
+           kMax,
+           kMax,
+           kMax,
+           1,
+           std::nullopt,
+           std::nullopt,
+           -kMax,
+           -kMax,
+           -kMax}),
+      makeDecimal128Batch(
+          {0, 1, 2, 2, 3, 4, 4, 4, 5, 6, 7},
+          {kMax - 1,
+           -kMax + 1,
+           kMax,
+           3,
+           -1,
+           2,
+           2,
+           2,
+           kMax,
+           std::nullopt,
+           -kMax}),
+  };
+  EXPECT_EQ(assertCompactMatrixMatchesCpu(batches, {"k"}, {"avg(d)"}), "");
+  auto plan = CudfPlanRewriter::rewrite(
+      exec::test::PlanBuilder()
+          .values(batches)
+          .partialAggregation({"k"}, {"avg(d)"})
+          .finalAggregation()
+          .planNode());
+  exec::test::AssertQueryBuilder(plan).assertResults(makeRowVector({
+      makeFlatVector<int32_t>({0, 1, 2, 3, 4, 5, 6, 7}),
+      makeNullableFlatVector<int128_t>(
+          {kMax,
+           -kMax,
+           cpuDecimal128Average({kMax, kMax, kMax, kMax, 3}),
+           cpuDecimal128Average({kMax, kMax, -1}),
+           2,
+           kMax,
+           std::nullopt,
+           -kMax},
+          DECIMAL(38, 2)),
+  }));
+
+  for (const auto& values : std::vector<std::vector<int128_t>>{
+           {kMax, kMax - 1}, {-kMax, -kMax + 1}, {kMax, kMax, -1}}) {
+    std::vector<RowVectorPtr> global;
+    for (auto value : values) {
+      global.push_back(makeDecimal128Batch({0}, {value}));
+    }
+    EXPECT_EQ(assertCompactMatrixMatchesCpu(global, {}, {"avg(d)"}), "");
+  }
+}
+
+TEST_F(CudfDecimalTest, decimal128NullAndEmptyInputsMatchCpu) {
+  const auto allNull = makeDecimal128Batch(
+      {0, 0, 1}, {std::nullopt, std::nullopt, std::nullopt});
+  const auto mixed = makeDecimal128Batch({0, 1}, {std::nullopt, 5});
+  const std::vector<std::string> aggregates{"sum(d)", "avg(d)"};
+  EXPECT_EQ(assertCompactMatrixMatchesCpu({allNull}, {}, aggregates), "");
+  EXPECT_EQ(
+      assertCompactMatrixMatchesCpu({allNull, mixed}, {}, aggregates), "");
+  EXPECT_EQ(assertCompactMatrixMatchesCpu({allNull}, {"k"}, aggregates), "");
+  EXPECT_EQ(
+      assertCompactMatrixMatchesCpu({allNull, mixed}, {"k"}, aggregates), "");
+
+  for (bool grouped : {false, true}) {
+    for (bool intermediate : {false, true}) {
+      SCOPED_TRACE(
+          fmt::format("grouped={} intermediate={}", grouped, intermediate));
+      auto builder = exec::test::PlanBuilder();
+      builder.values({mixed}).filter("k < 0").partialAggregation(
+          grouped ? std::vector<std::string>{"k"} : std::vector<std::string>{},
+          aggregates);
+      if (intermediate) {
+        builder.intermediateAggregation();
+      }
+      auto original = builder.finalAggregation().planNode();
+      assertCompactMatchesCpu(original);
+      exec::test::AssertQueryBuilder(CudfPlanRewriter::rewrite(original))
+          .assertResults(
+              grouped ? makeRowVector(
+                            {makeFlatVector<int32_t>({}),
+                             makeFlatVector<int128_t>({}, DECIMAL(38, 2)),
+                             makeFlatVector<int128_t>({}, DECIMAL(38, 2))})
+                      : makeRowVector(
+                            {makeNullableFlatVector<int128_t>(
+                                 {std::nullopt}, DECIMAL(38, 2)),
+                             makeNullableFlatVector<int128_t>(
+                                 {std::nullopt}, DECIMAL(38, 2))}));
+    }
+  }
+}
+
+TEST_F(CudfDecimalTest, decimal128RandomizedMatchesCpu) {
+  const auto kMax = DecimalUtil::kLongDecimalMax;
+  std::mt19937_64 rng(20261022);
+  auto randomBelow = [&](int128_t bound) {
+    const auto bits = (static_cast<unsigned __int128>(rng()) << 64) | rng();
+    return static_cast<int128_t>(bits % static_cast<unsigned __int128>(bound));
+  };
+  constexpr int kGroups = 7;
+  constexpr int kPairsPerGroup = 6;
+  // Column s: each group first adds big same-signed values, then nearly
+  // cancels them, so partial states overflow int128 while every final sum is
+  // small. Column a: arbitrary values for AVG.
+  std::vector<int32_t> keys;
+  std::vector<std::optional<int128_t>> s;
+  std::vector<std::optional<int128_t>> a;
+  std::vector<std::vector<int128_t>> big(kGroups);
+  for (int pass = 0; pass < 2; ++pass) {
+    for (int i = 0; i < kPairsPerGroup; ++i) {
+      for (int g = 0; g < kGroups; ++g) {
+        if (pass == 0) {
+          auto value = kMax / 2 + randomBelow(kMax / 2);
+          big[g].push_back(g % 2 ? -value : value);
+          s.push_back(big[g].back());
+        } else {
+          s.push_back(-big[g][i] + randomBelow(2001) - 1000);
+        }
+        keys.push_back(g);
+        if (randomBelow(10) == 0) {
+          a.push_back(std::nullopt);
+        } else {
+          const auto value = randomBelow(kMax);
+          a.push_back(rng() % 2 ? value : -value);
+        }
+      }
+    }
+  }
+  for (int g = 0; g < kGroups; ++g) {
+    keys.push_back(g);
+    s.push_back(std::nullopt);
+    a.push_back(std::nullopt);
+  }
+  // With mixed signs the CPU state depends on input order. That changes AVG
+  // only on exact .5 ties, which an odd count rules out.
+  for (int g = 0; g < kGroups; ++g) {
+    int count = 0;
+    size_t last = 0;
+    for (size_t row = 0; row < keys.size(); ++row) {
+      if (keys[row] == g) {
+        count += a[row].has_value();
+        last = row;
+      }
+    }
+    if (count % 2 == 0) {
+      a[last] = a[last] ? std::nullopt : std::optional<int128_t>{kMax};
+    }
+  }
+
+  std::vector<RowVectorPtr> batches;
+  constexpr size_t kBatchRows = 10;
+  for (size_t begin = 0; begin < keys.size(); begin += kBatchRows) {
+    const auto end = std::min(begin + kBatchRows, keys.size());
+    batches.push_back(makeRowVector(
+        {"k", "s", "a"},
+        {makeFlatVector<int32_t>(
+             std::vector<int32_t>(keys.begin() + begin, keys.begin() + end)),
+         makeNullableFlatVector<int128_t>(
+             std::vector<std::optional<int128_t>>(
+                 s.begin() + begin, s.begin() + end),
+             DECIMAL(38, 4)),
+         makeNullableFlatVector<int128_t>(
+             std::vector<std::optional<int128_t>>(
+                 a.begin() + begin, a.begin() + end),
+             DECIMAL(38, 4))}));
+  }
+  const std::vector<std::string> aggregates{"sum(s)", "avg(a)"};
+  EXPECT_EQ(assertCompactMatrixMatchesCpu(batches, {"k"}, aggregates), "");
+  EXPECT_EQ(assertCompactMatrixMatchesCpu(batches, {}, aggregates), "");
+}
+
+TEST_F(CudfDecimalTest, decimal128PreservesDecimal64AndResultTypes) {
+  const auto kMax = DecimalUtil::kLongDecimalMax;
+  auto input = makeRowVector(
+      {"k", "d", "l"},
+      {makeFlatVector<int32_t>({1, 1, 2, 2, 3}),
+       makeNullableFlatVector<int64_t>(
+           {999'999'999'999'999'999,
+            999'999'999'999'999'999,
+            -5,
+            6,
+            std::nullopt},
+           DECIMAL(18, 2)),
+       makeFlatVector<int128_t>(
+           {kMax, -kMax, kMax, 2 - kMax, 7}, DECIMAL(38, 3))});
+  for (const auto& keys :
+       {std::vector<std::string>{}, std::vector<std::string>{"k"}}) {
+    SCOPED_TRACE(keys.size());
+    auto original =
+        exec::test::PlanBuilder()
+            .values({input, input})
+            .partialAggregation(keys, {"sum(d)", "avg(d)", "sum(l)", "avg(l)"})
+            .localPartition(keys)
+            .intermediateAggregation()
+            .finalAggregation()
+            .planNode();
+    auto plan = CudfPlanRewriter::rewrite(original);
+    auto* final = dynamic_cast<const CudfAggregationNode*>(plan.get());
+    ASSERT_NE(final, nullptr);
+    EXPECT_EQ(*final->intermediateType(0), *DECIMAL(38, 2));
+    EXPECT_EQ(final->usesCompactDecimalState(1), !keys.empty());
+    EXPECT_EQ(
+        *final->intermediateType(2),
+        *ROW({{"sum", DECIMAL(38, 3)}, {"overflow", BIGINT()}}));
+    EXPECT_EQ(
+        *final->intermediateType(3),
+        *ROW(
+            {{"sum", DECIMAL(38, 3)},
+             {"count", BIGINT()},
+             {"overflow", BIGINT()}}));
+    const auto& resultType = plan->outputType();
+    EXPECT_EQ(*resultType, *original->outputType());
+    EXPECT_EQ(*resultType->childAt(keys.size()), *DECIMAL(38, 2));
+    EXPECT_EQ(*resultType->childAt(keys.size() + 1), *DECIMAL(18, 2));
+    EXPECT_EQ(*resultType->childAt(keys.size() + 2), *DECIMAL(38, 3));
+    EXPECT_EQ(*resultType->childAt(keys.size() + 3), *DECIMAL(38, 3));
+    auto* partition = dynamic_cast<const core::LocalPartitionNode*>(
+        plan->sources()[0]->sources()[0].get());
+    ASSERT_NE(partition, nullptr);
+    EXPECT_EQ(
+        *partition->outputType()->childAt(keys.size() + 2),
+        *final->intermediateType(2));
+    EXPECT_EQ(
+        *partition->outputType()->childAt(keys.size() + 3),
+        *final->intermediateType(3));
+    assertCompactMatchesCpu(original, {.maxDrivers = 2});
+  }
+}
+
+TEST_F(CudfDecimalTest, decimal128UcxFragmentSchemasAndSerde) {
+  auto input = makeRowVector(
+      {"k", "l"},
+      {makeFlatVector<int32_t>({1}),
+       makeFlatVector<int128_t>({100}, DECIMAL(20, 3))});
+  auto producer = exec::test::PlanBuilder()
+                      .values({input})
+                      .partialAggregation({"k"}, {"sum(l) AS s", "avg(l) AS a"})
+                      .partitionedOutput(
+                          {"k"},
+                          2,
+                          false,
+                          {},
+                          "Presto",
+                          std::string{core::TransportKind::kUcx})
+                      .planNode();
+  auto consumer = exec::test::PlanBuilder()
+                      .exchange(
+                          producer->outputType(),
+                          "Presto",
+                          std::string{core::TransportKind::kUcx})
+                      .finalAggregation(
+                          {"k"},
+                          {"sum(s) AS s", "avg(a) AS a"},
+                          {{DECIMAL(20, 3)}, {DECIMAL(20, 3)}})
+                      .planNode();
+  auto gpuProducer = CudfPlanRewriter::rewrite(producer);
+  auto gpuConsumer = CudfPlanRewriter::rewrite(consumer);
+  auto* output =
+      dynamic_cast<const core::PartitionedOutputNode*>(gpuProducer.get());
+  auto* exchange =
+      dynamic_cast<const core::ExchangeNode*>(gpuConsumer->sources()[0].get());
+  ASSERT_NE(output, nullptr);
+  ASSERT_NE(exchange, nullptr);
+  EXPECT_EQ(*output->outputType(), *exchange->outputType());
+  EXPECT_EQ(
+      *output->outputType()->childAt(1),
+      *ROW({{"sum", DECIMAL(38, 3)}, {"overflow", BIGINT()}}));
+  EXPECT_EQ(
+      *output->outputType()->childAt(2),
+      *ROW(
+          {{"sum", DECIMAL(38, 3)},
+           {"count", BIGINT()},
+           {"overflow", BIGINT()}}));
+  EXPECT_EQ(*producer->outputType()->childAt(1), *VARBINARY());
+  EXPECT_EQ(*gpuConsumer->outputType(), *consumer->outputType());
+
+  Type::registerSerDe();
+  core::ITypedExpr::registerSerDe();
+  core::PlanNode::registerSerDe();
+  CudfAggregationNode::registerSerDe();
+  auto copy = ISerializable::deserialize<core::PlanNode>(
+      gpuConsumer->serialize(), pool());
+  EXPECT_EQ(copy->serialize(), gpuConsumer->serialize());
+  auto* aggregation = dynamic_cast<const CudfAggregationNode*>(copy.get());
+  ASSERT_NE(aggregation, nullptr);
+  EXPECT_EQ(
+      *aggregation->intermediateType(0), *output->outputType()->childAt(1));
+  EXPECT_EQ(
+      *aggregation->intermediateType(1), *output->outputType()->childAt(2));
+}
+
+TEST_F(CudfDecimalTest, decimal128RejectsMismatchedStatesAndModifiers) {
+  auto input = makeRowVector(
+      {"k", "d", "l", "m"},
+      {makeFlatVector<int32_t>({1}),
+       makeFlatVector<int64_t>({100}, DECIMAL(12, 2)),
+       makeFlatVector<int128_t>({100}, DECIMAL(20, 3)),
+       makeFlatVector<bool>({true})});
+  auto ids = std::make_shared<core::PlanNodeIdGenerator>();
+  auto partial = [&](const std::string& aggregate) {
+    return exec::test::PlanBuilder(ids)
+        .values({input})
+        .partialAggregation({"k"}, {aggregate + " AS s"})
+        .localPartition({"k"})
+        .planNode();
+  };
+  // A consumer declaring another scale or width than its producer.
+  for (const auto& [aggregate, rawType] :
+       std::vector<std::pair<std::string, TypePtr>>{
+           {"sum(l)", DECIMAL(20, 2)},
+           {"avg(l)", DECIMAL(20, 2)},
+           {"sum(d)", DECIMAL(20, 2)},
+           {"avg(d)", DECIMAL(20, 2)},
+           {"sum(l)", DECIMAL(12, 3)}}) {
+    SCOPED_TRACE(aggregate + " " + rawType->toString());
+    const auto function = aggregate.substr(0, 3);
+    auto plan = exec::test::PlanBuilder(partial(aggregate), ids)
+                    .finalAggregation({"k"}, {function + "(s)"}, {{rawType}})
+                    .planNode();
+    VELOX_ASSERT_THROW(
+        CudfPlanRewriter::rewrite(plan),
+        "Incompatible compact aggregation state schemas");
+  }
+
+  auto masked = exec::test::PlanBuilder()
+                    .values({input})
+                    .partialAggregation({"k"}, {"sum(l)"}, {"m"})
+                    .finalAggregation()
+                    .planNode();
+  VELOX_ASSERT_THROW(
+      CudfPlanRewriter::rewrite(masked),
+      "Compact Decimal128 aggregation does not support DISTINCT, ordering or masks");
+  auto consumer = exec::test::PlanBuilder()
+                      .exchange(partial("avg(l)")->outputType(), "Presto")
+                      .finalAggregation({"k"}, {"avg(s)"}, {{DECIMAL(20, 3)}})
+                      .planNode();
+  VELOX_ASSERT_THROW(
+      CudfPlanRewriter::rewrite(consumer),
+      "Compact aggregation state requires an unordered UCX exchange");
+
+  // A node whose declared state is not the Decimal128 layout.
+  auto plan = CudfPlanRewriter::rewrite(
+      exec::test::PlanBuilder()
+          .values({input})
+          .partialAggregation({"k"}, {"sum(l)"})
+          .finalAggregation()
+          .planNode());
+  auto* final = dynamic_cast<const CudfAggregationNode*>(plan.get());
+  ASSERT_NE(final, nullptr);
+  EXPECT_THROW(
+      std::make_shared<CudfAggregationNode>(
+          *final, std::vector<TypePtr>{DECIMAL(38, 3)}),
+      VeloxUserError);
+
+  // State columns with the wrong layout are rejected at execution.
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  std::vector<std::unique_ptr<cudf::column>> children;
+  children.push_back(makeDecimalColumn<int128_t>({1}, 3, nullptr, stream));
+  children.push_back(makeInt64Column({1}, nullptr, stream));
+  auto state = cudf::make_structs_column(
+      1,
+      std::move(children),
+      0,
+      cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
+      stream,
+      mr);
+  decimal128StateChildren(state->view(), false, stream);
+  VELOX_ASSERT_THROW(
+      decimal128StateChildren(state->view(), true, stream),
+      "Decimal128 AVG state requires a STRUCT with 3 children");
+}
+
 TEST_F(CudfDecimalTest, reduceDecimal64SumCountSlicesAndNulls) {
   auto stream = cudf::get_default_stream();
   auto mr = cudf::get_current_device_resource_ref();
@@ -2474,8 +3599,8 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateDecimal64) {
 
   auto sumCol = makeDecimalColumn<int64_t>(sums, 2, &sumValid, stream);
   auto countCol = makeInt64Column(counts, &countValid, stream);
-  auto stateCol =
-      serializeDecimalSumState(sumCol->view(), countCol->view(), stream, mr);
+  auto stateCol = serializeDecimalSumState(
+      sumCol->view(), countCol->view(), nullptr, stream, mr);
   auto sumAndCount =
       deserializeDecimalSumState(stateCol->view(), 2, stream, mr);
   auto stateMask = copyNullMask(stateCol->view(), stream);
@@ -2506,8 +3631,8 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateDecimal128) {
 
   auto sumCol = makeDecimalColumn<__int128_t>(sums, 3, &sumValid, stream);
   auto countCol = makeInt64Column(counts, &countValid, stream);
-  auto stateCol =
-      serializeDecimalSumState(sumCol->view(), countCol->view(), stream, mr);
+  auto stateCol = serializeDecimalSumState(
+      sumCol->view(), countCol->view(), nullptr, stream, mr);
   auto sumAndCount =
       deserializeDecimalSumState(stateCol->view(), 3, stream, mr);
   auto stateMask = copyNullMask(stateCol->view(), stream);
@@ -2539,8 +3664,8 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStatePartialNullCompact) {
   std::vector<bool> sumValid = {true, false, true};
   auto sumCol = makeDecimalColumn<int64_t>(sums, 2, &sumValid, stream);
   auto countCol = makeInt64Column(counts, nullptr, stream);
-  auto stateCol =
-      serializeDecimalSumState(sumCol->view(), countCol->view(), stream, mr);
+  auto stateCol = serializeDecimalSumState(
+      sumCol->view(), countCol->view(), nullptr, stream, mr);
 
   // Round-trip through Arrow (cuDF -> Velox VARBINARY -> cuDF STRING).
   // Arrow stores null rows with 0-byte payloads, so the resulting cuDF STRING
@@ -2586,8 +3711,8 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateUncompactedSlice) {
   std::vector<bool> sumValid = {true, true, false, true, true};
   auto sumCol = makeDecimalColumn<int64_t>(sums, 2, &sumValid, stream);
   auto countCol = makeInt64Column(counts, nullptr, stream);
-  auto stateCol =
-      serializeDecimalSumState(sumCol->view(), countCol->view(), stream, mr);
+  auto stateCol = serializeDecimalSumState(
+      sumCol->view(), countCol->view(), nullptr, stream, mr);
 
   cudf::strings_column_view strings(stateCol->view());
   EXPECT_EQ(
@@ -2632,7 +3757,7 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateArrowCompactedSlice) {
   ASSERT_EQ(sumSlices.front().offset(), 1);
   ASSERT_EQ(countSlices.front().offset(), 1);
   auto stateCol = serializeDecimalSumState(
-      sumSlices.front(), countSlices.front(), stream, mr);
+      sumSlices.front(), countSlices.front(), nullptr, stream, mr);
 
   auto expectedType = ROW({{"s", VARBINARY()}});
   auto veloxRow = with_arrow::toVeloxColumn(
@@ -2684,7 +3809,7 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateMixedNullEncodings) {
     auto sumCol = makeDecimalColumn<int64_t>(sums, 2, &sumValid, stream);
     auto countCol = makeInt64Column(counts, nullptr, stream);
     return serializeDecimalSumState(
-        sumCol->view(), countCol->view(), stream, mr);
+        sumCol->view(), countCol->view(), nullptr, stream, mr);
   };
 
   // Buffered side: row 1 is null and keeps its 32-byte payload.
@@ -2753,8 +3878,8 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateTrailingNullCompact) {
   std::vector<bool> sumValid = {true, true, false};
   auto sumCol = makeDecimalColumn<int64_t>(sums, 2, &sumValid, stream);
   auto countCol = makeInt64Column(counts, nullptr, stream);
-  auto stateCol =
-      serializeDecimalSumState(sumCol->view(), countCol->view(), stream, mr);
+  auto stateCol = serializeDecimalSumState(
+      sumCol->view(), countCol->view(), nullptr, stream, mr);
 
   auto expectedType = ROW({{"s", VARBINARY()}});
   auto veloxRow = with_arrow::toVeloxColumn(
@@ -2797,8 +3922,8 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateLeadingNullCompact) {
   std::vector<bool> sumValid = {false, true, true};
   auto sumCol = makeDecimalColumn<int64_t>(sums, 2, &sumValid, stream);
   auto countCol = makeInt64Column(counts, nullptr, stream);
-  auto stateCol =
-      serializeDecimalSumState(sumCol->view(), countCol->view(), stream, mr);
+  auto stateCol = serializeDecimalSumState(
+      sumCol->view(), countCol->view(), nullptr, stream, mr);
 
   auto expectedType = ROW({{"s", VARBINARY()}});
   auto veloxRow = with_arrow::toVeloxColumn(
@@ -2904,8 +4029,8 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateRejectsMisalignedRow) {
 
   auto sumCol = makeDecimalColumn<int64_t>({200}, 2, nullptr, stream);
   auto countCol = makeInt64Column({2}, nullptr, stream);
-  auto alignedState =
-      serializeDecimalSumState(sumCol->view(), countCol->view(), stream, mr);
+  auto alignedState = serializeDecimalSumState(
+      sumCol->view(), countCol->view(), nullptr, stream, mr);
   cudf::strings_column_view alignedStrings(alignedState->view());
 
   // The only non-null row has the correct width, but starts four bytes into
@@ -2946,8 +4071,8 @@ TEST_F(CudfDecimalTest, decimalSerializeSumStateUsesInt64OffsetsWhenEnabled) {
 
   auto sumCol = makeDecimalColumn<int64_t>(sums, 2, nullptr, stream);
   auto countCol = makeInt64Column(counts, nullptr, stream);
-  auto stateCol =
-      serializeDecimalSumState(sumCol->view(), countCol->view(), stream, mr);
+  auto stateCol = serializeDecimalSumState(
+      sumCol->view(), countCol->view(), nullptr, stream, mr);
 
   cudf::strings_column_view strings(stateCol->view());
   EXPECT_EQ(strings.offsets().type().id(), cudf::type_id::INT64);
@@ -2966,8 +4091,8 @@ TEST_F(CudfDecimalTest, decimalSumStateRoundTripUsesInt64Offsets) {
 
   auto sumCol = makeDecimalColumn<int64_t>(sums, 2, &sumValid, stream);
   auto countCol = makeInt64Column(counts, &countValid, stream);
-  auto stateCol =
-      serializeDecimalSumState(sumCol->view(), countCol->view(), stream, mr);
+  auto stateCol = serializeDecimalSumState(
+      sumCol->view(), countCol->view(), nullptr, stream, mr);
 
   cudf::strings_column_view strings(stateCol->view());
   EXPECT_EQ(strings.offsets().type().id(), cudf::type_id::INT64);
@@ -3006,8 +4131,8 @@ TEST_F(CudfDecimalTest, decimalComputeAverageDecimal64) {
 
   auto sumCol = makeDecimalColumn<int64_t>(sums, 2, &sumValid, stream);
   auto countCol = makeInt64Column(counts, &countValid, stream);
-  auto avgCol =
-      computeDecimalAverage(sumCol->view(), countCol->view(), stream, mr);
+  auto avgCol = computeDecimalAverage(
+      sumCol->view(), countCol->view(), nullptr, stream, mr);
 
   auto avgMask = copyNullMask(avgCol->view(), stream);
   auto outAvg = copyColumnData<int64_t>(avgCol->view(), stream);
@@ -3047,8 +4172,8 @@ TEST_F(CudfDecimalTest, decimalComputeAverageDecimal64Slice) {
   ASSERT_EQ(sumSlices.front().offset(), 1);
   ASSERT_EQ(countSlices.front().offset(), 1);
 
-  auto avgCol =
-      computeDecimalAverage(sumSlices.front(), countSlices.front(), stream, mr);
+  auto avgCol = computeDecimalAverage(
+      sumSlices.front(), countSlices.front(), nullptr, stream, mr);
   auto avgMask = copyNullMask(avgCol->view(), stream);
   auto outAvg = copyColumnData<int64_t>(avgCol->view(), stream);
 
@@ -3087,8 +4212,8 @@ TEST_F(CudfDecimalTest, decimalComputeAverageDecimal128) {
 
   auto sumCol = makeDecimalColumn<__int128_t>(sums, 3, &sumValid, stream);
   auto countCol = makeInt64Column(counts, &countValid, stream);
-  auto avgCol =
-      computeDecimalAverage(sumCol->view(), countCol->view(), stream, mr);
+  auto avgCol = computeDecimalAverage(
+      sumCol->view(), countCol->view(), nullptr, stream, mr);
 
   auto avgMask = copyNullMask(avgCol->view(), stream);
   auto outAvg = copyColumnData<__int128_t>(avgCol->view(), stream);
@@ -3123,8 +4248,8 @@ TEST_F(CudfDecimalTest, decimalComputeAverageDecimal64MostNegativeSum) {
 
   auto sumCol = makeDecimalColumn<int64_t>(sums, 0, &valid, stream);
   auto countCol = makeInt64Column(counts, &valid, stream);
-  auto avgCol =
-      computeDecimalAverage(sumCol->view(), countCol->view(), stream, mr);
+  auto avgCol = computeDecimalAverage(
+      sumCol->view(), countCol->view(), nullptr, stream, mr);
 
   auto outAvg = copyColumnData<int64_t>(avgCol->view(), stream);
   EXPECT_EQ(outAvg[0], kMin);
@@ -3142,8 +4267,8 @@ TEST_F(CudfDecimalTest, decimalComputeAverageDecimal128MostNegativeSum) {
 
   auto sumCol = makeDecimalColumn<__int128_t>(sums, 0, &valid, stream);
   auto countCol = makeInt64Column(counts, &valid, stream);
-  auto avgCol =
-      computeDecimalAverage(sumCol->view(), countCol->view(), stream, mr);
+  auto avgCol = computeDecimalAverage(
+      sumCol->view(), countCol->view(), nullptr, stream, mr);
 
   auto outAvg = copyColumnData<__int128_t>(avgCol->view(), stream);
   EXPECT_EQ(outAvg[0], kMin);
@@ -3159,8 +4284,8 @@ TEST_F(CudfDecimalTest, decimalComputeAverageDecimal64AllValid) {
 
   auto sumCol = makeDecimalColumn<int64_t>(sums, 2, &sumValid, stream);
   auto countCol = makeInt64Column(counts, &countValid, stream);
-  auto avgCol =
-      computeDecimalAverage(sumCol->view(), countCol->view(), stream, mr);
+  auto avgCol = computeDecimalAverage(
+      sumCol->view(), countCol->view(), nullptr, stream, mr);
 
   EXPECT_EQ(avgCol->view().null_count(), 0);
   auto avgMask = copyNullMask(avgCol->view(), stream);
@@ -3196,8 +4321,8 @@ TEST_F(CudfDecimalTest, decimalComputeAverageDecimal128AllValid) {
 
   auto sumCol = makeDecimalColumn<__int128_t>(sums, 3, &sumValid, stream);
   auto countCol = makeInt64Column(counts, &countValid, stream);
-  auto avgCol =
-      computeDecimalAverage(sumCol->view(), countCol->view(), stream, mr);
+  auto avgCol = computeDecimalAverage(
+      sumCol->view(), countCol->view(), nullptr, stream, mr);
 
   EXPECT_EQ(avgCol->view().null_count(), 0);
   auto avgMask = copyNullMask(avgCol->view(), stream);
@@ -3230,8 +4355,8 @@ TEST_F(CudfDecimalTest, decimalComputeAverageDecimal64NonNullableInputs) {
   ASSERT_FALSE(sumCol->nullable());
   ASSERT_FALSE(countCol->nullable());
 
-  auto avgCol =
-      computeDecimalAverage(sumCol->view(), countCol->view(), stream, mr);
+  auto avgCol = computeDecimalAverage(
+      sumCol->view(), countCol->view(), nullptr, stream, mr);
 
   EXPECT_EQ(avgCol->view().null_count(), 0);
   auto avgMask = copyNullMask(avgCol->view(), stream);
@@ -3267,8 +4392,8 @@ TEST_F(CudfDecimalTest, decimalComputeAverageDecimal128NonNullableInputs) {
   ASSERT_FALSE(sumCol->nullable());
   ASSERT_FALSE(countCol->nullable());
 
-  auto avgCol =
-      computeDecimalAverage(sumCol->view(), countCol->view(), stream, mr);
+  auto avgCol = computeDecimalAverage(
+      sumCol->view(), countCol->view(), nullptr, stream, mr);
 
   EXPECT_EQ(avgCol->view().null_count(), 0);
   auto avgMask = copyNullMask(avgCol->view(), stream);
@@ -3300,8 +4425,8 @@ TEST_F(CudfDecimalTest, decimalSumStateRoundTripDecimal64) {
 
   auto sumCol = makeDecimalColumn<int64_t>(sums, 2, &sumValid, stream);
   auto countCol = makeInt64Column(counts, &countValid, stream);
-  auto stateCol =
-      serializeDecimalSumState(sumCol->view(), countCol->view(), stream, mr);
+  auto stateCol = serializeDecimalSumState(
+      sumCol->view(), countCol->view(), nullptr, stream, mr);
   auto stateMask = copyNullMask(stateCol->view(), stream);
 
   auto sumAndCount =
@@ -3340,8 +4465,8 @@ TEST_F(CudfDecimalTest, decimalSumStateRoundTripDecimal128) {
 
   auto sumCol = makeDecimalColumn<__int128_t>(sums, 3, &sumValid, stream);
   auto countCol = makeInt64Column(counts, &countValid, stream);
-  auto stateCol =
-      serializeDecimalSumState(sumCol->view(), countCol->view(), stream, mr);
+  auto stateCol = serializeDecimalSumState(
+      sumCol->view(), countCol->view(), nullptr, stream, mr);
   auto stateMask = copyNullMask(stateCol->view(), stream);
 
   auto sumAndCount =
@@ -3364,6 +4489,159 @@ TEST_F(CudfDecimalTest, decimalSumStateRoundTripDecimal128) {
       EXPECT_EQ(outCount[i], counts[i]);
     }
   }
+}
+
+TEST_F(CudfDecimalTest, decimalSumStateRoundTripDecimal128Overflow) {
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  const auto threeMax = 3 * static_cast<__uint128_t>(kLongDecimalMax);
+  std::vector<__int128_t> sums = {
+      overflowStateSum(threeMax, 1), overflowStateSum(-threeMax, -1), 7, 9};
+  std::vector<int64_t> counts = {3, 3, 1, 2};
+  std::vector<int64_t> overflows = {1, -1, 0, 0};
+  std::vector<bool> sumValid = {true, true, true, false};
+
+  auto sumCol = makeDecimalColumn<__int128_t>(sums, 0, &sumValid, stream);
+  auto countCol = makeInt64Column(counts, nullptr, stream);
+  auto overflowCol = makeInt64Column(overflows, nullptr, stream);
+  const auto overflowView = overflowCol->view();
+  auto stateCol = serializeDecimalSumState(
+      sumCol->view(), countCol->view(), &overflowView, stream, mr);
+
+  auto state = deserializeDecimalSumState(stateCol->view(), 0, stream, mr);
+  ASSERT_NE(state.overflow, nullptr);
+  auto outSum = copyColumnData<__int128_t>(state.sum->view(), stream);
+  auto outCount = copyColumnData<int64_t>(state.count->view(), stream);
+  auto outOverflow = copyColumnData<int64_t>(state.overflow->view(), stream);
+  auto outMask = copyNullMask(state.sum->view(), stream);
+  EXPECT_EQ(outMask, copyNullMask(state.overflow->view(), stream));
+  for (size_t i = 0; i < sums.size(); ++i) {
+    EXPECT_EQ(isValidAt(outMask, i), sumValid[i]);
+    if (sumValid[i]) {
+      EXPECT_EQ(outSum[i], sums[i]);
+      EXPECT_EQ(outCount[i], counts[i]);
+      EXPECT_EQ(outOverflow[i], overflows[i]);
+    }
+  }
+}
+
+TEST_F(CudfDecimalTest, decimalSumOverflowStateFromSumOverflow) {
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  constexpr auto kInt128Min = std::numeric_limits<int128_t>::min();
+  // SUM_OVERFLOW(COUNT) rows {sum mod 2^128, net 2^128 wraps} and the merged
+  // states' overflow; a null state overflow counts as zero.
+  std::vector<__int128_t> sums = {5, -6, 6, kInt128Min, 0};
+  std::vector<int64_t> wraps = {0, 1, -1, 0, 0};
+  std::vector<bool> valid = {true, true, true, true, false};
+  std::vector<int64_t> stateOverflows = {3, -1, 0, 0, 0};
+  std::vector<bool> stateValid = {true, true, false, true, true};
+  // Canonical states: the sum shares the sign of the exact value.
+  std::vector<__int128_t> expectedSums = {
+      5,
+      overflowStateSum(DecimalUtil::kOverflowMultiplier - 6, 0),
+      overflowStateSum(6 - DecimalUtil::kOverflowMultiplier, 0),
+      0};
+  std::vector<int64_t> expectedOverflows = {3, 0, -1, -1};
+
+  std::vector<std::unique_ptr<cudf::column>> children;
+  children.push_back(makeDecimalColumn<__int128_t>(sums, 0, nullptr, stream));
+  children.push_back(makeInt64Column(wraps, nullptr, stream));
+  auto [mask, nullCount] = makeNullMask(valid, stream);
+  auto sumOverflow = cudf::make_structs_column(
+      static_cast<cudf::size_type>(sums.size()),
+      std::move(children),
+      nullCount,
+      std::move(mask),
+      stream,
+      mr);
+  auto stateOverflow = makeInt64Column(stateOverflows, &stateValid, stream);
+  const auto stateOverflowView = stateOverflow->view();
+
+  auto state = makeDecimalSumOverflowState(
+      std::move(sumOverflow), &stateOverflowView, stream, mr);
+  ASSERT_NE(state.overflow, nullptr);
+  auto outSum = copyColumnData<__int128_t>(state.sum->view(), stream);
+  auto outOverflow = copyColumnData<int64_t>(state.overflow->view(), stream);
+  auto outMask = copyNullMask(state.sum->view(), stream);
+  for (size_t i = 0; i < sums.size(); ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_EQ(isValidAt(outMask, i), valid[i]);
+    if (valid[i]) {
+      EXPECT_EQ(outSum[i], expectedSums[i]);
+      EXPECT_EQ(outOverflow[i], expectedOverflows[i]);
+    }
+  }
+}
+
+TEST_F(CudfDecimalTest, decimalAdjustSumForOverflow) {
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  std::vector<__int128_t> sums = {
+      5,
+      overflowStateSum(kLongDecimalMax, 1),
+      overflowStateSum(-kLongDecimalMax, -1),
+      0};
+  std::vector<int64_t> overflows = {0, 1, -1, 0};
+  std::vector<bool> valid = {true, true, true, false};
+  auto sumCol = makeDecimalColumn<__int128_t>(sums, 2, &valid, stream);
+  auto overflowCol = makeInt64Column(overflows, nullptr, stream);
+
+  auto result = adjustDecimalSumForOverflow(
+      sumCol->view(), overflowCol->view(), stream, mr);
+  EXPECT_EQ(result->type(), sumCol->type());
+  auto outSum = copyColumnData<__int128_t>(result->view(), stream);
+  auto outMask = copyNullMask(result->view(), stream);
+  std::vector<__int128_t> expected = {5, kLongDecimalMax, -kLongDecimalMax};
+  for (size_t i = 0; i < sums.size(); ++i) {
+    EXPECT_EQ(isValidAt(outMask, i), valid[i]);
+    if (valid[i]) {
+      EXPECT_EQ(outSum[i], expected[i]);
+    }
+  }
+
+  // Overflow that does not fit int128, then a sum outside DECIMAL(38).
+  const std::vector<std::pair<__int128_t, int64_t>> invalid = {
+      {overflowStateSum(2 * static_cast<__uint128_t>(kLongDecimalMax), 1), 1},
+      {kLongDecimalMax + 1, 0}};
+  for (const auto& [sum, overflow] : invalid) {
+    auto badSum = makeDecimalColumn<__int128_t>({0, sum}, 2, nullptr, stream);
+    auto badOverflow = makeInt64Column({0, overflow}, nullptr, stream);
+    VELOX_ASSERT_THROW(
+        adjustDecimalSumForOverflow(
+            badSum->view(), badOverflow->view(), stream, mr),
+        "Decimal overflow");
+  }
+}
+
+TEST_F(CudfDecimalTest, decimalComputeAverageDecimal128Overflow) {
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  const auto threeMax = 3 * static_cast<__uint128_t>(kLongDecimalMax);
+  // The last row holds 2^128 + 12345.
+  std::vector<__int128_t> sums = {
+      overflowStateSum(threeMax - 1, 1),
+      overflowStateSum(-(threeMax - 1), -1),
+      7,
+      overflowStateSum(12345, 2)};
+  std::vector<int64_t> counts = {3, 3, 2, 5};
+  std::vector<int64_t> overflows = {1, -1, 0, 2};
+  auto sumCol = makeDecimalColumn<__int128_t>(sums, 0, nullptr, stream);
+  auto countCol = makeInt64Column(counts, nullptr, stream);
+  auto overflowCol = makeInt64Column(overflows, nullptr, stream);
+  const auto overflowView = overflowCol->view();
+
+  auto avgCol = computeDecimalAverage(
+      sumCol->view(), countCol->view(), &overflowView, stream, mr);
+  auto outAvg = copyColumnData<__int128_t>(avgCol->view(), stream);
+  for (size_t i = 0; i < sums.size(); ++i) {
+    SCOPED_TRACE(i);
+    int128_t expected = 0;
+    DecimalUtil::computeAverage(expected, sums[i], counts[i], overflows[i]);
+    EXPECT_EQ(outAvg[i], expected);
+  }
+  EXPECT_EQ(outAvg[0], kLongDecimalMax);
+  EXPECT_EQ(outAvg[1], -kLongDecimalMax);
 }
 
 TEST_F(CudfDecimalTest, cudfVarbinaryArrowRoundTrip) {
