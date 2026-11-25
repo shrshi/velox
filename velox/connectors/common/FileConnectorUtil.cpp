@@ -224,8 +224,11 @@ void configureRowReaderOptions(
   if (fileSplit->splitRowRange.has_value()) {
     VELOX_CHECK(
         fileSplit->fileFormat == dwio::common::FileFormat::NIMBLE ||
-            fileSplit->fileFormat == dwio::common::FileFormat::DWRF,
-        "Split row ranges are only supported for Nimble and DWRF files: {}",
+            fileSplit->fileFormat == dwio::common::FileFormat::DWRF ||
+            fileSplit->fileFormat == dwio::common::FileFormat::ORC ||
+            fileSplit->fileFormat == dwio::common::FileFormat::PARQUET ||
+            fileSplit->fileFormat == dwio::common::FileFormat::TEXT,
+        "Split row ranges are only supported for Nimble, DWRF, ORC, Parquet and text files: {}",
         fileSplit->toString());
     rowReaderOptions.setSplitRowRange(fileSplit->splitRowRange);
   }
@@ -592,13 +595,6 @@ bool isSpecialColumn(
 
 } // namespace
 
-const std::string& getColumnName(const common::Subfield& subfield) {
-  VELOX_CHECK_GT(subfield.path().size(), 0);
-  auto* field = checkedPointerCast<const common::Subfield::NestedField>(
-      subfield.path()[0].get());
-  return field->name();
-}
-
 void checkColumnNameLowerCase(const TypePtr& type) {
   switch (type->kind()) {
     case TypeKind::ARRAY:
@@ -750,7 +746,7 @@ std::shared_ptr<common::ScanSpec> makeScanSpec(
       VELOX_CHECK(!isSpecialColumn(name, specialColumns.rowIndex));
       VELOX_CHECK(!isSpecialColumn(name, specialColumns.rowId));
       VELOX_CHECK(!isSpecialColumn(name, specialColumns.readRange));
-      filterSubfields[getColumnName(subfield)].push_back(&subfield);
+      filterSubfields[subfield.baseName()].push_back(&subfield);
     }
   }
 

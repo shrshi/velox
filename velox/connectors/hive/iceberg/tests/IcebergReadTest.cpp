@@ -940,11 +940,10 @@ TEST_F(IcebergReadTest, partitionEnforcedFilterKeptForDynamicFilter) {
       })});
   const auto joinWithBuildKey = [&](int32_t buildKey,
                                     std::shared_ptr<exec::Task>& task) {
-    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    test::IcebergPlanBuilder builder;
     core::PlanNodeId scanId;
     const auto plan =
-        test::IcebergPlanBuilder(planNodeIdGenerator)
-            .startTableScan()
+        builder.startTableScan()
             .outputType(tableType)
             .dataColumns(tableType)
             .dataColumnFieldIds({1, 2})
@@ -952,13 +951,11 @@ TEST_F(IcebergReadTest, partitionEnforcedFilterKeptForDynamicFilter) {
             .endTableScan()
             .capturePlanNodeId(scanId)
             .hashJoin(
-                {"part"},
-                {"bpart"},
-                exec::test::PlanBuilder(planNodeIdGenerator)
+                "part = bpart",
+                builder.newPlan()
                     .values({makeRowVector(
                         {"bpart"}, {makeFlatVector<int32_t>({buildKey})})})
                     .planNode(),
-                /*filter=*/"",
                 {"value"})
             .planNode();
     auto splits = makeIcebergSplits(dataFile->getPath());
@@ -2676,23 +2673,19 @@ TEST_F(IcebergReadTest, rowLineageDynamicFilterOnRowId) {
           const std::vector<int64_t>& joinKeys,
           const std::vector<int64_t>& expectedValues,
           const std::vector<int64_t>& expectedRowIds) {
-        auto planNodeIdGenerator =
-            std::make_shared<core::PlanNodeIdGenerator>();
+        test::IcebergPlanBuilder builder;
         auto plan =
-            test::IcebergPlanBuilder(planNodeIdGenerator)
-                .startTableScan()
+            builder.startTableScan()
                 .outputType(ROW({"c0", "_row_id"}, BIGINT()))
                 .dataColumns(ROW("c0", BIGINT()))
                 .endTableScan()
                 .capturePlanNodeId(scanId)
                 .hashJoin(
-                    {"_row_id"},
-                    {"u0"},
-                    exec::test::PlanBuilder(planNodeIdGenerator)
+                    "_row_id = u0",
+                    builder.newPlan()
                         .values({makeRowVector(
                             {"u0"}, {makeFlatVector<int64_t>(joinKeys)})})
                         .planNode(),
-                    /*filter=*/"",
                     {"c0", "_row_id"})
                 .planNode();
 

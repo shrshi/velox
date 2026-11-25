@@ -514,20 +514,15 @@ TEST_F(IcebergGeospatialReadTest, geometryHashJoinWithDynamicFilterPushdown) {
   auto buildData = makeNamedRowVector(
       "bgeom", makeGeometryVector({toVeloxGeospatial(matchWkt)}));
 
-  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
   core::PlanNodeId scanId;
-  test::IcebergPlanBuilder planBuilder(planNodeIdGenerator);
-  auto plan = planBuilder.startTableScan()
+  test::IcebergPlanBuilder builder;
+  auto plan = builder.startTableScan()
                   .outputType(ROW({"id", "geom"}, {BIGINT(), GEOMETRY()}))
                   .endTableScan()
                   .capturePlanNodeId(scanId)
                   .hashJoin(
-                      {"geom"},
-                      {"bgeom"},
-                      exec::test::PlanBuilder(planNodeIdGenerator)
-                          .values({buildData})
-                          .planNode(),
-                      /*filter=*/"",
+                      "geom = bgeom",
+                      builder.newPlan().values(buildData).planNode(),
                       {"id"})
                   .planNode();
 

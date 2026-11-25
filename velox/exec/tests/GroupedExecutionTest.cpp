@@ -93,21 +93,21 @@ class GroupedExecutionTest : public virtual HiveConnectorTestBase {
 
 // Here we test the grouped execution sanity checks.
 TEST_F(GroupedExecutionTest, groupedExecutionErrors) {
-  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  PlanBuilder builder;
   core::PlanNodeId tableScanNodeId;
   core::PlanNodeId projectNodeId;
   core::PlanNodeId localPartitionNodeId;
   core::PlanNodeId tableScanNodeId2;
   auto planFragment =
-      PlanBuilder(planNodeIdGenerator)
+      builder.newPlan()
           .localPartitionRoundRobin(
-              {PlanBuilder(planNodeIdGenerator)
+              {builder.newPlan()
                    .tableScan(rowType_)
                    .capturePlanNodeId(tableScanNodeId)
                    .project({"c0", "c1", "c2", "c3", "c4", "c5"})
                    .capturePlanNodeId(projectNodeId)
                    .planNode(),
-               PlanBuilder(planNodeIdGenerator)
+               builder.newPlan()
                    .tableScan(rowType_)
                    .capturePlanNodeId(tableScanNodeId2)
                    .project({"c0", "c1", "c2", "c3", "c4", "c5"})
@@ -214,11 +214,10 @@ TEST_F(GroupedExecutionTest, groupedExecutionWithOutputBuffer) {
   // A chain of three pipelines separated by local exchange with the leaf one
   // having scan running grouped execution - this will make all three pipelines
   // running grouped execution.
-  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
   core::PlanNodeId tableScanNodeId;
 
   auto planFragment =
-      PlanBuilder(planNodeIdGenerator)
+      PlanBuilder()
           .tableScan(rowType_)
           .capturePlanNodeId(tableScanNodeId)
           .project({"c3 as x", "c2 as y", "c1 as z", "c0 as w", "c4", "c5"})
@@ -306,7 +305,10 @@ TEST_F(GroupedExecutionTest, groupedExecutionWithOutputBuffer) {
   for (const auto& pipeStats : taskStats.pipelineStats) {
     for (const auto& opStats : pipeStats.operatorStats) {
       EXPECT_EQ(
-          9, opStats.runtimeStats.find("runningFinishWallNanos")->second.count);
+          9,
+          opStats.runtimeStats
+              .find(std::string(OperatorStats::kRunningFinishWallNanos))
+              ->second.count);
     }
   }
 
@@ -384,7 +386,7 @@ TEST_F(GroupedExecutionTest, hashJoinWithMixedGroupedExecution) {
 
   for (const auto& testData : testSettings) {
     SCOPED_TRACE(testData.debugString());
-    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    PlanBuilder builder(pool_.get());
     core::PlanNodeId probeScanNodeId;
     core::PlanNodeId buildScanNodeId;
 
@@ -403,7 +405,7 @@ TEST_F(GroupedExecutionTest, hashJoinWithMixedGroupedExecution) {
       outputProjection = {"t1", "u1"};
     }
 
-    PlanBuilder planBuilder(planNodeIdGenerator, pool_.get());
+    auto planBuilder = builder.newPlan();
     planBuilder.tableScan(rowType_)
         .capturePlanNodeId(probeScanNodeId)
         .project({"c0 as t0", "c1 as t1"});
@@ -412,14 +414,12 @@ TEST_F(GroupedExecutionTest, hashJoinWithMixedGroupedExecution) {
     // is ungrouped
     auto planFragment = planBuilder
                             .hashJoin(
-                                {"t0"},
-                                {"u0"},
-                                PlanBuilder(planNodeIdGenerator, pool_.get())
+                                "t0 = u0",
+                                builder.newPlan()
                                     .tableScan(rowType_)
                                     .capturePlanNodeId(buildScanNodeId)
                                     .project({"c0 as u0", "c1 as u1"})
                                     .planNode(),
-                                "",
                                 outputProjection,
                                 testData.joinType)
                             .partitionedOutput({}, 1, outputProjection)
@@ -521,23 +521,21 @@ TEST_F(GroupedExecutionTest, hashJoinWithMixedGroupedExecutionWithSpill) {
   createDuckDbTable("u", buildVectors);
 
   for (const bool triggerSpill : {false, true}) {
-    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    PlanBuilder builder;
     core::PlanNodeId probeScanNodeId;
     core::PlanNodeId buildScanNodeId;
 
-    auto plan = PlanBuilder(planNodeIdGenerator)
+    auto plan = builder.newPlan()
                     .tableScan(rowType_)
                     .capturePlanNodeId(probeScanNodeId)
                     .project({"c0 as t0", "c1 as t1"})
                     .hashJoin(
-                        {"t0"},
-                        {"u0"},
-                        PlanBuilder(planNodeIdGenerator)
+                        "t0 = u0",
+                        builder.newPlan()
                             .tableScan(rowType_)
                             .capturePlanNodeId(buildScanNodeId)
                             .project({"c0 as u0", "c1 as u1"})
                             .planNode(),
-                        "",
                         {"t1", "u1"},
                         core::JoinType::kInner)
                     .planNode();
@@ -604,11 +602,11 @@ DEBUG_ONLY_TEST_F(
   for (const auto& testData : testSettings) {
     SCOPED_TRACE(testData.debugString());
 
-    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    PlanBuilder builder(pool_.get());
     core::PlanNodeId probeScanNodeId;
     core::PlanNodeId buildScanNodeId;
 
-    PlanBuilder planBuilder(planNodeIdGenerator, pool_.get());
+    auto planBuilder = builder.newPlan();
     planBuilder.tableScan(rowType_)
         .capturePlanNodeId(probeScanNodeId)
         .project({"c0 as x"});
@@ -616,14 +614,12 @@ DEBUG_ONLY_TEST_F(
     core::PlanNodePtr joinNode;
     auto planFragment = planBuilder
                             .hashJoin(
-                                {"x"},
-                                {"y"},
-                                PlanBuilder(planNodeIdGenerator, pool_.get())
+                                "x = y",
+                                builder.newPlan()
                                     .tableScan(rowType_, {"c0 > 0"})
                                     .capturePlanNodeId(buildScanNodeId)
                                     .project({"c0 as y"})
                                     .planNode(),
-                                "",
                                 {"x", "y"})
                             .capturePlanNode(joinNode)
                             .partitionedOutput({}, 1, {"x", "y"})
@@ -742,8 +738,8 @@ DEBUG_ONLY_TEST_F(
     // Task must be finished at this stage.
     ASSERT_EQ(task->state(), exec::TaskState::kFinished);
 
-    auto taskStats = exec::toPlanStats(task->taskStats());
-    auto& planStats = taskStats.at(joinNode->id());
+    const auto planStats =
+        exec::PlanNodeStats::extract(task->taskStats(), joinNode->id());
     if (testData.expectedSpill) {
       ASSERT_GT(planStats.spilledBytes, 0);
     } else {
@@ -762,11 +758,11 @@ DEBUG_ONLY_TEST_F(
   const uint32_t numDriversPerGroup{3};
   const uint32_t numGroups{2};
 
-  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  PlanBuilder builder(pool_.get());
   core::PlanNodeId probeScanNodeId;
   core::PlanNodeId buildScanNodeId;
 
-  PlanBuilder planBuilder(planNodeIdGenerator, pool_.get());
+  auto planBuilder = builder.newPlan();
   planBuilder.tableScan(rowType_)
       .capturePlanNodeId(probeScanNodeId)
       .project({"c0 as x"});
@@ -775,14 +771,12 @@ DEBUG_ONLY_TEST_F(
   core::PlanNodePtr joinNode;
   auto planFragment = planBuilder
                           .hashJoin(
-                              {"x"},
-                              {"y"},
-                              PlanBuilder(planNodeIdGenerator, pool_.get())
+                              "x = y",
+                              builder.newPlan()
                                   .tableScan(rowType_, {"c0 > 0"})
                                   .capturePlanNodeId(buildScanNodeId)
                                   .project({"c0 as y"})
                                   .planNode(),
-                              "",
                               {"x", "y"})
                           .capturePlanNode(joinNode)
                           .partitionedOutput({}, 1, {"x", "y"})
@@ -875,8 +869,8 @@ DEBUG_ONLY_TEST_F(
   // Task is at running state because the build side is lingering.
   ASSERT_EQ(task->state(), exec::TaskState::kRunning);
 
-  auto taskStats = exec::toPlanStats(task->taskStats());
-  auto& planStats = taskStats.at(joinNode->id());
+  const auto planStats =
+      exec::PlanNodeStats::extract(task->taskStats(), joinNode->id());
   ASSERT_GT(planStats.spilledBytes, 0);
 
   // Finalize the last probe split.
@@ -895,11 +889,11 @@ TEST_F(GroupedExecutionTest, groupedExecutionWithHashAndNestedLoopJoin) {
 
   // Run the test twice - for Hash and Cross Join.
   for (size_t i = 0; i < 2; ++i) {
-    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    PlanBuilder builder(pool_.get());
     core::PlanNodeId probeScanNodeId;
     core::PlanNodeId buildScanNodeId;
 
-    PlanBuilder planBuilder(planNodeIdGenerator, pool_.get());
+    auto planBuilder = builder.newPlan();
     planBuilder.tableScan(rowType_)
         .capturePlanNodeId(probeScanNodeId)
         .project({"c3 as x", "c2 as y", "c1 as z", "c0 as w", "c4", "c5"});
@@ -908,14 +902,12 @@ TEST_F(GroupedExecutionTest, groupedExecutionWithHashAndNestedLoopJoin) {
     if (i == 0) {
       planBuilder
           .hashJoin(
-              {"w"},
-              {"r"},
-              PlanBuilder(planNodeIdGenerator, pool_.get())
+              "w = r",
+              builder.newPlan()
                   .tableScan(rowType_, {"c0 > 0"})
                   .capturePlanNodeId(buildScanNodeId)
                   .project({"c0 as r"})
                   .planNode(),
-              "",
               {"x", "y", "z", "w", "c4", "c5"})
           .capturePlanNodeId(joinNodeId)
           .localPartitionRoundRobinRow()
@@ -924,7 +916,7 @@ TEST_F(GroupedExecutionTest, groupedExecutionWithHashAndNestedLoopJoin) {
     } else {
       planBuilder
           .nestedLoopJoin(
-              PlanBuilder(planNodeIdGenerator, pool_.get())
+              builder.newPlan()
                   .tableScan(rowType_, {"c0 > 0"})
                   .capturePlanNodeId(buildScanNodeId)
                   .project({"c0 as r"})

@@ -291,6 +291,12 @@ Constant vectors are represented using ConstantVector<T> template which contains
 a value and a boolean indicating whether the value is null or not. It may
 contain a string buffer if T = StringView and the string is longer than 12
 characters.
+When the constant is built from another vector, the string buffer can be the
+source vector's string buffer rather than a copy, if the buffer belongs to the
+constant's memory pool. A constant built from another constant shares its
+buffer at any size. One built from a flat vector shares only strings longer
+than about 1 MB that fill at least half of their buffer, since a flat vector
+reuses its string buffers and packs many strings into one.
 
 .. code-block:: c++
 
@@ -457,6 +463,9 @@ offset of an empty array.
 
 Null array and empty array are not the same.
 
+The offset and size of a null array are undefined and can be any value.
+Elements that no non-null array covers are undefined as well.
+
 Elements vector may have a nulls buffer independent of the nulls buffer of the
 array vector itself. This allows us to specify non-null arrays with some or all
 null elements. Null array and array of all null elements are not the same.
@@ -491,6 +500,9 @@ considered undefined and can be any value. Consider using zero for the offset
 of an empty map.
 
 Null map and empty map are not the same.
+
+The offset and size of a null map are undefined and can be any value. Keys and
+values that no non-null map covers are undefined as well.
 
 Keys and values vectors may have nulls buffer independent of each other and of
 the nulls buffer of the map vector itself. This allows us to specify non-null
